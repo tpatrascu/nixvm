@@ -1,0 +1,17 @@
+{
+  "username": "gigid",
+  "uid": 1000,
+  "gid": 1000,
+  "hostname": "devvm",
+  "timezone": "Europe/Bucharest",
+  "locale": "en_US.UTF-8",
+  "keyboard": "us",
+  "sshPublicKeys": [],
+  "repoPath": "/home/gigid/dev/nixvm",
+  "dotfilesPath": "/home/gigid/.dotfiles",
+  "dotfilesLinks": {".p10k.zsh": ".p10k.zsh"},
+  "toolchains": {"python": true, "node": true, "llvm": true, "rust": true},
+  "nfsMounts": [],
+  "gpu": {"enabled": false, "pci_functions": [], "rom_file": null, "open_driver": true, "driver_package": "stable"},
+  "streaming": {"enabled": false, "encoder": "nvenc", "autologin": true, "capture_output": "", "host_address": "192.168.122.1"}
+}

@@ -1,0 +1,28 @@
+ssh_public_keys = ["ssh-ed25519 REPLACE_WITH_YOUR_PUBLIC_KEY"]
+# ssh_identity_file = "~/.ssh/id_ed25519"
+repository_path = ".." # Relative to infrastructure/
+dotfiles_path   = "~/.dotfiles"
+
+guest = {
+  username = "gigid"
+  uid      = 1000
+  gid      = 1000
+  hostname = "devvm"
+  timezone = "Europe/Bucharest"
+}
+
+# Configure the export separately on Ubuntu. Match the host UID/GID above.
+# nfs_mounts = [{
+#   server = "192.168.122.1"
+#   export = "/srv/dev"
+#   mountpoint = "/mnt/host-dev"
+# }]
+
+# All functions must already be isolated and bound to vfio-pci on the host.
+# gpu = {
+#   enabled       = true
+#   pci_functions = ["0000:01:00.0", "0000:01:00.1"]
+#   open_driver   = true # Turing or newer; check your specific GPU
+# }
+# streaming = { enabled = true, encoder = "nvenc", autologin = true }
+# toolchains = { python = true, node = true, llvm = true, rust = true }

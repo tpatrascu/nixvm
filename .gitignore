@@ -1,0 +1,13 @@
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+.build/
+.runtime/
+result
+result-*
+__pycache__/
+nix/machines/current.json
