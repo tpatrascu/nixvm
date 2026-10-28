@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 EXCLUDED_PARTS = {".git", ".terraform", ".aws", ".gnupg", ".build", ".runtime",
                   "node_modules", ".venv", "venv", "__pycache__", ".cache", "target"}
 EXCLUDED_NAMES = ["*.tfstate*", "*.tfvars", "*.tfvars.json", "*.tfplan", ".env", ".env.*", "*.pem",
-                  "*.key", "id_rsa*", "id_ed25519*", ".zcompdump*", "result", "result-*"]
+                  "*.key", "id_rsa*", "id_ed25519*", "nixvm_test_ed25519*", ".zcompdump*", "result", "result-*"]
 
 
 def run(args, *, capture=False, **kwargs):
@@ -163,8 +163,9 @@ def ssh_args(c, *, tty=False):
     runtime.mkdir(parents=True, exist_ok=True, mode=0o700)
     args = ["ssh", "-o", "StrictHostKeyChecking=accept-new", "-o", f"UserKnownHostsFile={runtime / 'known_hosts'}",
             "-o", "ConnectTimeout=5", "-o", "BatchMode=yes"]
-    if c.get("identity"):
-        args += ["-i", str(Path(c["identity"]).expanduser()), "-o", "IdentitiesOnly=yes"]
+    identity = os.environ.get("NIXVM_SSH_IDENTITY") or c.get("identity")
+    if identity:
+        args += ["-i", str(Path(identity).expanduser()), "-o", "IdentitiesOnly=yes"]
     if tty:
         args += ["-t"]
     return args + [f"{c['username']}@{guest_ip(c)}"]
@@ -172,6 +173,15 @@ def ssh_args(c, *, tty=False):
 
 def remote(c, command, **kwargs):
     return run(ssh_args(c) + [command], **kwargs)
+
+
+def reset_guest_host_key(c):
+    """Allow first-contact trust after an explicitly triggered bootstrap."""
+    runtime = ROOT / ".runtime" / c["name"]
+    runtime.mkdir(parents=True, exist_ok=True, mode=0o700)
+    known_hosts = runtime / "known_hosts"
+    known_hosts.touch(mode=0o600, exist_ok=True)
+    run(["ssh-keygen", "-R", guest_ip(c), "-f", known_hosts], capture=True)
 
 
 def wait_ssh(c, timeout=600):
@@ -183,6 +193,80 @@ def wait_ssh(c, timeout=600):
         except (RuntimeError, subprocess.CalledProcessError):
             time.sleep(3)
     raise RuntimeError("Timed out waiting for SSH; inspect virsh console and the DHCP network")
+
+
+def reboot_guest(c, timeout=600):
+    """Reboot into the just-activated generation and verify GNOME starts."""
+    remote(c, "sudo systemd-run --quiet --on-active=2s --collect "
+           "/run/current-system/sw/bin/systemctl reboot")
+    deadline = time.monotonic() + timeout
+    disconnected = False
+    while time.monotonic() < deadline:
+        try:
+            remote(c, "true", capture=True, stderr=subprocess.DEVNULL)
+        except (RuntimeError, subprocess.CalledProcessError):
+            disconnected = True
+            break
+        time.sleep(1)
+    if not disconnected:
+        raise RuntimeError("Guest did not disconnect after the scheduled reboot")
+    wait_ssh(c, max(1, int(deadline - time.monotonic())))
+    remote(c, "systemctl is-active graphical.target && "
+           "systemctl is-active display-manager.service")
+
+
+def domain_state(c):
+    return virsh(c, "domstate", c["name"]).strip().lower()
+
+
+def wait_domain_state(c, expected, timeout):
+    deadline = time.monotonic() + timeout
+    while True:
+        state = domain_state(c)
+        if state == expected:
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"Timed out waiting for VM state {expected!r}; current state is {state!r}")
+        time.sleep(1)
+
+
+def start_vm(c, timeout=120, wait_for_ssh=False):
+    state = domain_state(c)
+    if state == "running":
+        print(f"{c['name']} is already running.")
+    elif state == "paused":
+        virsh(c, "resume", c["name"])
+        wait_domain_state(c, "running", timeout)
+    elif state in {"shut off", "crashed"}:
+        virsh(c, "start", c["name"])
+        wait_domain_state(c, "running", timeout)
+    else:
+        raise RuntimeError(f"Cannot start {c['name']} while libvirt reports state {state!r}")
+    if wait_for_ssh:
+        wait_ssh(c, timeout)
+        print("Guest SSH is ready.")
+
+
+def stop_vm(c, timeout=120, force=False):
+    state = domain_state(c)
+    if state in {"shut off", "crashed"}:
+        print(f"{c['name']} is already stopped (state: {state}).")
+        return
+    if force:
+        virsh(c, "destroy", c["name"])
+        wait_domain_state(c, "shut off", min(timeout, 30))
+        print(f"{c['name']} was force-stopped.")
+        return
+    if state == "paused":
+        virsh(c, "resume", c["name"])
+    elif state != "running":
+        raise RuntimeError(f"Cannot gracefully stop {c['name']} while libvirt reports state {state!r}")
+    virsh(c, "shutdown", c["name"])
+    try:
+        wait_domain_state(c, "shut off", timeout)
+    except RuntimeError as error:
+        raise RuntimeError(f"{error}. Retry with 'stop --force' only if graceful shutdown is stuck") from error
+    print(f"{c['name']} shut down gracefully.")
 
 
 def build_image():
@@ -199,7 +283,8 @@ def build_image():
         shutil.rmtree(snapshot)
     shutil.copytree(ROOT / "nix", snapshot, ignore=shutil.ignore_patterns("current.json", "result*"))
     (snapshot / "machines/current.json").write_text(json.dumps(settings, indent=2) + "\n")
-    run(["nix", "build", f"path:{snapshot}#bootstrap", "--out-link", build / "image-result"])
+    run(["nix", "--extra-experimental-features", "nix-command flakes",
+         "build", f"path:{snapshot}#bootstrap", "--out-link", build / "image-result"])
     images = list((build / "image-result").rglob("*.qcow2"))
     if len(images) != 1:
         raise RuntimeError(f"Expected one QCOW2 image, found {len(images)}")
@@ -232,13 +317,17 @@ def copy_checkout(c, source, destination, *, dotfiles=False, settings=None):
 
 def bootstrap():
     c = connection()
+    # Bootstrap only runs on initial provisioning or an explicit reprovision.
+    # A recreated NixOS disk can generate a new host key at the same DHCP IP.
+    reset_guest_host_key(c)
     wait_ssh(c)
     config = c["guest_config"]
     copy_checkout(c, os.environ["NIXVM_DOTFILES"], config["dotfilesPath"], dotfiles=True)
     copy_checkout(c, os.environ["NIXVM_REPOSITORY"], config["repoPath"], settings=config)
     flake = "path:" + config["repoPath"] + "/nix#devvm"
     remote(c, f"sudo nixos-rebuild switch --flake {shlex.quote(flake)}")
-    print("Provisioned. Reboot with scripts/nixvm.py reboot to start GNOME cleanly.")
+    reboot_guest(c)
+    print("Provisioned and rebooted into the graphical system. SSH and GNOME are ready.")
 
 
 def preflight(c):
@@ -365,10 +454,19 @@ def usb(c, attach, selector=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=["build-image", "bootstrap", "preflight", "ssh", "forward",
-                        "usb-attach", "usb-detach", "rebuild", "rollback", "password", "reboot",
+                        "usb-attach", "usb-detach", "rebuild", "rollback", "password", "reboot", "start", "stop",
                         "reprovision", "import-public-keys", "gpu-check", "sunshine-ui", "token-check"])
     parser.add_argument("--device", help="YubiKey USB port name or serial; mandatory if selection is ambiguous")
+    parser.add_argument("--timeout", type=int, default=120, help="Seconds to wait for start/stop transitions (default: 120)")
+    parser.add_argument("--force", action="store_true", help="Abruptly destroy the VM instead of graceful shutdown (stop only)")
+    parser.add_argument("--wait-ssh", action="store_true", help="Wait until guest SSH accepts connections after start")
     args, extra = parser.parse_known_args()
+    if args.timeout < 1:
+        parser.error("--timeout must be at least one second")
+    if args.force and args.command != "stop":
+        parser.error("--force is only valid with stop")
+    if args.wait_ssh and args.command != "start":
+        parser.error("--wait-ssh is only valid with start")
     if args.command == "build-image":
         return build_image()
     if args.command == "bootstrap":
@@ -396,8 +494,13 @@ def main():
         remote(c, "sudo nixos-rebuild switch --rollback")
     elif args.command == "reboot":
         remote(c, "sudo systemctl reboot")
+    elif args.command == "start":
+        start_vm(c, timeout=args.timeout, wait_for_ssh=args.wait_ssh)
+    elif args.command == "stop":
+        stop_vm(c, timeout=args.timeout, force=args.force)
     elif args.command == "reprovision":
-        run(["tofu", f"-chdir={ROOT / 'infrastructure'}", "apply", "-replace=terraform_data.bootstrap", *extra])
+        run(["tofu", f"-chdir={ROOT / 'infrastructure'}", "apply", "-auto-approve",
+             "-replace=terraform_data.bootstrap", *extra])
     elif args.command == "import-public-keys":
         public = subprocess.check_output(["gpg", "--export"])
         run(ssh_args(c) + ["gpg --no-autostart --import"], input=public.decode("latin1"), encoding="latin1")

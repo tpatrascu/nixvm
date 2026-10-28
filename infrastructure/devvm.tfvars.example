@@ -1,7 +1,23 @@
 ssh_public_keys = ["ssh-ed25519 REPLACE_WITH_YOUR_PUBLIC_KEY"]
+# Add additional host keys as separate list entries; the guest authorizes all of them.
+# Set to the private key matching one ssh_public_keys entry to avoid agent fallback.
 # ssh_identity_file = "~/.ssh/id_ed25519"
 repository_path = ".." # Relative to infrastructure/
 dotfiles_path   = "~/.dotfiles"
+
+# Dedicated pool default: /var/lib/libvirt/images/<VM name>-user. Its
+# directory is owned by the OpenTofu user and group-accessible to QEMU.
+# Override these IDs for your host; find them with `id -u` and `id libvirt-qemu`.
+# storage_owner_uid = 1000
+# disk_permissions = { gid = 64055 }
+# vm_storage_pool_name = "devvm-user"
+# vm_storage_pool_path = "/var/lib/libvirt/images/devvm-user"
+
+# Defaults for Ubuntu's ovmf package. Override for another distribution.
+# uefi = {
+#   code          = "/usr/share/OVMF/OVMF_CODE_4M.fd"
+#   vars_template = "/usr/share/OVMF/OVMF_VARS_4M.fd"
+# }
 
 guest = {
   username = "gigid"

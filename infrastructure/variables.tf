@@ -38,9 +38,56 @@ variable "disk_gib" {
     error_message = "Allocate at least 20 GiB."
   }
 }
-variable "storage_pool" {
-  type    = string
-  default = "default"
+variable "vm_storage_pool_name" {
+  description = "Dedicated libvirt pool name for the new VM disk. Defaults to <VM name>-user."
+  type        = string
+  default     = null
+  validation {
+    condition     = var.vm_storage_pool_name == null || can(regex("^[a-zA-Z0-9_.-]{1,64}$", var.vm_storage_pool_name))
+    error_message = "vm_storage_pool_name may contain only letters, digits, underscore, dot, and hyphen."
+  }
+}
+variable "vm_storage_pool_path" {
+  description = "Directory for the dedicated pool. Keep it under /var/lib/libvirt/images for Ubuntu libvirt AppArmor access."
+  type        = string
+  default     = null
+  validation {
+    condition     = var.vm_storage_pool_path == null || (startswith(var.vm_storage_pool_path, "/var/lib/libvirt/images/") && !contains(split("/", var.vm_storage_pool_path), ".."))
+    error_message = "vm_storage_pool_path must be inside /var/lib/libvirt/images and may not traverse parent directories."
+  }
+}
+variable "storage_owner_uid" {
+  description = "Host UID that owns the dedicated pool directory and VM volume, normally the user running OpenTofu."
+  type        = number
+  default     = 1000
+  validation {
+    condition     = var.storage_owner_uid >= 0 && floor(var.storage_owner_uid) == var.storage_owner_uid
+    error_message = "storage_owner_uid must be a nonnegative integer."
+  }
+}
+variable "disk_permissions" {
+  description = "QEMU runtime group ID for access to the user-owned VM disk."
+  type = object({
+    gid = optional(number, 64055)
+  })
+  default = {}
+  validation {
+    condition     = var.disk_permissions.gid >= 0 && floor(var.disk_permissions.gid) == var.disk_permissions.gid
+    error_message = "Disk GID must be a nonnegative integer for the host QEMU runtime group."
+  }
+}
+variable "uefi" {
+  description = "Host OVMF firmware paths. Explicit pflash avoids selecting SEV/TDX ROM firmware on Ubuntu."
+  type = object({
+    code          = optional(string, "/usr/share/OVMF/OVMF_CODE_4M.fd")
+    vars_template = optional(string, "/usr/share/OVMF/OVMF_VARS_4M.fd")
+    nvram_dir     = optional(string, "/var/lib/libvirt/qemu/nvram")
+  })
+  default = {}
+  validation {
+    condition     = alltrue([for path in [var.uefi.code, var.uefi.vars_template, var.uefi.nvram_dir] : startswith(path, "/")])
+    error_message = "UEFI firmware and NVRAM paths must be absolute host paths."
+  }
 }
 variable "network_name" {
   type    = string
@@ -79,8 +126,8 @@ variable "ssh_public_keys" {
   description = "Public keys only. A matching private key stays on the host or its agent."
   type        = list(string)
   validation {
-    condition     = length(var.ssh_public_keys) > 0 && alltrue([for key in var.ssh_public_keys : can(regex("^(ssh-|ecdsa-|sk-)[^\\n]+$", key))])
-    error_message = "Supply at least one single-line SSH public key."
+    condition     = length(var.ssh_public_keys) > 0 && length(distinct(var.ssh_public_keys)) == length(var.ssh_public_keys) && alltrue([for key in var.ssh_public_keys : can(regex("^(ssh-|ecdsa-|sk-)[^\\n]+$", key))])
+    error_message = "Supply one or more unique, single-line SSH public keys."
   }
 }
 variable "ssh_identity_file" {

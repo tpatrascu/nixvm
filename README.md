@@ -17,7 +17,8 @@ sudo usermod -aG libvirt,kvm "$USER"
 ```
 
 Log out and back in after changing groups. Install OpenTofu >=1.9 and <2.0.
-Ensure the `default` storage pool and NAT network exist and are active:
+Ensure the default NAT network exists and is active, and check the available
+libvirt pools:
 
 ```sh
 virsh -c qemu:///system list --all
@@ -26,9 +27,33 @@ virsh -c qemu:///system net-list --all
 test -r /dev/kvm && test -w /dev/kvm
 ```
 
-Starting an existing network or pool is an explicit host administration step:
-`virsh net-start default`, `virsh pool-start default`. This project does not
-replace libvirt's host network, storage pool, or NFS server configuration.
+Starting the existing NAT network is an explicit host administration step:
+`virsh net-start default`. OpenTofu creates a
+dedicated `<VM name>-user` directory pool under
+`/var/lib/libvirt/images/<VM name>-user`; the directory belongs to the user
+running OpenTofu and grants access to the QEMU runtime group. This keeps the new
+disk within libvirt's usual AppArmor image tree while avoiding the shared
+default pool's root-only file ownership. The domain references the volume's
+resolved file path so Ubuntu's per-domain AppArmor helper adds the QCOW2 to its
+generated allowlist. Set `storage_owner_uid` to `id -u` and
+`disk_permissions.gid` to the numeric group ID shown by `id libvirt-qemu` when
+your host differs from Ubuntu's defaults. The pool path can be changed with
+`vm_storage_pool_path`, but it must remain below `/var/lib/libvirt/images` for
+the default Ubuntu AppArmor rules. This project does not replace libvirt's host
+network or NFS server configuration.
+
+The `uefi` input selects Ubuntu's standard `/usr/share/OVMF/OVMF_CODE_4M.fd`
+and matching `OVMF_VARS_4M.fd` explicitly. Override those paths on other
+distributions. This avoids firmware autoselection choosing a SEV/TDX ROM that
+Ubuntu's `virt-aa-helper` may reject. Keep AppArmor enabled; inspect
+`journalctl -u libvirtd -u virtqemud` for the underlying rejected file if domain
+startup reports that an AppArmor profile could not be loaded.
+
+The new volume is created as the OpenTofu user's UID and the QEMU runtime GID,
+with mode `0660`; the pool directory is mode `0770`. Check host IDs with
+`id -u` and `id libvirt-qemu`, and configure `storage_owner_uid` and
+`disk_permissions.gid` accordingly. The VM uses one managed disk in the
+dedicated pool. Reprovisioning does not replace it automatically.
 
 Both this directory and `~/.dotfiles` must be genuine Git working trees with at
 least one commit. Initialize them or clone their real remotes before provisioning.
@@ -50,8 +75,25 @@ scripts/nixvm.py password
 scripts/nixvm.py reboot
 ```
 
+If a failed earlier apply left `devvm` defined in libvirt but absent from
+`tofu state list`, confirm it is shut off and remove only that stale domain
+definition before applying the pool migration:
+
+```sh
+virsh -c qemu:///system domstate devvm
+virsh -c qemu:///system undefine devvm --keep-nvram
+```
+
+This removes only the stale domain definition; it leaves the managed VM disk
+and NVRAM files in place for OpenTofu to reuse.
+
 The example is intentionally not usable until its placeholder public key is
-replaced. Authenticate with the matching host SSH agent or `ssh_identity_file`.
+replaced. `ssh_public_keys` accepts multiple SSH public keys; add each key as a
+separate list entry to retain access from more than one host or authenticator.
+Set `ssh_identity_file` in `devvm.tfvars` to force a specific local private key
+for Terraform provisioning; the SSH command then uses `IdentitiesOnly` and does
+not fall back to other keys in the agent. If unset, OpenSSH may use the host
+agent. The private key stays outside the guest and OpenTofu state.
 Passwords are set interactively after provisioning and survive rebuilds. The
 development user has passwordless sudo; root SSH and SSH password login are off.
 
@@ -116,26 +158,46 @@ Host convenience commands:
 | `scripts/nixvm.py rollback` | Activate the preceding system generation |
 | `scripts/nixvm.py password` | Set/change the guest login password |
 | `scripts/nixvm.py reboot` | Reboot the guest |
+| `scripts/nixvm.py start --wait-ssh` | Start the VM and wait for SSH readiness |
+| `scripts/nixvm.py stop` | Request graceful guest shutdown and wait up to 120 seconds |
+| `scripts/nixvm.py stop --timeout 300` | Allow up to five minutes for graceful shutdown |
+| `scripts/nixvm.py stop --force` | Abruptly power off a stuck VM; unsaved guest writes may be lost |
 | `scripts/nixvm.py reprovision -var-file=devvm.tfvars` | Explicit bootstrap retry |
+
+The optional root-level `nixvm_test_ed25519` key is Git-ignored and excluded
+from repository transfers. To use it with host commands, set
+`NIXVM_SSH_IDENTITY="$PWD/nixvm_test_ed25519"` in that command's environment;
+its public key must also be in the guest's `ssh_public_keys` machine setting.
+Never add the private key to Git, OpenTofu variables, or the guest.
 
 Reprovisioning preserves existing guest Git directories and rebuilds from them.
 A failed transfer stays in a sibling `.nixvm-staging` directory and can be
 retried; an unknown destination without `.git` is rejected for manual inspection.
 Normal reapply does not transfer repositories or run a rebuild.
 
-The disk has `prevent_destroy = true`. OpenTofu will refuse destroy/replacement
-that could discard guest edits, including disk-capacity changes. To recreate it,
-first push both repositories and save any other needed data, explicitly remove
-that lifecycle guard, destroy, then restore the guard and apply. Host `.build/`
-and `.runtime/` are local artifacts, not backups. Guest project data needs its own
-backup policy. Do not commit OpenTofu state.
+All OpenTofu-managed resources can be destroyed with `tofu destroy`, including
+the VM domain, disk volume, and dedicated storage pool. Destroying the disk
+permanently removes the guest filesystem and any edits or data not backed up
+elsewhere. Push both repositories and back up other needed data before
+destroying. Host `.build/` and `.runtime/` are local artifacts, not backups.
+Do not commit OpenTofu state.
 
 ## Modules and dotfiles
 
 `nix/modules/system/` holds base hardware/users, GNOME, NFS, GPU/streaming, and
 smartcard services. `nix/modules/home/` holds user settings, mutable dotfile links,
-GNOME preferences, token clients, and independent Python/Node/LLVM/Rust modules.
+GNOME preferences, token clients, applications, and independent Python/Node/LLVM/Rust modules.
 Home Manager activates with `nixos-rebuild`; no separate activation is needed.
+
+The Home Manager application module installs Zed, Kitty, and Oh My Pi. OMP uses
+the upstream Linux x86_64 release binary at version 18.12.6, pinned by SHA-256
+in `nix/packages/omp-binary.nix`, so rebuilding does not compile its source tree.
+GNOME uses the packaged Adw-gtk3 dark theme and the packaged Vanilla-DMZ white
+cursor theme; 0xProto Nerd Font is configured for Zed buffers, Zed's integrated
+terminal, and Kitty. The dock favorites include Firefox, Kitty, Zed, and Files,
+with launcher icons pointing directly at their packaged icon assets. The supported host GNOME extensions are installed
+and enabled declaratively; Ubuntu Snap-specific extensions and Desktop Icons NG
+are not available in the pinned NixOS package set.
 
 All four language modules are enabled in the example. Toggle them with the
 `toolchains` object or the guest machine JSON. Python includes pip and uv; use

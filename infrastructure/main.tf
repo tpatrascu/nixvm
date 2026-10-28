@@ -21,6 +21,8 @@ locals {
     identity     = pathexpand(var.ssh_identity_file)
     guest_config = local.guest_config
   }
+  vm_pool_name = coalesce(var.vm_storage_pool_name, "${var.name}-user")
+  vm_pool_path = coalesce(var.vm_storage_pool_path, "/var/lib/libvirt/images/${local.vm_pool_name}")
 }
 
 resource "terraform_data" "preflight" {
@@ -52,17 +54,40 @@ resource "terraform_data" "image" {
   }
 }
 
-resource "libvirt_volume" "root" {
+resource "libvirt_pool" "vm" {
+  name = local.vm_pool_name
+  type = "dir"
+  target = {
+    path = local.vm_pool_path
+    # The Terraform user owns the directory, while the QEMU runtime group can
+    # traverse and create VM disks. Keep this under libvirt's standard images
+    # tree so Ubuntu's generated AppArmor profiles can authorize it.
+    permissions = {
+      owner = tostring(var.storage_owner_uid)
+      group = tostring(var.disk_permissions.gid)
+      mode  = "0770"
+    }
+  }
+  create = { autostart = true, start = true }
+}
+
+resource "libvirt_volume" "user_root" {
   name       = "${var.name}.qcow2"
-  pool       = var.storage_pool
+  pool       = libvirt_pool.vm.name
   capacity   = var.disk_gib * 1024 * 1024 * 1024
   allocation = 0
-  target     = { format = { type = "qcow2" } }
+  target = {
+    format = { type = "qcow2" }
+    permissions = {
+      owner = tostring(var.storage_owner_uid)
+      group = tostring(var.disk_permissions.gid)
+      mode  = "0660"
+    }
+  }
   create     = { content = { url = "${local.build_dir}/bootstrap.qcow2" } }
-  depends_on = [terraform_data.image]
+  depends_on = [terraform_data.image, libvirt_pool.vm]
   lifecycle {
-    prevent_destroy = true
-    ignore_changes  = [create]
+    ignore_changes = [create, target.permissions]
   }
 }
 
@@ -78,18 +103,29 @@ resource "libvirt_domain" "vm" {
   cpu         = { mode = "host-passthrough" }
   features    = { acpi = true, apic = {} }
   os = {
-    type          = "hvm"
-    type_arch     = "x86_64"
-    type_machine  = "q35"
-    firmware      = "efi"
-    firmware_info = { features = [{ name = "secure-boot", enabled = "no" }] }
-    boot_devices  = [{ dev = "hd" }]
+    type            = "hvm"
+    type_arch       = "x86_64"
+    type_machine    = "q35"
+    loader          = var.uefi.code
+    loader_type     = "pflash"
+    loader_readonly = "yes"
+    loader_secure   = "no"
+    loader_format   = "raw"
+    nv_ram = {
+      nv_ram   = "${var.uefi.nvram_dir}/${var.name}_VARS.fd"
+      template = var.uefi.vars_template
+      format   = "raw"
+    }
+    boot_devices = [{ dev = "hd" }]
   }
   devices = {
     disks = [{
       device = "disk"
       driver = { name = "qemu", type = "qcow2", cache = "none" }
-      source = { volume = { pool = var.storage_pool, volume = libvirt_volume.root.name } }
+      # Use the resolved file path in domain XML. Ubuntu's AppArmor helper
+      # omits disk permissions for pool/volume references, so QEMU receives
+      # EACCES even when the volume's Unix owner and group are correct.
+      source = { file = { file = libvirt_volume.user_root.path } }
       target = { dev = "vda", bus = "virtio" }
     }]
     interfaces = [{
@@ -102,8 +138,6 @@ resource "libvirt_domain" "vm" {
       ], var.gpu.enabled ? [] : [
       { source = { spice_vmc = true }, target = { virt_io = { name = "com.redhat.spice.0" } } }
     ])
-    serials     = [{ source = { pty = { path = "" } }, target = { port = 0 } }]
-    consoles    = [{ source = { pty = { path = "" } }, target = { type = "serial", port = 0 } }]
     controllers = [{ type = "usb", model = "qemu-xhci" }]
     videos      = [{ model = { type = var.gpu.enabled ? "none" : "virtio" } }]
     graphics    = var.gpu.enabled ? [] : [{ spice = { auto_port = true, listen = "127.0.0.1" } }]
@@ -120,10 +154,13 @@ resource "libvirt_domain" "vm" {
       rom = index == 0 && var.gpu.rom_file != null ? { file = var.gpu.rom_file } : null
     }] : []
   }
+
 }
 
 resource "terraform_data" "bootstrap" {
-  triggers_replace = [libvirt_domain.vm.id, libvirt_volume.root.id]
+  # libvirt's numeric domain ID changes after every start/stop. Use its stable
+  # UUID so routine VM lifecycle commands never rerun repository bootstrap.
+  triggers_replace = [libvirt_domain.vm.uuid, libvirt_volume.user_root.id]
   provisioner "local-exec" {
     command = "python3 \"$NIXVM_ROOT/scripts/nixvm.py\" bootstrap"
     environment = {

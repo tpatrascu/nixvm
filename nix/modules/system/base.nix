@@ -36,6 +36,14 @@
     shell = pkgs.zsh;
     openssh.authorizedKeys.keys = machine.sshPublicKeys;
   };
+  # Home Manager's first activation needs a writable Nix profile directory.
+  # A fresh image has not created one with nix profile install yet.
+  systemd.tmpfiles.rules = [
+    "d /home/${machine.username}/.local 0755 ${machine.username} ${machine.username} -"
+    "d /home/${machine.username}/.local/state 0755 ${machine.username} ${machine.username} -"
+    "d /home/${machine.username}/.local/state/nix 0755 ${machine.username} ${machine.username} -"
+    "d /home/${machine.username}/.local/state/nix/profiles 0700 ${machine.username} ${machine.username} -"
+  ];
   programs.zsh.enable = true;
   security.sudo.wheelNeedsPassword = false;
   services.openssh = {

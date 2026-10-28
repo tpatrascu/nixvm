@@ -1,7 +1,7 @@
 { config, lib, pkgs, machine, ... }:
 {
   imports = [
-    ./gnome.nix ./dotfiles.nix ./yubikey.nix
+    ./gnome.nix ./apps.nix ./dotfiles.nix ./yubikey.nix
     ./toolchains/python.nix ./toolchains/node.nix
     ./toolchains/llvm.nix ./toolchains/rust.nix
   ];
@@ -13,7 +13,7 @@
   programs.direnv = { enable = true; nix-direnv.enable = true; };
   home.packages = [ pkgs.ripgrep pkgs.fd pkgs.jq pkgs.gnumake pkgs.kubectl ];
   home.sessionVariables = {
-    EDITOR = "vim";
+    EDITOR = "zed --wait";
     PKCS11_MODULE = "${pkgs.opensc}/lib/opensc-pkcs11.so";
     PCSCLITE_CSOCK_NAME = "/run/user/${toString machine.uid}/nixvm/pcsc.sock";
     NIXVM_REPOSITORY = machine.repoPath;

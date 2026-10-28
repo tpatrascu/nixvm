@@ -94,6 +94,7 @@ in {
     name = "Firefox (YubiKey mode)";
     genericName = "Web Browser";
     exec = "${firefox}/bin/nixvm-firefox %U";
+    icon = "${config.programs.firefox.finalPackage}/share/icons/hicolor/128x128/apps/firefox.png";
     terminal = false;
     categories = [ "Network" "WebBrowser" ];
     mimeType = [ "text/html" "x-scheme-handler/http" "x-scheme-handler/https" ];
