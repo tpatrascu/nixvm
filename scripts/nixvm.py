@@ -657,6 +657,31 @@ def bootstrap():
     print("Provisioned and rebooted into the graphical system. SSH and GNOME are ready.")
 
 
+def update_config():
+    """Build and activate the host checkout's NixOS config in the existing guest."""
+    c = connection()
+    settings = c["guest_config"]
+    remote_stage = f"/tmp/nixvm-config-{os.getpid()}-{time.time_ns()}"
+    with tempfile.TemporaryDirectory(prefix="nixvm-config-") as tmp:
+        staged_nix = Path(tmp) / "nix"
+        shutil.copytree(ROOT / "nix", staged_nix,
+                        ignore=shutil.ignore_patterns("current.json", "result*"))
+        (staged_nix / "machines/current.json").write_text(
+            json.dumps(settings, indent=2) + "\n"
+        )
+
+        remote(c, f"mkdir -m 700 {shlex.quote(remote_stage)}")
+        try:
+            ssh = ssh_args(c)
+            run(["rsync", "-a", "--delete", "--protect-args", "-e", shlex.join(ssh[:-1]),
+                 str(staged_nix) + "/", f"{ssh[-1]}:{remote_stage}/nix/"])
+            flake = f"path:{remote_stage}/nix#devvm"
+            remote(c, f"sudo nixos-rebuild switch --flake {shlex.quote(flake)}")
+        finally:
+            remote(c, f"rm -rf -- {shlex.quote(remote_stage)}")
+    print("Activated the host NixOS configuration in the guest.")
+
+
 def preflight(c):
     failures = []
     for name in ["nix", "tofu", "virsh", "git", "ssh", "rsync", "qemu-img"]:
@@ -781,7 +806,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=["build-image", "remove-image", "define-network-filter", "firewall-test", "check-host-nfs", "setup-host-nfs", "bootstrap", "preflight", "ssh", "forward",
                         "usb-attach", "usb-detach", "rebuild", "rollback", "password", "reboot", "start", "stop",
-                        "reprovision", "import-public-keys", "gpu-check", "sunshine-ui", "token-check"])
+                        "reprovision", "import-public-keys", "gpu-check", "token-check", "update-config", "ip"])
     parser.add_argument("--name", default="devvm", help="VM name for remove-image (default: devvm)")
     parser.add_argument("--device", help="YubiKey USB port name or serial; mandatory if selection is ambiguous")
     parser.add_argument("--timeout", type=int, default=120, help="Seconds to wait for start/stop transitions (default: 120)")
@@ -817,6 +842,8 @@ def main():
         c = connection()
     if args.command == "preflight":
         preflight(c)
+    elif args.command == "ip":
+        print(guest_ip(c))
     elif args.command == "ssh":
         run(ssh_args(c, tty=not extra) + extra)
     elif args.command == "forward":
@@ -843,12 +870,11 @@ def main():
         run(ssh_args(c) + ["gpg --no-autostart --import"], input=public.decode("latin1"), encoding="latin1")
     elif args.command == "gpu-check":
         remote(c, "nixvm-gpu-check")
+    elif args.command == "update-config":
+        update_config()
     elif args.command == "token-check":
         print("Checking PIV through the selected PC/SC socket; protocol mismatch errors require compatible pcsc-lite versions.")
         remote(c, "nixvm-piv --list-slots")
-    elif args.command == "sunshine-ui":
-        print("Open https://localhost:47990 while this command runs.")
-        run(ssh_args(c)[:-1] + ["-N", "-L", "127.0.0.1:47990:127.0.0.1:47990", ssh_args(c)[-1]])
 
 
 if __name__ == "__main__":

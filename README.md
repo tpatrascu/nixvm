@@ -212,9 +212,12 @@ Home Manager owns the global Git configuration; avoid rewriting it with
 
 The flake lives in `nix/` so state, SSH material, and the infrastructure directory
 are outside its source. Only public settings belong anywhere under `nix/`.
-Host OpenTofu variable changes affect infrastructure, but **do not overwrite the
-guest machine settings or checkouts after bootstrap**. Edit settings in the VM
-and rebuild when changing its operating system configuration.
+Host OpenTofu variable changes affect infrastructure, but normal applies do not
+overwrite the guest machine settings or checkouts after bootstrap. Use
+`./nixvm update-config` to stage the host's current `nix/` configuration and
+applied machine settings into a temporary guest directory, then rebuild from
+there without changing the guest checkout. Use `./nixvm rebuild` to build from
+the guest checkout instead.
 
 Common commands:
 
@@ -225,7 +228,9 @@ Common commands:
 | `./nixvm plan` / `./nixvm destroy` | Review changes / destroy the managed VM and test network |
 | `./nixvm ssh` | Interactive guest shell |
 | `./nixvm ssh uname -a` | Execute a guest command |
+| `./nixvm ip` | Print the VM's current IPv4 address |
 | `./nixvm rebuild` / `./nixvm rollback` | Activate the guest checkout / previous generation |
+| `./nixvm update-config` | Stage and activate the host's NixOS config in the guest |
 | `./nixvm password` / `./nixvm reboot` | Change the guest password / reboot |
 | `./nixvm start --wait-ssh` | Start the VM and wait for SSH readiness |
 | `./nixvm stop` | Gracefully stop the guest and wait up to 120 seconds |

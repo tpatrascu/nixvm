@@ -26,7 +26,9 @@ VM lifecycle:
   start [options]            Start the VM
   stop [options]             Gracefully stop the VM
   ssh [guest command...]     Open a guest shell or run a guest command
+  ip                         Print the VM's current IPv4 address
   rebuild | rollback         Rebuild or roll back the guest system
+  update-config              Activate this host checkout's NixOS config in the guest
   reboot | password          Reboot the guest or change its password
   reprovision [tofu options] Retry OpenTofu bootstrap
 
@@ -172,9 +174,9 @@ def main(arguments):
         variables, operation = split_arguments(extra)
         internal("setup-host-nfs", variables)
         tofu("apply", [*variables, "-replace=terraform_data.bootstrap", *operation])
-    elif command in {"ssh", "start", "stop", "rebuild", "rollback", "reboot",
+    elif command in {"ssh", "ip", "start", "stop", "rebuild", "rollback", "reboot",
                      "password", "forward", "usb-attach", "usb-detach", "gpu-check",
-                     "token-check", "sunshine-ui", "import-public-keys"}:
+                     "token-check", "import-public-keys", "update-config"}:
         internal(command, extra)
     else:
         raise ValueError(f"Unknown command: {command}. Run 'nixvm help' for usage.")

@@ -268,8 +268,19 @@ resource "libvirt_domain" "vm" {
       { source = { spice_vmc = true }, target = { virt_io = { name = "com.redhat.spice.0" } } }
     ])
     controllers = [{ type = "usb", model = "qemu-xhci" }]
-    videos      = [{ model = { type = var.gpu.enabled ? "none" : "virtio" } }]
-    graphics    = var.gpu.enabled ? [] : [{ spice = { auto_port = true, listen = "127.0.0.1" } }]
+    # Keep a virtual display even with GPU passthrough. Laptop dGPUs often have
+    # no physical display outputs wired to them, while Sunshine needs a screen
+    # to capture; Vulkan applications can still use the passed-through GPU.
+    videos = [{
+      model = {
+        type = "virtio"
+        # Advertise at least the host's 16:9 streaming resolution to the guest.
+        resolution = { x = 2560, y = 1440 }
+      }
+    }]
+    # Keep a host-local SPICE console available alongside Sunshine streaming,
+    # using the same virtio display device.
+    graphics = [{ spice = { auto_port = true, listen = "127.0.0.1" } }]
     hostdevs = var.gpu.enabled ? [for index, pci in var.gpu.pci_functions : {
       managed = true
       subsys_pci = {

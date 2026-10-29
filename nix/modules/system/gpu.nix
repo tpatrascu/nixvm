@@ -2,11 +2,21 @@
 {
   config = lib.mkIf machine.gpu.enabled {
     hardware.graphics.enable = true;
+    # Use the VM's virtio display for GNOME Wayland scanout while keeping
+    # NVIDIA as a PRIME render-offload GPU for Vulkan applications.
     services.xserver.videoDrivers = [ "nvidia" ];
     hardware.nvidia = {
       modesetting.enable = true;
       open = machine.gpu.open_driver;
       package = config.boot.kernelPackages.nvidiaPackages.${machine.gpu.driver_package};
+    };
+    hardware.nvidia.prime = {
+      offload.enable = true;
+      offload.enableOffloadCmd = true;
+      # The libvirt virtio display is at 00:01.0; the passed-through MX450 is
+      # at 05:00.0 inside this guest.
+      intelBusId = "PCI:0@0:1:0";
+      nvidiaBusId = "PCI:0@0:5:0";
     };
     environment.systemPackages = with pkgs; [ vulkan-tools mesa-demos pciutils
       (writeShellApplication {
@@ -34,7 +44,8 @@
         capture = "kms";
         encoder = machine.streaming.encoder;
         upnp = "disabled";
-        origin_web_ui_allowed = "pc";
+        origin_web_ui_allowed = "lan";
+        csrf_allowed_origins = "https://192.168.124.13:47990";
         hevc_mode = 1;
         av1_mode = 1;
         audio_sink = "nixvm-audio";
@@ -44,10 +55,10 @@
     };
     hardware.uinput.enable = machine.streaming.enabled;
     users.users.${machine.username}.extraGroups = lib.optional machine.streaming.enabled "uinput";
-    # The configured host IP also works when the firewall starts before DHCP.
+    # Permit the configured host to reach any guest service over the private VM
+    # network. This also works when the firewall starts before DHCP.
     networking.firewall.extraCommands = lib.mkIf machine.streaming.enabled ''
-      iptables -A nixos-fw -s ${lib.escapeShellArg machine.streaming.host_address} -p tcp -m multiport --dports 47984,47989,48010 -j nixos-fw-accept
-      iptables -A nixos-fw -s ${lib.escapeShellArg machine.streaming.host_address} -p udp -m multiport --dports 47998:48000,48002,48010 -j nixos-fw-accept
+      iptables -A nixos-fw -s ${lib.escapeShellArg machine.streaming.host_address} -j nixos-fw-accept
     '';
     # A silent audio sink works even when the GPU has no HDMI audio function.
     services.pipewire.extraConfig.pipewire."90-nixvm-audio" = {
