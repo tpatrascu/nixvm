@@ -49,6 +49,21 @@ def guest_ip(c):
     raise RuntimeError("No IPv4 DHCP lease yet for the VM MAC")
 
 
+def wait_guest_ip(c, timeout=120):
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            return guest_ip(c)
+        except RuntimeError as error:
+            if str(error) != "No IPv4 DHCP lease yet for the VM MAC":
+                raise
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"Timed out waiting for an IPv4 DHCP lease for {c['name']} on network {c['network']!r}"
+                ) from error
+            time.sleep(2)
+
+
 def ssh_args(c, *, tty=False):
     runtime = ROOT / ".runtime" / c["name"]
     runtime.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -197,12 +212,16 @@ def remove_image_cache(name):
     print(f"Removed image cache for {name}: {build}")
 
 
-def add_network_filter_rule(root, action, *, element, direction="out", priority, **attributes):
-    rule = ET.SubElement(root, "rule", {
+def add_network_filter_rule(root, action, *, element, direction="out", priority,
+                            statematch=None, **attributes):
+    rule_attributes = {
         "action": action,
         "direction": direction,
         "priority": str(priority),
-    })
+    }
+    if statematch is not None:
+        rule_attributes["statematch"] = str(statematch).lower()
+    rule = ET.SubElement(root, "rule", rule_attributes)
     ET.SubElement(rule, element, {key: str(value) for key, value in attributes.items()})
 
 
@@ -217,28 +236,75 @@ def add_network_access_rules(root, access):
     for rule_config in rules:
         address = rule_config["ip"]
         ip = ipaddress.ip_address(address)
-        family_tag = "ip" if ip.version == 4 else "ipv6"
         if rule_config["all_ports"]:
-            add_network_filter_rule(root, "accept", element=family_tag, priority=100,
+            # The generic ipv6 element is matched at the bridge layer. The
+            # all-ipv6 protocol element goes through ip6tables, whose libvirt
+            # per-interface chains are unavailable on some nftables hosts.
+            add_network_filter_rule(root, "accept", element="all" if ip.version == 4 else "ipv6",
+                                    priority=100,
                                     dstipaddr=ip.compressed)
             continue
         for port in rule_config["ports"]:
             for transport in ("tcp", "udp"):
-                protocol_number = transport if ip.version == 4 else ("6" if transport == "tcp" else "17")
                 add_network_filter_rule(
-                    root, "accept", element=family_tag, priority=100,
-                    dstipaddr=ip.compressed, protocol=protocol_number,
+                    root, "accept", element=transport if ip.version == 4 else "ipv6", priority=100,
+                    dstipaddr=ip.compressed,
+                    **({} if ip.version == 4 else {"protocol": transport}),
                     dstportstart=port, dstportend=port,
                 )
 
 
-def define_network_filter():
-    name = os.environ["NIXVM_FILTER_NAME"]
+def existing_network_filter_uuid(uri, name):
+    result = subprocess.run(
+        ["virsh", "--connect", uri, "nwfilter-dumpxml", name],
+        capture_output=True, text=True,
+    )
+    if result.returncode:
+        message = (result.stdout + result.stderr).lower()
+        if "failed to get nwfilter" in message or "no nwfilter" in message:
+            return None
+        raise subprocess.CalledProcessError(result.returncode, result.args, result.stdout, result.stderr)
+
+    try:
+        existing = ET.fromstring(result.stdout)
+    except ET.ParseError as error:
+        raise RuntimeError(f"Could not parse existing libvirt filter {name!r}.") from error
+    if existing.get("name") != name:
+        raise RuntimeError(f"Libvirt returned a different filter while looking up {name!r}.")
+    uuid = existing.findtext("uuid")
+    if not uuid:
+        raise RuntimeError(f"Existing libvirt filter {name!r} has no UUID; refusing to replace it blindly.")
+    return uuid
+
+
+def build_network_filter(name, access, filter_uuid=None):
+    """Build the libvirt nwfilter XML for the supplied access policy."""
     if not re.fullmatch(r"nixvm-[a-z][a-z0-9-]{0,30}-access", name):
         raise ValueError(f"Invalid libvirt network filter name: {name}")
-    access = json.loads(os.environ["NIXVM_NETWORK_ACCESS"])
     root = ET.Element("filter", {"name": name, "chain": "root"})
-    ET.SubElement(root, "filterref", {"filter": "clean-traffic"})
+    if filter_uuid:
+        ET.SubElement(root, "uuid").text = filter_uuid
+    # clean-traffic contains an unconditional outbound IPv4 accept that would
+    # shadow these destination rules. Keep its protections as separate refs,
+    # then allow non-denied IPv4/IPv6 traffic at the end of our policy.
+    for filter_name in (
+        "no-mac-spoofing",
+        "no-ip-spoofing",
+        "allow-incoming-ipv4",
+        "no-arp-spoofing",
+    ):
+        ET.SubElement(root, "filterref", {"filter": filter_name})
+    add_network_filter_rule(root, "accept", element="mac", direction="inout",
+                            priority=-500, protocolid="arp")
+    ET.SubElement(root, "filterref", {"filter": "no-other-l2-traffic"})
+    ET.SubElement(root, "filterref", {"filter": "qemu-announce-self-rarp"})
+    add_network_filter_rule(root, "accept", element="all", priority=50,
+                            state="ESTABLISHED,RELATED")
+    # DHCP client requests use UDP 68 -> 67, including limited-broadcast
+    # destinations that are otherwise denied by the internal-range policy.
+    add_network_filter_rule(root, "accept", element="udp", priority=75,
+                            srcportstart=68, srcportend=68,
+                            dstportstart=67, dstportend=67)
 
     # Host allow rules are explicit and are evaluated before internal-network
     # allow rules; remaining traffic to listed host IPs is denied.
@@ -254,8 +320,12 @@ def define_network_filter():
     for address in sorted(host_ips):
         ip = ipaddress.ip_address(address)
         add_network_filter_rule(
-            root, "drop", element="ip" if ip.version == 4 else "ipv6", priority=800,
-            dstipaddr=ip.compressed,
+            root, "drop", element="all" if ip.version == 4 else "ipv6", priority=800,
+            # IPv6 header rules use bridge matching and do not carry the
+            # ip6tables state attribute; the rule-level switch keeps this
+            # destination drop independent of conntrack.
+            statematch=False if ip.version == 6 else None,
+            dstipaddr=ip.compressed, **({"state": "NEW"} if ip.version == 4 else {}),
         )
 
     internal_ranges = [ipaddress.ip_network(cidr) for cidr in access["internal"]["deny_cidrs"]]
@@ -266,21 +336,72 @@ def define_network_filter():
             raise ValueError(f"Internal allow rule {address} is outside internal_network_deny")
     for network in internal_ranges:
         add_network_filter_rule(
-            root, "drop", element="ip" if network.version == 4 else "ipv6", priority=900,
-            dstipaddr=network.network_address.compressed, dstipmask=network.prefixlen,
+            root, "drop", element="all" if network.version == 4 else "ipv6", priority=900,
+            statematch=False if network.version == 6 else None,
+            dstipaddr=network.network_address.compressed,
+            dstipmask=network.prefixlen,
+            **({"state": "NEW"} if network.version == 4 else {}),
         )
+    add_network_filter_rule(root, "accept", element="ip", priority=999)
+    add_network_filter_rule(root, "accept", element="ipv6", priority=999)
+    return root
+
+
+def define_network_filter():
+    name = os.environ["NIXVM_FILTER_NAME"]
+    access = json.loads(os.environ["NIXVM_NETWORK_ACCESS"])
+    uri = json.loads(os.environ["NIXVM_CONNECTION"])["uri"]
+    filter_uuid = existing_network_filter_uuid(uri, name)
+    root = build_network_filter(name, access, filter_uuid)
 
     with tempfile.NamedTemporaryFile(mode="wb", prefix="nixvm-nwfilter-", suffix=".xml") as xml:
         ET.ElementTree(root).write(xml, encoding="utf-8", xml_declaration=True)
         xml.flush()
-        run(["virsh", "--connect", json.loads(os.environ["NIXVM_CONNECTION"])["uri"],
-             "nwfilter-define", xml.name])
-    print(f"Defined host network filter: {name}")
+        run(["virsh", "--connect", uri, "nwfilter-define", xml.name])
+    action = "Updated" if filter_uuid else "Defined"
+    print(f"{action} host network filter: {name}")
+
+
+def tofu_firewall_test_config(extra):
+    expression = (
+        "jsonencode({filter_name = local.network_filter_name, "
+        "filter_access = local.network_filter_access, "
+        "vm_name = local.connection.name, "
+        "connection = local.connection, "
+        "vm_network = {name = local.vm_network_name, uri = var.libvirt_uri, "
+        "cidr = local.vm_network.cidr, gateway = local.vm_network.gateway}, "
+        "network = {name = local.firewall_test_network_name, "
+        "uri = var.libvirt_uri, bridge_network = local.vm_network_name, "
+        "cidr = local.firewall_test_network.cidr, "
+        "gateway = local.firewall_test_network.gateway, "
+        "primary_gateway = local.vm_network.gateway, "
+        "primary_mac = var.mac_address, "
+        "allow_test_port = local.firewall_test_network.allow_test_port, "
+        "deny_test_port = local.firewall_test_network.deny_test_port, "
+        "prefix = local.firewall_test_network.prefix}})"
+    )
+    result = run(["tofu", f"-chdir={ROOT / 'infrastructure'}", "console", *extra],
+                 capture=True, input=expression + "\n").stdout.strip()
+    try:
+        return json.loads(json.loads(result))
+    except (json.JSONDecodeError, TypeError) as error:
+        raise RuntimeError(f"Could not read firewall test configuration from OpenTofu: {result}") from error
+
+
+def run_firewall_tests(extra):
+    config = tofu_firewall_test_config(extra)
+    print("Waiting for guest SSH before running live firewall probes.")
+    wait_ssh(config["connection"], timeout=300)
+    env = os.environ.copy()
+    env["NIXVM_FIREWALL_TEST_CONFIG"] = json.dumps(config)
+    run([sys.executable, "-m", "unittest", "discover", "-s", ROOT / "tests",
+         "-p", "test_firewall.py", "-v"], env=env)
 
 
 def tofu_host_nfs_config(extra):
     expression = (
-        "jsonencode({name = var.name, uri = var.libvirt_uri, network = var.network_name, "
+        "jsonencode({name = var.name, uri = var.libvirt_uri, network = local.vm_network_name, "
+        "network_cidr = local.vm_network.cidr, "
         "exports = var.host_nfs_exports})"
     )
     result = run(["tofu", f"-chdir={ROOT / 'infrastructure'}", "console", *extra],
@@ -335,6 +456,18 @@ def nfs_network_cidrs(uri, network_name):
     return sorted(cidrs, key=lambda value: (ipaddress.ip_network(value).version, value))
 
 
+def configured_nfs_network_cidrs(config):
+    # The dedicated network is created by the same OpenTofu apply that runs
+    # host setup, so use its configured subnet before it exists in libvirt.
+    network_cidr = config.get("network_cidr")
+    if network_cidr:
+        network = ipaddress.ip_network(network_cidr, strict=False)
+        if network.version != 4:
+            raise ValueError("The VM NFS export network must be IPv4.")
+        return [network.with_prefixlen]
+    return nfs_network_cidrs(config["uri"], config["network"])
+
+
 def validate_host_nfs_path(value):
     if any(char.isspace() or char in "#(),\\\"" for char in value):
         raise ValueError(f"Host NFS path contains characters that cannot be represented safely: {value!r}")
@@ -352,7 +485,7 @@ def host_nfs_exports_file(name):
 
 def host_nfs_exports_text(config, cidrs=None):
     if cidrs is None:
-        cidrs = nfs_network_cidrs(config["uri"], config["network"])
+        cidrs = configured_nfs_network_cidrs(config)
     exports = config["exports"]
     sources = sorted({validate_host_nfs_path(export["host_path"]) for export in exports})
     clients = " ".join(f"{cidr}(rw,sync,root_squash,no_subtree_check)" for cidr in cidrs)
@@ -372,7 +505,7 @@ def check_host_nfs():
             )
         print("No host_nfs_exports are configured; no host export check is needed.")
         return
-    cidrs = nfs_network_cidrs(config["uri"], config["network"])
+    cidrs = configured_nfs_network_cidrs(config)
     exports_file = host_nfs_exports_file(config["name"])
     expected = host_nfs_exports_text(config, cidrs)
     if not exports_file.is_file() or exports_file.read_text() != expected:
@@ -417,7 +550,7 @@ def configure_host_nfs(extra):
 
     if config["exports"]:
         package_manager, package, service = host_nfs_distro(values)
-        cidrs = nfs_network_cidrs(config["uri"], config["network"])
+        cidrs = configured_nfs_network_cidrs(config)
         contents = host_nfs_exports_text(config, cidrs)
         if shutil.which("systemctl") is None:
             raise RuntimeError("Automatic host NFS setup requires systemd on the host.")
@@ -512,6 +645,7 @@ def bootstrap():
     c = connection()
     # Bootstrap only runs on initial provisioning or an explicit reprovision.
     # A recreated NixOS disk can generate a new host key at the same DHCP IP.
+    wait_guest_ip(c)
     reset_guest_host_key(c)
     wait_ssh(c)
     config = c["guest_config"]
@@ -532,9 +666,8 @@ def preflight(c):
         failures.append("/dev/kvm is missing or inaccessible")
     try:
         virsh(c, "list", "--all")
-        virsh(c, "net-info", c["network"])
     except subprocess.CalledProcessError:
-        failures.append("Cannot access libvirt or the configured network")
+        failures.append("Cannot access libvirt")
     selected = set(c["guest_config"]["gpu"]["pci_functions"])
     if c["guest_config"]["gpu"]["enabled"]:
         for pci in sorted(selected):
@@ -646,7 +779,7 @@ def usb(c, attach, selector=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["build-image", "remove-image", "define-network-filter", "check-host-nfs", "setup-host-nfs", "bootstrap", "preflight", "ssh", "forward",
+    parser.add_argument("command", choices=["build-image", "remove-image", "define-network-filter", "firewall-test", "check-host-nfs", "setup-host-nfs", "bootstrap", "preflight", "ssh", "forward",
                         "usb-attach", "usb-detach", "rebuild", "rollback", "password", "reboot", "start", "stop",
                         "reprovision", "import-public-keys", "gpu-check", "sunshine-ui", "token-check"])
     parser.add_argument("--name", default="devvm", help="VM name for remove-image (default: devvm)")
@@ -667,6 +800,8 @@ def main():
         return remove_image_cache(args.name)
     if args.command == "define-network-filter":
         return define_network_filter()
+    if args.command == "firewall-test":
+        return run_firewall_tests(extra)
     if args.command == "setup-host-nfs":
         return configure_host_nfs(extra)
     if args.command == "check-host-nfs":

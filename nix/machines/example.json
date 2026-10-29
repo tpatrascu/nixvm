@@ -7,7 +7,7 @@
   "locale": "en_US.UTF-8",
   "keyboard": "us",
   "sshPublicKeys": [],
-  "repoPath": "/home/gigid/dev/nixvm",
+  "repoPath": "/home/gigid/nixvm",
   "dotfilesPath": "/home/gigid/.dotfiles",
   "dotfilesLinks": {".p10k.zsh": ".p10k.zsh"},
   "toolchains": {"python": true, "node": true, "llvm": true, "rust": true},

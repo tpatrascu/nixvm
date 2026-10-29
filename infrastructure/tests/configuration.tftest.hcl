@@ -35,7 +35,7 @@ run "default_vm" {
     error_message = "VM start/stop cycles must not retrigger bootstrap; key it on the stable domain UUID."
   }
   assert {
-    condition     = output.guest_configuration.repoPath == "/home/gigid/dev/nixvm"
+    condition     = output.guest_configuration.repoPath == "/home/gigid/nixvm"
     error_message = "The editable guest checkout must be on the guest disk."
   }
 }

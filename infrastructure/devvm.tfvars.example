@@ -5,14 +5,20 @@ ssh_public_keys = ["ssh-ed25519 REPLACE_WITH_YOUR_PUBLIC_KEY"]
 repository_path = ".." # Relative to infrastructure/
 dotfiles_path   = "~/.dotfiles"
 
-# Guest-initiated host access. The default only permits DNS to the default
-# libvirt gateway. Ports permit TCP and UDP; set all_ports=true and ports=[]
-# to allow all protocols to the listed IPs.
+# Guest-initiated host access. The dedicated VM NAT gateway is included
+# automatically; these IPs add other host addresses. Ports permit TCP and UDP;
+# set all_ports=true and ports=[] to allow all protocols to the listed IPs.
 # host_access = {
-#   ips       = ["192.168.122.1"]
+#   ips       = []
 #   ports     = [53, 2049]
 #   all_ports = false
 # }
+
+# The firewall test subnet is managed on the VM's NAT bridge and removed by
+# `nixvm destroy`. Choose a non-overlapping IPv4 subnet whose gateway remains
+# covered by internal_network_deny.
+# firewall_test_network_cidr = "192.168.123.0/24"
+# vm_network_cidr = "192.168.124.0/24"
 # Guest-initiated access to the standard internal CIDRs is denied by default.
 # Leave internal_network_deny unset to keep those defaults. If overriding that
 # list, include any standard CIDRs you still want denied.

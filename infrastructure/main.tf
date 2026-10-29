@@ -3,57 +3,126 @@ locals {
   build_dir = "${local.root}/.build/${var.name}"
   guest_config = merge(var.guest, {
     sshPublicKeys  = var.ssh_public_keys
-    repoPath       = "/home/${var.guest.username}/dev/nixvm"
+    repoPath       = "/home/${var.guest.username}/nixvm"
     dotfilesPath   = "/home/${var.guest.username}/.dotfiles"
     dotfilesLinks  = var.dotfiles_links
     toolchains     = var.toolchains
     nfsMounts      = var.nfs_mounts
     hostNfsExports = var.host_nfs_exports
-    hostAddress    = var.streaming.host_address
+    hostAddress    = coalesce(var.streaming.host_address, local.vm_network.gateway)
     gpu            = var.gpu
-    streaming      = merge(var.streaming, { enabled = var.gpu.enabled && var.streaming.enabled })
+    streaming = merge(var.streaming, {
+      enabled      = var.gpu.enabled && var.streaming.enabled
+      host_address = coalesce(var.streaming.host_address, local.vm_network.gateway)
+    })
   })
   connection = {
     name         = var.name
     uri          = var.libvirt_uri
     mac          = var.mac_address
-    network      = var.network_name
+    network      = local.vm_network_name
     username     = var.guest.username
     uid          = var.guest.uid
     identity     = pathexpand(var.ssh_identity_file)
     guest_config = local.guest_config
   }
   host_nfs_config = {
-    name    = var.name
-    uri     = var.libvirt_uri
-    network = var.network_name
-    exports = var.host_nfs_exports
+    name         = var.name
+    uri          = var.libvirt_uri
+    network      = local.vm_network_name
+    network_cidr = local.vm_network.cidr
+    exports      = var.host_nfs_exports
   }
-  vm_pool_name        = coalesce(var.vm_storage_pool_name, "${var.name}-user")
-  vm_pool_path        = coalesce(var.vm_storage_pool_path, "/var/lib/libvirt/images/${local.vm_pool_name}")
-  network_filter_name = "nixvm-${var.name}-access"
+  vm_pool_name    = coalesce(var.vm_storage_pool_name, "${var.name}-user")
+  vm_pool_path    = coalesce(var.vm_storage_pool_path, "/var/lib/libvirt/images/${local.vm_pool_name}")
+  vm_network_name = "nixvm-${var.name}-nat"
+  vm_network = {
+    cidr    = var.vm_network_cidr
+    gateway = cidrhost(var.vm_network_cidr, 1)
+    prefix  = tonumber(split("/", var.vm_network_cidr)[1])
+  }
+  network_filter_name        = "nixvm-${var.name}-access"
+  firewall_test_network_name = "nixvm-firewall-test-subnet"
+  firewall_test_network = {
+    cidr            = var.firewall_test_network_cidr
+    gateway         = cidrhost(var.firewall_test_network_cidr, 1)
+    prefix          = tonumber(split("/", var.firewall_test_network_cidr)[1])
+    allow_test_port = 49231
+    deny_test_port  = 49232
+  }
   network_filter_access = {
     host = {
-      ips = distinct(concat(var.host_access.ips,
-      length(var.host_nfs_exports) > 0 ? [var.streaming.host_address] : []))
+      ips = distinct(concat([local.vm_network.gateway], var.host_access.ips,
+      length(var.host_nfs_exports) > 0 ? [local.guest_config.hostAddress] : []))
       ports = var.host_access.all_ports ? [] : distinct(concat(var.host_access.ports,
       length(var.host_nfs_exports) > 0 ? [2049] : []))
       all_ports = var.host_access.all_ports
     }
     internal = {
       deny_cidrs = var.internal_network_deny
-      allow      = var.internal_network_allow
+      # A short-lived host listener on the firewall test subnet gives the
+      # guest connectivity probes one narrowly-scoped expected success case.
+      allow = concat(var.internal_network_allow, [{
+        ip        = local.firewall_test_network.gateway
+        ports     = [local.firewall_test_network.allow_test_port]
+        all_ports = false
+      }])
     }
   }
 }
 
 resource "terraform_data" "preflight" {
-  triggers_replace = [var.libvirt_uri, var.network_name, jsonencode(var.gpu)]
+  triggers_replace = [var.libvirt_uri, local.vm_network_name, jsonencode(var.gpu)]
   provisioner "local-exec" {
     command = "python3 \"$NIXVM_ROOT/scripts/nixvm.py\" preflight"
     environment = {
       NIXVM_ROOT       = local.root
       NIXVM_CONNECTION = jsonencode(local.connection)
+    }
+  }
+}
+
+# Use a dedicated NAT network for this VM. The default libvirt network is
+# intentionally left untouched because this VM has a custom filter and test NIC.
+resource "libvirt_network" "vm_nat" {
+  name      = local.vm_network_name
+  autostart = true
+  forward   = { mode = "nat" }
+  ips = [
+    {
+      address = local.vm_network.gateway
+      prefix  = local.vm_network.prefix
+      dhcp = {
+        ranges = [{
+          start = cidrhost(var.vm_network_cidr, 2)
+          end   = cidrhost(var.vm_network_cidr, -2)
+        }]
+      }
+    },
+    # Keep the firewall probe subnet on the same bridge as the primary NIC.
+    # This lets SSH probes reach the host-side test endpoint without a second
+    # TAP device whose link state is unreliable on some libvirt hosts.
+    {
+      address = local.firewall_test_network.gateway
+      prefix  = local.firewall_test_network.prefix
+    },
+  ]
+  depends_on = [terraform_data.preflight]
+
+  lifecycle {
+    precondition {
+      condition = (
+        !cidrcontains(var.firewall_test_network_cidr, cidrhost(var.vm_network_cidr, 0)) &&
+        !cidrcontains(var.vm_network_cidr, cidrhost(var.firewall_test_network_cidr, 0))
+      )
+      error_message = "vm_network_cidr and firewall_test_network_cidr must not overlap."
+    }
+    precondition {
+      condition = anytrue([
+        for cidr in var.internal_network_deny : !strcontains(cidr, ":") &&
+        cidrcontains(cidr, local.firewall_test_network.gateway)
+      ]) && !contains([for rule in var.internal_network_allow : rule.ip], local.firewall_test_network.gateway)
+      error_message = "The firewall test gateway must be covered by internal_network_deny and must not appear in internal_network_allow."
     }
   }
 }
@@ -149,7 +218,7 @@ resource "libvirt_volume" "user_root" {
 }
 
 resource "libvirt_domain" "vm" {
-  depends_on  = [terraform_data.preflight, terraform_data.network_filter, terraform_data.host_nfs]
+  depends_on  = [terraform_data.preflight, terraform_data.network_filter, terraform_data.host_nfs, libvirt_network.vm_nat]
   name        = var.name
   type        = "kvm"
   memory      = var.memory_mib
@@ -185,12 +254,14 @@ resource "libvirt_domain" "vm" {
       source = { file = { file = libvirt_volume.user_root.path } }
       target = { dev = "vda", bus = "virtio" }
     }]
-    interfaces = [{
-      mac        = { address = var.mac_address }
-      model      = { type = "virtio" }
-      source     = { network = { network = var.network_name } }
-      filter_ref = { filter = local.network_filter_name }
-    }]
+    interfaces = [
+      {
+        mac        = { address = var.mac_address }
+        model      = { type = "virtio" }
+        source     = { network = { network = local.vm_network_name } }
+        filter_ref = { filter = local.network_filter_name }
+      },
+    ]
     channels = concat([
       { source = { unix = {} }, target = { virt_io = { name = "org.qemu.guest_agent.0" } } }
       ], var.gpu.enabled ? [] : [

@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """User-facing commands for the local NixOS VM workflow."""
 
+import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -16,10 +18,10 @@ def usage():
     print("""Usage: nixvm <command> [options]
 
 VM lifecycle:
-  up | apply [tofu options]  Prepare host NFS exports, then run tofu apply
+  up | apply [tofu options]  Run firewall tests, prepare NFS, then tofu apply
   init [tofu options]        Initialize OpenTofu
   plan [tofu options]        Run tofu plan
-  destroy [tofu options]     Run tofu destroy; host NFS exports are retained
+  destroy [tofu options]     Destroy VM, clear its SSH host key; retain host NFS exports
   preflight [var options]    Check host tools, libvirt, and VM settings
   start [options]            Start the VM
   stop [options]             Gracefully stop the VM
@@ -32,6 +34,7 @@ Host setup:
   nfs setup [var options]    Confirm and configure host NFS exports
   nfs cleanup [var options]  Confirm removal of this VM's managed exports
   image remove [--name NAME] Remove a generated bootstrap image cache
+  firewall-test [var options] Check the managed firewall network and policy
 
 Variable files default to infrastructure/devvm.tfvars when it exists. Pass
 -var-file=PATH or set NIXVM_VAR_FILE to select another file.""")
@@ -92,8 +95,29 @@ def tofu(command, arguments):
     run(["tofu", f"-chdir={INFRA}", command, *arguments])
 
 
+def current_vm_name():
+    result = subprocess.run(
+        ["tofu", f"-chdir={INFRA}", "output", "-json", "connection"],
+        cwd=ROOT, check=False, text=True, stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    if result.returncode:
+        return None
+    try:
+        name = json.loads(result.stdout)["name"]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return None
+    if isinstance(name, str) and re.fullmatch(r"[a-z][a-z0-9-]{0,30}", name):
+        return name
+    return None
+
+
 def internal(command, arguments=()):
     run([sys.executable, str(INTERNAL), command, *arguments])
+
+
+def firewall_tests(variables):
+    internal("firewall-test", variables)
 
 
 def main(arguments):
@@ -106,6 +130,7 @@ def main(arguments):
         variables, operation = split_arguments(extra)
         internal("setup-host-nfs", variables)
         tofu("apply", [*variables, *operation])
+        firewall_tests(variables)
     elif command == "init":
         tofu("init", extra)
     elif command == "plan":
@@ -113,12 +138,20 @@ def main(arguments):
         tofu("plan", [*variables, *operation])
     elif command == "destroy":
         variables, operation = split_arguments(extra)
+        vm_name = current_vm_name()
         tofu("destroy", [*variables, *operation])
+        if vm_name:
+            (ROOT / ".runtime" / vm_name / "known_hosts").unlink(missing_ok=True)
     elif command == "preflight":
         variables, operation = split_arguments(extra)
         if operation:
             raise ValueError("nixvm preflight accepts only -var-file and -var options")
         internal("preflight", variables)
+    elif command == "firewall-test":
+        variables, operation = split_arguments(extra)
+        if operation:
+            raise ValueError("nixvm firewall-test accepts only -var-file and -var options")
+        firewall_tests(variables)
     elif command == "nfs":
         if not extra or extra[0] not in ("setup", "cleanup"):
             raise ValueError("Use 'nixvm nfs setup' or 'nixvm nfs cleanup'")

@@ -89,16 +89,41 @@ variable "uefi" {
     error_message = "UEFI firmware and NVRAM paths must be absolute host paths."
   }
 }
-variable "network_name" {
-  type    = string
-  default = "default"
+variable "vm_network_cidr" {
+  description = "IPv4 subnet for this VM's dedicated libvirt NAT network."
+  type        = string
+  default     = "192.168.124.0/24"
+  validation {
+    condition = can(cidrnetmask(var.vm_network_cidr)) && try(
+      tonumber(split("/", var.vm_network_cidr)[1]) >= 16 &&
+      tonumber(split("/", var.vm_network_cidr)[1]) <= 30,
+      false
+    )
+    error_message = "vm_network_cidr must be a valid IPv4 CIDR with a prefix from /16 through /30."
+  }
+}
+variable "firewall_test_network_cidr" {
+  description = "IPv4 test subnet configured on the VM's NAT bridge. Its gateway must remain in internal_network_deny."
+  type        = string
+  default     = "192.168.123.0/24"
+  validation {
+    condition = can(cidrnetmask(var.firewall_test_network_cidr)) && try(
+      tonumber(split("/", var.firewall_test_network_cidr)[1]) >= 16 &&
+      tonumber(split("/", var.firewall_test_network_cidr)[1]) <= 30,
+      false
+    )
+    error_message = "firewall_test_network_cidr must be a valid IPv4 CIDR with a prefix from /16 through /30."
+  }
 }
 variable "mac_address" {
   type    = string
   default = "52:54:00:dc:10:01"
   validation {
-    condition     = can(regex("^52:54:00(:[0-9a-fA-F]{2}){3}$", var.mac_address))
-    error_message = "Use a unique QEMU MAC address beginning with 52:54:00."
+    condition = alltrue([
+      can(regex("^52:54:00(:[0-9a-fA-F]{2}){3}$", var.mac_address)),
+      lower(var.mac_address) != "52:54:00:dc:10:fe",
+    ])
+    error_message = "Use a unique QEMU MAC address beginning with 52:54:00, distinct from the firewall test interface MAC."
   }
 }
 variable "host_access" {
@@ -109,7 +134,7 @@ variable "host_access" {
     all_ports = bool
   })
   default = {
-    ips       = ["192.168.122.1"]
+    ips       = []
     ports     = [53]
     all_ports = false
   }
@@ -312,7 +337,7 @@ variable "streaming" {
     encoder        = optional(string, "nvenc")
     autologin      = optional(bool, true)
     capture_output = optional(string, "")
-    host_address   = optional(string, "192.168.122.1")
+    host_address   = optional(string)
   })
   default = {}
   validation {
@@ -320,7 +345,7 @@ variable "streaming" {
     error_message = "Choose nvenc or explicitly opt into software encoding."
   }
   validation {
-    condition     = can(cidrnetmask("${var.streaming.host_address}/32"))
+    condition     = var.streaming.host_address == null || can(cidrnetmask("${var.streaming.host_address}/32"))
     error_message = "streaming.host_address must be the host's IPv4 address on the libvirt network."
   }
 }

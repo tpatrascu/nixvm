@@ -96,9 +96,11 @@ agent. The private key stays outside the guest and OpenTofu state.
 Passwords are set interactively after provisioning and survive rebuilds. The
 development user has passwordless sudo; root SSH and SSH password login are off.
 
-`nixvm up` first checks and prepares configured host NFS exports, with
-confirmation before installing packages or changing host services. OpenTofu
-then performs these steps:
+`nixvm up` checks and prepares configured host NFS exports with confirmation
+before installing packages or changing host services. OpenTofu then applies
+the VM and its managed firewall test subnet; after apply, the `nixvm-firewall-test`
+suite checks the live libvirt network and filter. Rerun those checks with
+`./nixvm firewall-test`.
 
 1. Check host tools, KVM/libvirt access, and selected GPU devices.
 2. Reuse the cached NixOS UEFI QCOW2 image, or build it on the first apply.
@@ -109,7 +111,7 @@ then performs these steps:
    configuration over SSH.
 
 The host paths are interpreted relative to `infrastructure/` when relative.
-Guest defaults are `~/dev/nixvm` and `~/.dotfiles`, both on the VM disk.
+Guest defaults are `~/nixvm` and `~/.dotfiles`, both on the VM disk.
 Submodules and Git LFS assets are not initialized automatically; this initial
 project does not use either. Configure them explicitly if your dotfiles do.
 
@@ -129,11 +131,10 @@ variables, so changing the allow rules preserves the default deny CIDRs. Each
 allow rule specifies one IP and its own allowed ports, over both TCP and UDP.
 For example, add `2049` under
 `host_access.ports` to let the VM reach a host's NFSv4 service. The
-default `host_access` allows DNS to `192.168.122.1`, the usual gateway address
-for libvirt's default network and denies other guest-initiated access to that
-host IP. Add any other host IPs the VM could reach to `host_access.ips` so their
-access is limited to the configured ports. Update the default IP if the network
-uses another DNS gateway.
+default `host_access` allows DNS to the dedicated VM NAT gateway and denies
+other guest-initiated access to that host IP. Add any other host IPs the VM
+could reach to `host_access.ips` so their access is limited to the configured
+ports.
 
 `internal_network_deny` defaults to the standard special-use, private,
 documentation, benchmarking, multicast, link-local, and reserved IPv4/IPv6
@@ -142,19 +143,55 @@ along with organization-specific CIDRs. Each `internal_network_allow` entry
 allows selected ports to one IP within the denied ranges. Set that entry's
 `all_ports = true` and `ports = []` to allow every protocol and port to that IP.
 The allow list defaults to empty, so internal network access remains denied.
+OpenTofu reserves the test network gateway for a single probe port so the live
+test can demonstrate an allowed connection; the host listener exists only while
+the test is running.
 Apply changes with `tofu apply`.
+
+The VM's primary interface uses a separate, per-VM libvirt NAT network named
+`nixvm-<VM name>-nat`; it does not attach to libvirt's `default` network. Set
+`vm_network_cidr` to choose its IPv4 subnet (default `192.168.124.0/24`). Keep
+it distinct from `firewall_test_network_cidr` and any other host/libvirt
+subnets. The network is managed by OpenTofu and removed by `tofu destroy`.
+
+OpenTofu also configures the firewall test subnet on that NAT bridge. Set
+`firewall_test_network_cidr` to choose its IPv4 subnet; the default is
+`192.168.123.0/24`. Its gateway must be covered by `internal_network_deny` and
+absent from `internal_network_allow`, otherwise OpenTofu rejects the apply.
+This gives the guest and host a reachable test endpoint without adding a
+second VM interface. The subnet is removed with the NAT network by
+`tofu destroy`.
+
+The `nixvm-firewall-test` suite runs after apply and checks that both configured
+subnets are present on the NAT network, and that the live libvirt filter XML
+matches the policy and is attached to the VM interface. Over SSH, it adds a
+temporary route to the test gateway and attempts TCP connections to two host
+listeners: the configured test port must connect, while the neighboring denied
+port must time out. The filter grants the test gateway one narrow port
+exception for this probe, over TCP and UDP; listeners run only during the
+suite. The guest also sends UDP probes and the host confirms that only the
+allowed port arrives.
+Generated-policy tests also check per-IP TCP/UDP port rules, all-port rules,
+host-access drops, IPv4/IPv6 CIDR drops, allow-before-deny ordering, and
+invalid allow-list configurations.
+Run `./nixvm firewall-test` to repeat these checks after a successful
+`nixvm up`. The suite fails if the managed network or live filter is missing,
+differs from the configured policy, is not attached, or does not enforce the
+allow and deny connectivity cases.
 
 Provisioning accepts a new SSH host key into `.runtime/<name>/known_hosts` on
 first contact. Verify its fingerprint through the libvirt console if the host
 network is not trusted. A changed key is rejected; inspect it before removing an
-old entry following an intentional recreation.
+old entry following an intentional recreation. `./nixvm destroy` removes the
+VM's `known_hosts` file after a successful destroy so a later VM created with
+the same name can accept its new host key.
 
 ## Edit and rebuild
 
 Inside the VM:
 
 ```sh
-cd ~/dev/nixvm
+cd ~/nixvm
 # Edit nix/modules/* or nix/machines/current.json.
 nixvm-rebuild                  # switch
 nixvm-rebuild boot             # activate at next boot
@@ -183,8 +220,9 @@ Common commands:
 
 | Command | Action |
 | --- | --- |
-| `./nixvm up` | Prepare configured host NFS exports, then create/update the VM |
-| `./nixvm plan` / `./nixvm destroy` | Review changes / destroy the VM resources |
+| `./nixvm up` | Prepare host NFS, apply VM/network resources, then check firewall policy |
+| `./nixvm firewall-test` | Check the managed test network and live firewall policy |
+| `./nixvm plan` / `./nixvm destroy` | Review changes / destroy the managed VM and test network |
 | `./nixvm ssh` | Interactive guest shell |
 | `./nixvm ssh uname -a` | Execute a guest command |
 | `./nixvm rebuild` / `./nixvm rollback` | Activate the guest checkout / previous generation |
@@ -200,9 +238,11 @@ Common commands:
 
 The wrapper uses `infrastructure/devvm.tfvars` when present. Choose another
 variable file with `-var-file=PATH` or `NIXVM_VAR_FILE=PATH`. OpenTofu's direct
-commands remain available, but direct `tofu apply` does not run the wrapper's
-host NFS setup step. `scripts/nixvm.py` contains lower-level callbacks and
-helpers; use `./nixvm` for normal host operations.
+commands remain available, but direct `tofu apply` skips the wrapper's live
+firewall policy tests and host NFS setup. The NAT network and firewall test
+subnet are managed by OpenTofu. `scripts/nixvm.py`
+contains lower-level callbacks and helpers; use `./nixvm` for normal host
+operations.
 
 The optional root-level `nixvm_test_ed25519` key is Git-ignored but is copied
 into the guest with the repository. Keep private identities outside repository
@@ -270,8 +310,8 @@ overwritten.
 `server`, `export`, `mountpoint`, and optional mount options. Use
 `host_nfs_exports` for host directories exported and mounted by the VM; each
 entry maps an absolute host `host_path` to an absolute guest `guest_path`. The
-guest uses `streaming.host_address` as the host's libvirt-network address
-(default `192.168.122.1`).
+guest uses `streaming.host_address` as the host's libvirt-network address; when
+unset, it uses the dedicated VM NAT gateway.
 
 When `host_nfs_exports` is nonempty, `./nixvm up` invokes host setup before
 OpenTofu. The script detects the host distribution, prints the
