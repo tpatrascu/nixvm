@@ -1,6 +1,15 @@
 { lib, machine, ... }:
+let
+  hostMounts = map (export: {
+    server = machine.hostAddress;
+    export = export.host_path;
+    mountpoint = export.guest_path;
+    options = export.options;
+  }) machine.hostNfsExports;
+  mounts = machine.nfsMounts ++ hostMounts;
+in
 {
-  boot.supportedFilesystems = lib.optional (machine.nfsMounts != []) "nfs";
+  boot.supportedFilesystems = lib.optional (mounts != []) "nfs";
   fileSystems = builtins.listToAttrs (map (mount: {
     name = mount.mountpoint;
     value = {
@@ -11,5 +20,5 @@
         "x-systemd.mount-timeout=15s"
       ];
     };
-  }) machine.nfsMounts);
+  }) mounts);
 }

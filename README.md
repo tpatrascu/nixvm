@@ -55,12 +55,11 @@ with mode `0660`; the pool directory is mode `0770`. Check host IDs with
 `disk_permissions.gid` accordingly. The VM uses one managed disk in the
 dedicated pool. Reprovisioning does not replace it automatically.
 
-Both this directory and `~/.dotfiles` must be genuine Git working trees with at
-least one commit. Initialize them or clone their real remotes before provisioning.
-Git worktrees are supported; their host-specific `.git` pointer is not copied.
-Do not commit credentials: complete Git history is transferred along with the
-current branch. Provisioning excludes common credential/cache files from the
-working-tree overlay, but cannot erase secrets from Git history.
+Both this directory and `~/.dotfiles` should be Git working trees. Provisioning
+copies each directory as-is, including `.git`, ignored files, and uncommitted
+changes. Git worktrees have a host-specific `.git` pointer, so use a regular
+clone instead. Review the contents before provisioning; secrets and caches are
+copied too.
 
 ## Create the VM
 
@@ -100,18 +99,48 @@ development user has passwordless sudo; root SSH and SSH password login are off.
 The first apply performs these ordered steps:
 
 1. Check host tools, KVM/libvirt access, and selected GPU devices.
-2. Build a minimal NixOS UEFI QCOW2 image with your user and SSH public keys.
+2. Reuse the cached NixOS UEFI QCOW2 image, or build it on the first apply.
 3. Resize its QCOW2 virtual capacity to the requested disk size and upload it.
 4. Create the VM and discover its IPv4 DHCP lease by its configured MAC.
-5. Independently clone each local repository into staging, preserve history,
-   restore its real Git remotes, and overlay dirty/untracked nonignored files.
-6. Transfer the staged checkouts, write non-secret machine settings, and activate
-   the complete NixOS/Home Manager configuration over SSH.
+5. Copy each local directory into temporary staging, transfer it to the guest,
+   write non-secret machine settings, and activate the NixOS/Home Manager
+   configuration over SSH.
 
 The host paths are interpreted relative to `infrastructure/` when relative.
 Guest defaults are `~/dev/nixvm` and `~/.dotfiles`, both on the VM disk.
 Submodules and Git LFS assets are not initialized automatically; this initial
 project does not use either. Configure them explicitly if your dotfiles do.
+
+## VM network access
+
+OpenTofu defines a host-side libvirt network filter and attaches it to the VM's
+interface. Guest-initiated internet access remains unrestricted. The filter
+blocks guest-initiated traffic to the standard special-use, private,
+documentation, benchmarking, multicast, link-local, and reserved IPv4/IPv6
+ranges unless explicitly allowed by the host configuration. It does not restrict
+host-initiated connections to the VM, including SSH.
+
+Configure the `host_access` and `internal_network` objects in
+`infrastructure/devvm.tfvars`. `host_access` lists exact host IPs and allowed
+ports; `internal_network` lists denied CIDRs plus per-IP allow rules. Each rule
+specifies one IP and its own allowed ports, over both TCP and UDP.
+For example, add `2049` under
+`host_access.ports` to let the VM reach a host's NFSv4 service. The
+default `host_access` allows DNS to `192.168.122.1`, the usual gateway address
+for libvirt's default network and denies other guest-initiated access to that
+host IP. Add any other host IPs the VM could reach to `host_access.ips` so their
+access is limited to the configured ports. Update the default IP if the network
+uses another DNS gateway.
+
+`internal_network.deny_cidrs` defaults to the standard special-use, private,
+documentation, benchmarking, multicast, link-local, and reserved IPv4/IPv6
+ranges. Add organization-specific internal CIDRs there. If you override
+`internal_network`, retain the defaults you still want blocked because the
+object replaces the default as a whole. Each `internal_network.allow` entry
+allows selected ports to one IP within those ranges. Set that entry's
+`all_ports = true` and `ports = []` to allow every protocol and port to that IP.
+By default the allow list is empty, so internal network access is denied.
+Apply changes with `tofu apply`.
 
 Provisioning accepts a new SSH host key into `.runtime/<name>/known_hosts` on
 first contact. Verify its fingerprint through the libvirt console if the host
@@ -163,23 +192,33 @@ Host convenience commands:
 | `scripts/nixvm.py stop --timeout 300` | Allow up to five minutes for graceful shutdown |
 | `scripts/nixvm.py stop --force` | Abruptly power off a stuck VM; unsaved guest writes may be lost |
 | `scripts/nixvm.py reprovision -var-file=devvm.tfvars` | Explicit bootstrap retry |
+| `scripts/nixvm.py setup-host-nfs -var-file=devvm.tfvars` | Install/configure host NFS exports after confirmation |
+| `scripts/nixvm.py remove-image` | Remove the default VM's local generated image cache |
+| `scripts/nixvm.py remove-image --name workvm` | Remove another VM's local generated image cache |
 
-The optional root-level `nixvm_test_ed25519` key is Git-ignored and excluded
-from repository transfers. To use it with host commands, set
+The optional root-level `nixvm_test_ed25519` key is Git-ignored but is copied
+into the guest with the repository. Keep private identities outside repository
+directories. To use it with host commands, set
 `NIXVM_SSH_IDENTITY="$PWD/nixvm_test_ed25519"` in that command's environment;
 its public key must also be in the guest's `ssh_public_keys` machine setting.
 Never add the private key to Git, OpenTofu variables, or the guest.
 
-Reprovisioning preserves existing guest Git directories and rebuilds from them.
-A failed transfer stays in a sibling `.nixvm-staging` directory and can be
-retried; an unknown destination without `.git` is rejected for manual inspection.
+Reprovisioning preserves existing guest checkouts and rebuilds from them. A
+failed transfer stays in a sibling `.nixvm-staging` directory and can be retried;
+an unknown destination without `.git` is rejected for manual inspection.
 Normal reapply does not transfer repositories or run a rebuild.
 
 All OpenTofu-managed resources can be destroyed with `tofu destroy`, including
 the VM domain, disk volume, and dedicated storage pool. Destroying the disk
 permanently removes the guest filesystem and any edits or data not backed up
 elsewhere. Push both repositories and back up other needed data before
-destroying. Host `.build/` and `.runtime/` are local artifacts, not backups.
+destroying. The generated bootstrap image in `.build/<VM name>/` is kept, so
+the next `tofu apply` can reuse it. Run `scripts/nixvm.py remove-image` to delete
+the default VM's cache; add `--name <VM name>` for a custom VM. This only removes
+the host-side cache and does not affect an existing VM disk. Remove the cache
+before applying if you want to regenerate the bootstrap image with changed
+image inputs such as SSH public keys. Host `.runtime/` is also a local artifact,
+not a backup.
 Do not commit OpenTofu state.
 
 ## Modules and dotfiles
@@ -211,22 +250,38 @@ Nix libraries, a project-specific shell, or packaging. Avoid global `sudo pip`
 and `sudo npm`. Update inputs deliberately with `nix flake update --flake ./nix`,
 then review the lock and rebuild; no automatic updates run.
 
-The initial dotfiles copy receives a small, reviewable `.zshrc` portability edit:
-guard host Homebrew initialization, accept Nix's OpenSC path, and avoid loading
-Oh My Zsh twice. The host dotfiles checkout is untouched. Review/commit the diff
-from the guest and pull it normally on the host. Oh My Zsh and Powerlevel10k come
-from Nix; `.p10k.zsh` links to the editable checkout. Extend `dotfiles_links` for
-other files. Runtime completion caches are excluded. Dotfiles are never pulled
-automatically. Existing conflicting Home Manager destinations are not overwritten.
-The portability adapter requires `.dotfiles/.zshrc` to be a regular file; it
-rejects symlinks rather than risk rewriting a target outside the staged copy.
+Dotfiles are copied as-is. Make any VM-specific `.zshrc` compatibility changes
+yourself. Oh My Zsh and Powerlevel10k come from Nix; `.p10k.zsh` links to the
+editable checkout. Extend `dotfiles_links` for other files. Dotfiles are never
+pulled automatically. Existing conflicting Home Manager destinations are not
+overwritten.
 
 ## NFS
 
-Configure a host export separately, restrict it to the VM/network, and set
-`nfs_mounts` in your variables. For the default libvirt NAT network the host is
-usually `192.168.122.1`; verify your actual network. Each mount declares `server`,
-`export`, a distinct `/mnt/...` mountpoint, and optional NFS options.
+`nfs_mounts` is a list of remote NFS exports you define manually; each entry has
+`server`, `export`, `mountpoint`, and optional mount options. Use
+`host_nfs_exports` for host directories exported and mounted by the VM; each
+entry maps an absolute host `host_path` to an absolute guest `guest_path`. The
+guest uses `streaming.host_address` as the host's libvirt-network address
+(default `192.168.122.1`).
+
+Before applying a nonempty `host_nfs_exports` list, run
+`scripts/nixvm.py setup-host-nfs -var-file=devvm.tfvars` in a terminal. The script
+detects the host distribution, prints the package/service/export changes, and
+requires you to type `yes` before proceeding. It supports Debian/Ubuntu,
+Fedora/RHEL, Arch, and openSUSE families; it installs the NFS server package if
+needed and writes `/etc/exports.d/nixvm-<name>.exports`. Source directories must
+already exist. Exports are limited to the selected libvirt network's IPv4 CIDR;
+other guests attached to that same network can also access them. The script
+does not change host firewall rules, so allow TCP port 2049 from that subnet if
+the host firewall is active. On SELinux-enforcing hosts, assign suitable NFS
+export labels to the source directories yourself; the script does not change
+SELinux policy. When `host_nfs_exports` is nonempty, OpenTofu checks
+that the managed export file and NFS service are ready, and allows guest traffic
+to host port 2049 in the VM's libvirt filter. Set `host_nfs_exports = []` and
+rerun the setup command to remove the managed export file; the package and
+service remain installed. `tofu destroy` does not remove host exports, so run
+the setup command with an empty list before destroying if you want them removed.
 
 Match guest UID/GID with the host owner for normal NFS AUTH_SYS permissions.
 The NFSv4 automount does not block boot when the host export is down. Once in use,
@@ -258,9 +313,8 @@ scripts/check.sh
 NIXVM_BUILD_CHECKS=1 scripts/check.sh
 ```
 
-Mocked OpenTofu plans do not create VMs. Python tests exercise actual temporary
-Git repositories, dirty/deleted/untracked files, credential exclusions, worktree
-independence, dotfiles portability, and preservation of existing guest checkouts.
+Mocked OpenTofu plans do not create VMs. Python tests cover VM lifecycle behavior
+and preservation of existing guest checkouts.
 
 Hardware acceptance after the first boot:
 

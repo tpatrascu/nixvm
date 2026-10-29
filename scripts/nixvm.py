@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import fnmatch
 import ipaddress
 import json
 import os
@@ -18,12 +17,6 @@ import time
 import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[1]
-EXCLUDED_PARTS = {".git", ".terraform", ".aws", ".gnupg", ".build", ".runtime",
-                  "node_modules", ".venv", "venv", "__pycache__", ".cache", "target"}
-EXCLUDED_NAMES = ["*.tfstate*", "*.tfvars", "*.tfvars.json", "*.tfplan", ".env", ".env.*", "*.pem",
-                  "*.key", "id_rsa*", "id_ed25519*", "nixvm_test_ed25519*", ".zcompdump*", "result", "result-*"]
-
-
 def run(args, *, capture=False, **kwargs):
     return subprocess.run([str(x) for x in args], check=True, text=True,
                           stdout=subprocess.PIPE if capture else None, **kwargs)
@@ -31,108 +24,6 @@ def run(args, *, capture=False, **kwargs):
 
 def output(args, **kwargs):
     return run(args, capture=True, **kwargs).stdout.strip()
-
-
-def excluded(path):
-    p = Path(path)
-    return (any(part in EXCLUDED_PARTS for part in p.parts) or
-            (".ssh" in p.parts and p.name != "config") or
-            any(fnmatch.fnmatch(p.name, pat) for pat in EXCLUDED_NAMES))
-
-
-def git_check(path):
-    path = Path(path).expanduser().resolve()
-    if output(["git", "-C", path, "rev-parse", "--show-toplevel"]) != str(path):
-        raise ValueError(f"Repository path must be its working-tree root: {path}")
-    run(["git", "-C", path, "rev-parse", "--verify", "HEAD"], capture=True)
-    return path
-
-
-def portable_zsh(text):
-    """Adapt the known Ubuntu dotfiles without modifying the host checkout."""
-    text = text.replace('export ZSH="$HOME/.oh-my-zsh"',
-                        'export ZSH="${ZSH:-$HOME/.oh-my-zsh}"')
-    text = re.sub(r'^source ["\']?\$ZSH/oh-my-zsh\.sh["\']?\s*$',
-                  'if [[ -z ${NIXVM_ZSH_MANAGED:-} ]]; then source "$ZSH/oh-my-zsh.sh"; fi',
-                  text, flags=re.M)
-    text = text.replace('PKCS11_MODULE="/usr/lib/x86_64-linux-gnu/opensc-pkcs11.so"',
-                        'PKCS11_MODULE="${PKCS11_MODULE:-/usr/lib/x86_64-linux-gnu/opensc-pkcs11.so}"')
-    text = re.sub(r'^eval "\$\(/home/linuxbrew/\.linuxbrew/bin/brew shellenv zsh\)"$',
-                        'if [[ -z ${NIXVM_ZSH_MANAGED:-} && -x /home/linuxbrew/.linuxbrew/bin/brew ]]; then\n'
-                        '  eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv zsh)"\nfi', text, flags=re.M)
-    return text
-
-
-def stage_repository(source, destination, *, dotfiles=False):
-    """Clone history (including worktrees), overlay edits, retain real remotes."""
-    source = git_check(source)
-    destination = Path(destination)
-    remotes = {}
-    for remote_name in output(["git", "-C", source, "remote"]).splitlines():
-        fetch_url = output(["git", "-C", source, "remote", "get-url", remote_name])
-        push_url = output(["git", "-C", source, "remote", "get-url", "--push", remote_name])
-        if any(re.match(r"^https?://[^/]*@", url) for url in (fetch_url, push_url)):
-            raise ValueError("Remove embedded HTTPS credentials from Git remotes before copying repositories")
-        remotes[remote_name] = (fetch_url, push_url)
-    refs = output(["git", "-C", source, "for-each-ref", "--format=%(objectname) %(refname)",
-                   "refs/heads", "refs/remotes"])
-    # Never let copied repository symlinks write outside the staging tree.
-    files = subprocess.check_output(
-        ["git", "-C", str(source), "ls-files", "--cached", "--others", "--exclude-standard", "-z"]
-    ).decode().split("\0")
-    run(["git", "clone", "--quiet", "--no-hardlinks", "--dissociate", source, destination])
-    # Remove credentials/caches even if tracked; their presence in history is
-    # still the owner's responsibility and is documented.
-    for path in sorted(destination.rglob("*"), key=lambda p: len(p.parts), reverse=True):
-        rel = path.relative_to(destination)
-        if rel.parts[0] == ".git":
-            continue
-        if excluded(rel):
-            if path.is_dir() and not path.is_symlink():
-                shutil.rmtree(path)
-            else:
-                path.unlink(missing_ok=True)
-    for name in files:
-        if not name or excluded(name):
-            continue
-        src, dst = source / name, destination / name
-        # Files beneath directory symlinks are not emitted by git ls-files.
-        if dst.is_symlink():
-            dst.unlink()
-        if not src.exists() and not src.is_symlink():
-            if dst.exists():
-                dst.unlink()
-            continue
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        if src.is_symlink():
-            dst.symlink_to(os.readlink(src))
-        else:
-            shutil.copy2(src, dst)
-    for remote in output(["git", "-C", destination, "remote"]).splitlines():
-        run(["git", "-C", destination, "remote", "remove", remote])
-    for remote, (url, push) in remotes.items():
-        run(["git", "-C", destination, "remote", "add", remote, url])
-        if push != url:
-            run(["git", "-C", destination, "remote", "set-url", "--push", remote, push])
-    for line in refs.splitlines():
-        commit, ref = line.split(" ", 1)
-        # clone transfers local branch objects, but may not transfer stale remote
-        # objects; retain every source ref whose object is present in the clone.
-        available = subprocess.run(["git", "-C", str(destination), "cat-file", "-e", commit],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if available.returncode == 0:
-            run(["git", "-C", destination, "update-ref", ref, commit])
-    branch = subprocess.run(["git", "-C", str(source), "symbolic-ref", "--short", "HEAD"],
-                            text=True, capture_output=True)
-    if branch.returncode == 0 and "origin" in output(["git", "-C", source, "remote"]).splitlines():
-        run(["git", "-C", destination, "config", f"branch.{branch.stdout.strip()}.remote", "origin"])
-        run(["git", "-C", destination, "config", f"branch.{branch.stdout.strip()}.merge",
-             f"refs/heads/{branch.stdout.strip()}"])
-    if dotfiles and (destination / ".zshrc").is_file():
-        shell = destination / ".zshrc"
-        if shell.is_symlink():
-            raise ValueError("Dotfiles .zshrc must be a regular file for the portability adapter")
-        shell.write_text(portable_zsh(shell.read_text()))
 
 
 def connection():
@@ -270,14 +161,16 @@ def stop_vm(c, timeout=120, force=False):
 
 
 def build_image():
-    for key in ("NIXVM_REPOSITORY", "NIXVM_DOTFILES"):
-        if key in os.environ:
-            git_check(os.environ[key])
     if "NIXVM_CONNECTION" in os.environ:
         preflight(connection())
     settings = json.loads(os.environ["NIXVM_CONFIG"])
     build = Path(os.environ["NIXVM_BUILD"])
     build.mkdir(parents=True, exist_ok=True)
+    image = build / "bootstrap.qcow2"
+    if image.is_file():
+        print(f"Using cached bootstrap image: {image}")
+        run(["qemu-img", "resize", image, os.environ["NIXVM_DISK_GIB"] + "G"])
+        return
     snapshot = build / "nix-source"
     if snapshot.exists():
         shutil.rmtree(snapshot)
@@ -288,14 +181,305 @@ def build_image():
     images = list((build / "image-result").rglob("*.qcow2"))
     if len(images) != 1:
         raise RuntimeError(f"Expected one QCOW2 image, found {len(images)}")
-    shutil.copyfile(images[0], build / "bootstrap.qcow2")
+    shutil.copyfile(images[0], image)
     # An upload overwrites the QCOW2 header, including its virtual capacity.
-    run(["qemu-img", "resize", build / "bootstrap.qcow2", os.environ["NIXVM_DISK_GIB"] + "G"])
+    run(["qemu-img", "resize", image, os.environ["NIXVM_DISK_GIB"] + "G"])
 
 
-def copy_checkout(c, source, destination, *, dotfiles=False, settings=None):
+def remove_image_cache(name):
+    if not re.fullmatch(r"[a-z][a-z0-9-]{0,30}", name):
+        raise ValueError("VM name must match [a-z][a-z0-9-]{0,30}")
+    build = ROOT / ".build" / name
+    if not build.exists():
+        print(f"No image cache found for {name}.")
+        return
+    shutil.rmtree(build)
+    print(f"Removed image cache for {name}: {build}")
+
+
+def add_network_filter_rule(root, action, *, element, direction="out", priority, **attributes):
+    rule = ET.SubElement(root, "rule", {
+        "action": action,
+        "direction": direction,
+        "priority": str(priority),
+    })
+    ET.SubElement(rule, element, {key: str(value) for key, value in attributes.items()})
+
+
+def add_network_access_rules(root, access):
+    if "allow" in access:
+        rules = access["allow"]
+    else:
+        rules = [
+            {"ip": address, "ports": access["ports"], "all_ports": access["all_ports"]}
+            for address in access["ips"]
+        ]
+    for rule_config in rules:
+        address = rule_config["ip"]
+        ip = ipaddress.ip_address(address)
+        family_tag = "ip" if ip.version == 4 else "ipv6"
+        if rule_config["all_ports"]:
+            add_network_filter_rule(root, "accept", element=family_tag, priority=100,
+                                    dstipaddr=ip.compressed)
+            continue
+        for port in rule_config["ports"]:
+            for transport in ("tcp", "udp"):
+                protocol_number = transport if ip.version == 4 else ("6" if transport == "tcp" else "17")
+                add_network_filter_rule(
+                    root, "accept", element=family_tag, priority=100,
+                    dstipaddr=ip.compressed, protocol=protocol_number,
+                    dstportstart=port, dstportend=port,
+                )
+
+
+def define_network_filter():
+    name = os.environ["NIXVM_FILTER_NAME"]
+    if not re.fullmatch(r"nixvm-[a-z][a-z0-9-]{0,30}-access", name):
+        raise ValueError(f"Invalid libvirt network filter name: {name}")
+    access = json.loads(os.environ["NIXVM_NETWORK_ACCESS"])
+    root = ET.Element("filter", {"name": name, "chain": "root"})
+    ET.SubElement(root, "filterref", {"filter": "clean-traffic"})
+
+    # Host allow rules are explicit and are evaluated before internal-network
+    # allow rules; remaining traffic to listed host IPs is denied.
+    add_network_access_rules(root, access["host"])
+    add_network_access_rules(root, access["internal"])
+
+    host_ips = {ipaddress.ip_address(address).compressed for address in access["host"]["ips"]}
+    internal_allow = access["internal"]["allow"]
+    internal_ips = {ipaddress.ip_address(item["ip"]).compressed for item in internal_allow}
+    overlap = host_ips.intersection(internal_ips)
+    if overlap:
+        raise ValueError("List host IPs only in host_access, not internal_network.allow: " + ", ".join(sorted(overlap)))
+    for address in sorted(host_ips):
+        ip = ipaddress.ip_address(address)
+        add_network_filter_rule(
+            root, "drop", element="ip" if ip.version == 4 else "ipv6", priority=800,
+            dstipaddr=ip.compressed,
+        )
+
+    internal_ranges = [ipaddress.ip_network(cidr) for cidr in access["internal"]["deny_cidrs"]]
+    for rule in internal_allow:
+        address = rule["ip"]
+        ip = ipaddress.ip_address(address)
+        if not any(ip.version == network.version and ip in network for network in internal_ranges):
+            raise ValueError(f"Internal allow rule {address} is outside internal_network.deny_cidrs")
+    for network in internal_ranges:
+        add_network_filter_rule(
+            root, "drop", element="ip" if network.version == 4 else "ipv6", priority=900,
+            dstipaddr=network.network_address.compressed, dstipmask=network.prefixlen,
+        )
+
+    with tempfile.NamedTemporaryFile(mode="wb", prefix="nixvm-nwfilter-", suffix=".xml") as xml:
+        ET.ElementTree(root).write(xml, encoding="utf-8", xml_declaration=True)
+        xml.flush()
+        run(["virsh", "--connect", json.loads(os.environ["NIXVM_CONNECTION"])["uri"],
+             "nwfilter-define", xml.name])
+    print(f"Defined host network filter: {name}")
+
+
+def tofu_host_nfs_config(extra):
+    expression = (
+        "jsonencode({name = var.name, uri = var.libvirt_uri, network = var.network_name, "
+        "exports = var.host_nfs_exports})"
+    )
+    result = run(["tofu", f"-chdir={ROOT / 'infrastructure'}", "console", *extra],
+                 capture=True, input=expression + "\n").stdout.strip()
+    try:
+        return json.loads(json.loads(result))
+    except (json.JSONDecodeError, TypeError) as error:
+        raise RuntimeError(f"Could not read host_nfs_exports from OpenTofu: {result}") from error
+
+
+def host_os_release():
+    values = {}
+    for line in Path("/etc/os-release").read_text().splitlines():
+        if "=" not in line or line.startswith("#"):
+            continue
+        key, value = line.split("=", 1)
+        parts = shlex.split(value)
+        values[key] = parts[0] if parts else ""
+    return values
+
+
+def host_nfs_distro(values):
+    distro_ids = {values.get("ID", "").lower(), *values.get("ID_LIKE", "").lower().split()}
+    if distro_ids & {"debian", "ubuntu", "linuxmint", "pop"}:
+        return "apt-get", "nfs-kernel-server", "nfs-kernel-server"
+    if distro_ids & {"fedora", "rhel", "centos", "rocky", "almalinux", "ol"}:
+        return ("dnf" if shutil.which("dnf") else "yum"), "nfs-utils", "nfs-server"
+    if distro_ids & {"arch", "archarm", "manjaro", "endeavouros"}:
+        return "pacman", "nfs-utils", "nfs-server"
+    if distro_ids & {"suse", "opensuse"} or any(value.startswith("opensuse") for value in distro_ids):
+        return "zypper", "nfs-kernel-server", "nfsserver"
+    raise RuntimeError(
+        f"Unsupported host distribution {values.get('PRETTY_NAME', values.get('ID', 'unknown'))!r}. "
+        "Supported families: Debian/Ubuntu, Fedora/RHEL, Arch, and openSUSE."
+    )
+
+
+def nfs_network_cidrs(uri, network_name):
+    xml = output(["virsh", "--connect", uri, "net-dumpxml", network_name])
+    root = ET.fromstring(xml)
+    cidrs = set()
+    for node in root.findall("./ip"):
+        address = node.get("address")
+        if not address or ipaddress.ip_address(address).version != 4:
+            continue
+        mask = node.get("netmask") or node.get("prefix")
+        if not mask:
+            continue
+        cidrs.add(ipaddress.ip_network(f"{address}/{mask}", strict=False).with_prefixlen)
+    if not cidrs:
+        raise RuntimeError(f"Could not find an IPv4 subnet in libvirt network {network_name!r}")
+    return sorted(cidrs, key=lambda value: (ipaddress.ip_network(value).version, value))
+
+
+def validate_host_nfs_path(value):
+    if any(char.isspace() or char in "#(),\\\"" for char in value):
+        raise ValueError(f"Host NFS path contains characters that cannot be represented safely: {value!r}")
+    path = Path(value)
+    if not path.is_absolute() or ".." in path.parts or path.is_symlink() or not path.is_dir():
+        raise ValueError(f"Host NFS source must be an existing absolute directory, not a symlink: {value}")
+    return str(path)
+
+
+def host_nfs_exports_file(name):
+    if not re.fullmatch(r"[a-z][a-z0-9-]{0,30}", name):
+        raise ValueError(f"Invalid VM name for NFS exports: {name}")
+    return Path("/etc/exports.d") / f"nixvm-{name}.exports"
+
+
+def host_nfs_exports_text(config, cidrs=None):
+    if cidrs is None:
+        cidrs = nfs_network_cidrs(config["uri"], config["network"])
+    exports = config["exports"]
+    sources = sorted({validate_host_nfs_path(export["host_path"]) for export in exports})
+    clients = " ".join(f"{cidr}(rw,sync,root_squash,no_subtree_check)" for cidr in cidrs)
+    return "# Managed by nixvm; edit host_nfs_exports in OpenTofu instead.\n" + "".join(
+        f"{source} {clients}\n" for source in sources
+    )
+
+
+def check_host_nfs():
+    config = json.loads(os.environ["NIXVM_HOST_NFS_CONFIG"])
+    if not config["exports"]:
+        exports_file = host_nfs_exports_file(config["name"])
+        if exports_file.exists():
+            raise RuntimeError(
+                f"A managed host NFS export still exists at {exports_file}; set host_nfs_exports = [] "
+                "and run 'scripts/nixvm.py setup-host-nfs -var-file=devvm.tfvars' to remove it before applying."
+            )
+        print("No host_nfs_exports are configured; no host export check is needed.")
+        return
+    cidrs = nfs_network_cidrs(config["uri"], config["network"])
+    exports_file = host_nfs_exports_file(config["name"])
+    expected = host_nfs_exports_text(config, cidrs)
+    if not exports_file.is_file() or exports_file.read_text() != expected:
+        raise RuntimeError(
+            f"Host NFS exports are not configured for these variables. Run "
+            f"'scripts/nixvm.py setup-host-nfs -var-file=devvm.tfvars' in a terminal first."
+        )
+    values = host_os_release()
+    _, _, service = host_nfs_distro(values)
+    if shutil.which("systemctl") is None:
+        raise RuntimeError("Host NFS is configured, but systemd is unavailable to check the NFS service.")
+    try:
+        run(["systemctl", "is-active", "--quiet", service])
+    except subprocess.CalledProcessError as error:
+        raise RuntimeError(f"Host NFS service {service} is not active; run setup-host-nfs before applying.") from error
+    print(f"Host NFS exports verified for {', '.join(cidrs)}.")
+
+
+def confirm_host_nfs_plan():
+    if not sys.stdin.isatty():
+        raise RuntimeError("Host NFS setup requires an interactive terminal for confirmation; run this command directly in a terminal.")
+    answer = input("Continue and apply these host NFS changes? Type 'yes' to proceed: ").strip().lower()
+    if answer != "yes":
+        raise RuntimeError("Host NFS setup cancelled; no changes were made.")
+
+
+def host_admin_prefix():
+    if os.geteuid() == 0:
+        return []
+    if shutil.which("sudo") is None:
+        raise RuntimeError("Host NFS setup needs root privileges; run as root or install sudo.")
+    return ["sudo"]
+
+
+def configure_host_nfs(extra):
+    config = tofu_host_nfs_config(extra)
+    values = host_os_release()
+    exports_file = host_nfs_exports_file(config["name"])
+    if not config["exports"] and not exports_file.exists():
+        print("No host_nfs_exports are configured and no managed host export file exists.")
+        return
+
+    if config["exports"]:
+        package_manager, package, service = host_nfs_distro(values)
+        cidrs = nfs_network_cidrs(config["uri"], config["network"])
+        contents = host_nfs_exports_text(config, cidrs)
+        if shutil.which("systemctl") is None:
+            raise RuntimeError("Automatic host NFS setup requires systemd on the host.")
+        admin = host_admin_prefix()
+        package_missing = shutil.which("exportfs") is None
+        print(f"Detected host distribution: {values.get('PRETTY_NAME', values.get('ID', 'unknown'))}")
+        print("The script will:")
+        if package_missing:
+            if package_manager == "apt-get":
+                commands = [["apt-get", "update"], ["apt-get", "install", "-y", package]]
+            elif package_manager in ("dnf", "yum"):
+                commands = [[package_manager, "install", "-y", package]]
+            elif package_manager == "pacman":
+                commands = [["pacman", "-S", "--needed", "--noconfirm", package]]
+            else:
+                commands = [["zypper", "--non-interactive", "install", package]]
+            for command in commands:
+                print(f"  - run {' '.join(admin + command)}")
+        else:
+            print(f"  - keep the installed NFS server package {package}")
+        print(f"  - write {exports_file} for libvirt network {config['network']} ({', '.join(cidrs)})")
+        for export in config["exports"]:
+            print(f"  - export host path {export['host_path']} and mount it in the VM at {export['guest_path']}")
+        print(f"  - enable/start {service} and reload NFS exports")
+        print("  - leave host firewall settings unchanged; allow TCP port 2049 from the listed libvirt subnet if firewalled")
+        confirm_host_nfs_plan()
+
+        if package_missing:
+            if package_manager == "apt-get":
+                run(admin + ["apt-get", "update"])
+                run(admin + ["apt-get", "install", "-y", package])
+            elif package_manager == "dnf":
+                run(admin + ["dnf", "install", "-y", package])
+            elif package_manager == "yum":
+                run(admin + ["yum", "install", "-y", package])
+            elif package_manager == "pacman":
+                run(admin + ["pacman", "-S", "--needed", "--noconfirm", package])
+            else:
+                run(admin + ["zypper", "--non-interactive", "install", package])
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", prefix="nixvm-exports-") as staged:
+            staged.write(contents)
+            staged.flush()
+            run(admin + ["install", "-d", "-m", "0755", "/etc/exports.d"])
+            run(admin + ["install", "-m", "0644", staged.name, str(exports_file)])
+        run(admin + ["systemctl", "enable", "--now", service])
+        run(admin + ["exportfs", "-ra"])
+        print(f"Configured host NFS exports in {exports_file}.")
+        return
+
+    print(f"Detected host distribution: {values.get('PRETTY_NAME', values.get('ID', 'unknown'))}")
+    print(f"No host_nfs_exports remain; the script will remove {exports_file} and reload NFS exports.")
+    confirm_host_nfs_plan()
+    admin = host_admin_prefix()
+    run(admin + ["rm", "-f", str(exports_file)])
+    if shutil.which("exportfs"):
+        run(admin + ["exportfs", "-ra"])
+    print("Removed the managed NFS export file. The NFS server package and service were left installed.")
+
+
+def copy_checkout(c, source, destination, *, settings=None):
     quoted = shlex.quote(destination)
-    exists = output(ssh_args(c) + [f"if test -d {quoted}/.git; then echo yes; fi"])
+    exists = output(ssh_args(c) + [f"if test -e {quoted}/.git; then echo yes; fi"])
     if exists == "yes":
         print(f"Preserving existing guest checkout: {destination}")
         return
@@ -303,7 +487,7 @@ def copy_checkout(c, source, destination, *, dotfiles=False, settings=None):
     remote(c, f"test ! -e {quoted} || {{ echo 'Destination exists without .git; inspect it before retrying' >&2; exit 1; }}")
     with tempfile.TemporaryDirectory(prefix="nixvm-stage-") as tmp:
         staged = Path(tmp) / "checkout"
-        stage_repository(source, staged, dotfiles=dotfiles)
+        shutil.copytree(source, staged, symlinks=True)
         if settings is not None:
             (staged / "nix/machines/current.json").write_text(json.dumps(settings, indent=2) + "\n")
         target = destination + ".nixvm-staging"
@@ -322,7 +506,7 @@ def bootstrap():
     reset_guest_host_key(c)
     wait_ssh(c)
     config = c["guest_config"]
-    copy_checkout(c, os.environ["NIXVM_DOTFILES"], config["dotfilesPath"], dotfiles=True)
+    copy_checkout(c, os.environ["NIXVM_DOTFILES"], config["dotfilesPath"])
     copy_checkout(c, os.environ["NIXVM_REPOSITORY"], config["repoPath"], settings=config)
     flake = "path:" + config["repoPath"] + "/nix#devvm"
     remote(c, f"sudo nixos-rebuild switch --flake {shlex.quote(flake)}")
@@ -453,9 +637,10 @@ def usb(c, attach, selector=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["build-image", "bootstrap", "preflight", "ssh", "forward",
+    parser.add_argument("command", choices=["build-image", "remove-image", "define-network-filter", "check-host-nfs", "setup-host-nfs", "bootstrap", "preflight", "ssh", "forward",
                         "usb-attach", "usb-detach", "rebuild", "rollback", "password", "reboot", "start", "stop",
                         "reprovision", "import-public-keys", "gpu-check", "sunshine-ui", "token-check"])
+    parser.add_argument("--name", default="devvm", help="VM name for remove-image (default: devvm)")
     parser.add_argument("--device", help="YubiKey USB port name or serial; mandatory if selection is ambiguous")
     parser.add_argument("--timeout", type=int, default=120, help="Seconds to wait for start/stop transitions (default: 120)")
     parser.add_argument("--force", action="store_true", help="Abruptly destroy the VM instead of graceful shutdown (stop only)")
@@ -469,6 +654,14 @@ def main():
         parser.error("--wait-ssh is only valid with start")
     if args.command == "build-image":
         return build_image()
+    if args.command == "remove-image":
+        return remove_image_cache(args.name)
+    if args.command == "define-network-filter":
+        return define_network_filter()
+    if args.command == "setup-host-nfs":
+        return configure_host_nfs(extra)
+    if args.command == "check-host-nfs":
+        return check_host_nfs()
     if args.command == "bootstrap":
         return bootstrap()
     if args.command == "preflight" and extra:

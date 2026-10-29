@@ -101,6 +101,88 @@ variable "mac_address" {
     error_message = "Use a unique QEMU MAC address beginning with 52:54:00."
   }
 }
+variable "host_access" {
+  description = "Guest-initiated access to host IPs. Ports apply to TCP and UDP; all_ports allows all IP protocols."
+  type = object({
+    ips       = list(string)
+    ports     = list(number)
+    all_ports = bool
+  })
+  default = {
+    ips       = ["192.168.122.1"]
+    ports     = [53]
+    all_ports = false
+  }
+  validation {
+    condition = alltrue([
+      for ip in var.host_access.ips : can(cidrhost("${ip}/32", 0)) || can(cidrhost("${ip}/128", 0))
+    ])
+    error_message = "host_access.ips must contain individual IPv4 or IPv6 addresses."
+  }
+  validation {
+    condition     = alltrue([for port in var.host_access.ports : port >= 1 && port <= 65535 && floor(port) == port])
+    error_message = "host_access.ports must contain integer port numbers from 1 to 65535."
+  }
+  validation {
+    condition     = !var.host_access.all_ports || length(var.host_access.ports) == 0
+    error_message = "Set host_access.ports to an empty list when host_access.all_ports is true."
+  }
+}
+variable "internal_network" {
+  description = "CIDRs denied by default and per-IP allow rules. Ports apply to TCP and UDP; all_ports allows all IP protocols for that IP."
+  type = object({
+    deny_cidrs = list(string)
+    allow = list(object({
+      ip        = string
+      ports     = list(number)
+      all_ports = bool
+    }))
+  })
+  default = {
+    deny_cidrs = [
+      "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
+      "169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24",
+      "192.88.99.0/24", "192.168.0.0/16", "198.18.0.0/15", "198.51.100.0/24",
+      "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4", "255.255.255.255/32",
+      "::/128", "::1/128", "::ffff:0:0/96", "64:ff9b:1::/48", "100::/64",
+      "100:0:0:1::/64", "2001::/23", "2001:2::/48", "2001:10::/28", "2001:db8::/32",
+      "3fff::/20", "5f00::/16", "fc00::/7", "fe80::/10", "fec0::/10", "ff00::/8",
+    ]
+    allow = []
+  }
+  validation {
+    condition = alltrue([
+      for cidr in var.internal_network.deny_cidrs : can(cidrhost(cidr, 0))
+    ])
+    error_message = "internal_network.deny_cidrs must contain valid IPv4 or IPv6 CIDR blocks."
+  }
+  validation {
+    condition = alltrue([
+      for rule in var.internal_network.allow : can(cidrhost("${rule.ip}/32", 0)) || can(cidrhost("${rule.ip}/128", 0))
+    ])
+    error_message = "Each internal_network allow rule must use an individual IPv4 or IPv6 address."
+  }
+  validation {
+    condition = alltrue(flatten([
+      for rule in var.internal_network.allow : [
+        for port in rule.ports : port >= 1 && port <= 65535 && floor(port) == port
+      ]
+    ]))
+    error_message = "Each internal_network allow rule's ports must be integers from 1 to 65535."
+  }
+  validation {
+    condition = alltrue([
+      for rule in var.internal_network.allow : !rule.all_ports || length(rule.ports) == 0
+    ])
+    error_message = "Set an allow rule's ports to an empty list when all_ports is true."
+  }
+  validation {
+    condition = length(distinct([
+      for rule in var.internal_network.allow : rule.ip
+    ])) == length(var.internal_network.allow)
+    error_message = "Each IP may appear only once in internal_network.allow."
+  }
+}
 variable "guest" {
   type = object({
     username = optional(string, "gigid")
@@ -144,7 +226,7 @@ variable "dotfiles_path" {
   default = "~/.dotfiles"
 }
 variable "dotfiles_links" {
-  description = "Home-relative destination -> dotfiles-relative source. Zsh uses the portable adapter instead."
+  description = "Home-relative destination -> dotfiles-relative source."
   type        = map(string)
   default     = { ".p10k.zsh" = ".p10k.zsh" }
   validation {
@@ -166,6 +248,7 @@ variable "toolchains" {
   default = {}
 }
 variable "nfs_mounts" {
+  description = "Manually configured NFS exports on remote servers to mount in the guest."
   type = list(object({
     server     = string
     export     = string
@@ -179,6 +262,30 @@ variable "nfs_mounts" {
       !contains(split("/", m.mountpoint), "..") && m.server != ""
     ]) && length(distinct([for m in var.nfs_mounts : m.mountpoint])) == length(var.nfs_mounts)
     error_message = "NFS exports must be absolute, with distinct mountpoints under /mnt/."
+  }
+}
+variable "host_nfs_exports" {
+  description = "Host directories to export over NFS and mount in the guest."
+  type = list(object({
+    host_path  = string
+    guest_path = string
+    options    = optional(list(string), ["rw", "hard", "timeo=50", "retrans=2"])
+  }))
+  default = []
+  validation {
+    condition = alltrue([for export in var.host_nfs_exports :
+      startswith(export.host_path, "/") && !contains(split("/", export.host_path), "..") &&
+      startswith(export.guest_path, "/") && export.guest_path != "/" &&
+      !contains(split("/", export.guest_path), "..")
+    ]) && length(distinct([for export in var.host_nfs_exports : export.guest_path])) == length(var.host_nfs_exports)
+    error_message = "Host NFS export sources and guest destinations must be absolute; guest destinations must be distinct and cannot be /."
+  }
+  validation {
+    condition = length(setintersection(
+      toset([for export in var.host_nfs_exports : export.guest_path]),
+      toset([for m in var.nfs_mounts : m.mountpoint])
+    )) == 0
+    error_message = "Guest mountpoints must be unique across nfs_mounts and host_nfs_exports."
   }
 }
 variable "gpu" {

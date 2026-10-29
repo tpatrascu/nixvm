@@ -2,14 +2,16 @@ locals {
   root      = abspath("${path.module}/..")
   build_dir = "${local.root}/.build/${var.name}"
   guest_config = merge(var.guest, {
-    sshPublicKeys = var.ssh_public_keys
-    repoPath      = "/home/${var.guest.username}/dev/nixvm"
-    dotfilesPath  = "/home/${var.guest.username}/.dotfiles"
-    dotfilesLinks = var.dotfiles_links
-    toolchains    = var.toolchains
-    nfsMounts     = var.nfs_mounts
-    gpu           = var.gpu
-    streaming     = merge(var.streaming, { enabled = var.gpu.enabled && var.streaming.enabled })
+    sshPublicKeys  = var.ssh_public_keys
+    repoPath       = "/home/${var.guest.username}/dev/nixvm"
+    dotfilesPath   = "/home/${var.guest.username}/.dotfiles"
+    dotfilesLinks  = var.dotfiles_links
+    toolchains     = var.toolchains
+    nfsMounts      = var.nfs_mounts
+    hostNfsExports = var.host_nfs_exports
+    hostAddress    = var.streaming.host_address
+    gpu            = var.gpu
+    streaming      = merge(var.streaming, { enabled = var.gpu.enabled && var.streaming.enabled })
   })
   connection = {
     name         = var.name
@@ -21,8 +23,25 @@ locals {
     identity     = pathexpand(var.ssh_identity_file)
     guest_config = local.guest_config
   }
-  vm_pool_name = coalesce(var.vm_storage_pool_name, "${var.name}-user")
-  vm_pool_path = coalesce(var.vm_storage_pool_path, "/var/lib/libvirt/images/${local.vm_pool_name}")
+  host_nfs_config = {
+    name    = var.name
+    uri     = var.libvirt_uri
+    network = var.network_name
+    exports = var.host_nfs_exports
+  }
+  vm_pool_name        = coalesce(var.vm_storage_pool_name, "${var.name}-user")
+  vm_pool_path        = coalesce(var.vm_storage_pool_path, "/var/lib/libvirt/images/${local.vm_pool_name}")
+  network_filter_name = "nixvm-${var.name}-access"
+  network_filter_access = {
+    host = {
+      ips = distinct(concat(var.host_access.ips,
+      length(var.host_nfs_exports) > 0 ? [var.streaming.host_address] : []))
+      ports = var.host_access.all_ports ? [] : distinct(concat(var.host_access.ports,
+      length(var.host_nfs_exports) > 0 ? [2049] : []))
+      all_ports = var.host_access.all_ports
+    }
+    internal = var.internal_network
+  }
 }
 
 resource "terraform_data" "preflight" {
@@ -32,6 +51,41 @@ resource "terraform_data" "preflight" {
     environment = {
       NIXVM_ROOT       = local.root
       NIXVM_CONNECTION = jsonencode(local.connection)
+    }
+  }
+}
+
+# libvirt has no nwfilter resource in the pinned provider. Define the filter on
+# the host with virsh; the domain attaches to this host-enforced policy below.
+resource "terraform_data" "network_filter" {
+  triggers_replace = [
+    local.network_filter_name,
+    var.libvirt_uri,
+    filesha256("${local.root}/scripts/nixvm.py"),
+    jsonencode(local.network_filter_access)
+  ]
+  depends_on = [terraform_data.preflight]
+  provisioner "local-exec" {
+    command = "python3 \"$NIXVM_ROOT/scripts/nixvm.py\" define-network-filter"
+    environment = {
+      NIXVM_ROOT           = local.root
+      NIXVM_CONNECTION     = jsonencode(local.connection)
+      NIXVM_FILTER_NAME    = local.network_filter_name
+      NIXVM_NETWORK_ACCESS = jsonencode(local.network_filter_access)
+    }
+  }
+}
+
+# Host exports are prepared interactively with scripts/nixvm.py setup-host-nfs.
+# This check keeps apply from activating guest mounts before the host export exists.
+resource "terraform_data" "host_nfs" {
+  triggers_replace = [jsonencode(local.host_nfs_config), filesha256("${local.root}/scripts/nixvm.py")]
+  depends_on       = [terraform_data.preflight]
+  provisioner "local-exec" {
+    command = "python3 \"$NIXVM_ROOT/scripts/nixvm.py\" check-host-nfs"
+    environment = {
+      NIXVM_ROOT            = local.root
+      NIXVM_HOST_NFS_CONFIG = jsonencode(local.host_nfs_config)
     }
   }
 }
@@ -92,7 +146,7 @@ resource "libvirt_volume" "user_root" {
 }
 
 resource "libvirt_domain" "vm" {
-  depends_on  = [terraform_data.preflight]
+  depends_on  = [terraform_data.preflight, terraform_data.network_filter, terraform_data.host_nfs]
   name        = var.name
   type        = "kvm"
   memory      = var.memory_mib
@@ -129,9 +183,10 @@ resource "libvirt_domain" "vm" {
       target = { dev = "vda", bus = "virtio" }
     }]
     interfaces = [{
-      mac    = { address = var.mac_address }
-      model  = { type = "virtio" }
-      source = { network = { network = var.network_name } }
+      mac        = { address = var.mac_address }
+      model      = { type = "virtio" }
+      source     = { network = { network = var.network_name } }
+      filter_ref = { filter = local.network_filter_name }
     }]
     channels = concat([
       { source = { unix = {} }, target = { virt_io = { name = "org.qemu.guest_agent.0" } } }
