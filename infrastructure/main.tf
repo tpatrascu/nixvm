@@ -62,7 +62,18 @@ locals {
       deny_cidrs = var.internal_network_deny
       # A short-lived host listener on the firewall test subnet gives the
       # guest connectivity probes one narrowly-scoped expected success case.
-      allow = concat(var.internal_network_allow, [{
+      # NFSv4 uses TCP/2049; allow it automatically for each configured remote
+      # NFS server so users do not need a duplicate internal_network_allow rule.
+      allow = concat(var.internal_network_allow, [
+        for ip in distinct([for mount in var.nfs_mounts : mount.server if anytrue([
+          for cidr in var.internal_network_deny : try(cidrcontains(cidr, mount.server), false)
+        ])]) : {
+          ip        = ip
+          ports     = [2049]
+          protocols = ["tcp"]
+          all_ports = false
+        }
+      ], [{
         ip        = local.firewall_test_network.gateway
         ports     = [local.firewall_test_network.allow_test_port]
         all_ports = false

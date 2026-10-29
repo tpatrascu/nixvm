@@ -245,7 +245,7 @@ def add_network_access_rules(root, access):
                                     dstipaddr=ip.compressed)
             continue
         for port in rule_config["ports"]:
-            for transport in ("tcp", "udp"):
+            for transport in rule_config.get("protocols", ("tcp", "udp")):
                 add_network_filter_rule(
                     root, "accept", element=transport if ip.version == 4 else "ipv6", priority=100,
                     dstipaddr=ip.compressed,

@@ -318,6 +318,11 @@ entry maps an absolute host `host_path` to an absolute guest `guest_path`. The
 guest uses `streaming.host_address` as the host's libvirt-network address; when
 unset, it uses the dedicated VM NAT gateway.
 
+For an `nfs_mounts` server whose IP falls within `internal_network_deny`, the
+VM firewall automatically allows TCP port 2049 for NFSv4. You do not need to
+add a matching `internal_network_allow` entry. Servers outside the deny ranges
+already follow the general internet access policy.
+
 When `host_nfs_exports` is nonempty, `./nixvm up` invokes host setup before
 OpenTofu. The script detects the host distribution, prints the
 package/service/export changes, and requires you to type `yes` before
