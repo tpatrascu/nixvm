@@ -13,22 +13,15 @@ dotfiles_path   = "~/.dotfiles"
 #   ports     = [53, 2049]
 #   all_ports = false
 # }
-# Guest-initiated access to these CIDRs is denied; per-IP allow rules open only
-# the listed ports, or all ports when all_ports is true.
-# internal_network = {
-#   # Keep the default special-use CIDRs from variables.tf and add any local ranges.
-#   deny_cidrs = ["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
-#     "169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24",
-#     "192.88.99.0/24", "192.168.0.0/16", "198.18.0.0/15", "198.51.100.0/24",
-#     "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4", "255.255.255.255/32",
-#     "::/128", "::1/128", "::ffff:0:0/96", "64:ff9b:1::/48", "100::/64",
-#     "100:0:0:1::/64", "2001::/23", "2001:2::/48", "2001:10::/28", "2001:db8::/32",
-#     "3fff::/20", "5f00::/16", "fc00::/7", "fe80::/10", "fec0::/10", "ff00::/8"]
-#   allow = [
-#     { ip = "10.0.0.25", ports = [443], all_ports = false },
-#     { ip = "10.0.0.26", ports = [], all_ports = true },
-#   ]
-# }
+# Guest-initiated access to the standard internal CIDRs is denied by default.
+# Leave internal_network_deny unset to keep those defaults. If overriding that
+# list, include any standard CIDRs you still want denied.
+# internal_network_deny = ["10.0.0.0/8", "10.10.0.0/16"]
+# Per-IP access rules are independent and preserve the default deny list.
+# internal_network_allow = [
+#   { ip = "10.0.0.25", ports = [443], all_ports = false },
+#   { ip = "10.0.0.26", ports = [], all_ports = true },
+# ]
 
 # Manually configured NFS exports on other servers mounted in the guest.
 # nfs_mounts = [{
@@ -37,7 +30,8 @@ dotfiles_path   = "~/.dotfiles"
 #   mountpoint = "/mnt/host-dev"
 # }]
 # Host paths mounted by the guest over NFS. The setup command creates the host
-# export entries and installs the NFS server package if needed.
+# export entries and installs the NFS server package if needed. `./nixvm up`
+# runs this setup after confirmation.
 # Make sure you allow port 2049 in "host_access".
 # host_nfs_exports = [{
 #   host_path = "/srv/dev"

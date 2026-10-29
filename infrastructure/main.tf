@@ -40,7 +40,10 @@ locals {
       length(var.host_nfs_exports) > 0 ? [2049] : []))
       all_ports = var.host_access.all_ports
     }
-    internal = var.internal_network
+    internal = {
+      deny_cidrs = var.internal_network_deny
+      allow      = var.internal_network_allow
+    }
   }
 }
 

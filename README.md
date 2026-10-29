@@ -66,12 +66,12 @@ copied too.
 ```sh
 cp infrastructure/devvm.tfvars.example infrastructure/devvm.tfvars
 # Edit: replace ssh_public_keys with an actual key and set repository paths.
-tofu -chdir=infrastructure init
-scripts/nixvm.py preflight -var-file=devvm.tfvars
-tofu -chdir=infrastructure plan -var-file=devvm.tfvars
-tofu -chdir=infrastructure apply -var-file=devvm.tfvars
-scripts/nixvm.py password
-scripts/nixvm.py reboot
+./nixvm init
+./nixvm preflight
+./nixvm plan
+./nixvm up
+./nixvm password
+./nixvm reboot
 ```
 
 If a failed earlier apply left `devvm` defined in libvirt but absent from
@@ -96,7 +96,9 @@ agent. The private key stays outside the guest and OpenTofu state.
 Passwords are set interactively after provisioning and survive rebuilds. The
 development user has passwordless sudo; root SSH and SSH password login are off.
 
-The first apply performs these ordered steps:
+`nixvm up` first checks and prepares configured host NFS exports, with
+confirmation before installing packages or changing host services. OpenTofu
+then performs these steps:
 
 1. Check host tools, KVM/libvirt access, and selected GPU devices.
 2. Reuse the cached NixOS UEFI QCOW2 image, or build it on the first apply.
@@ -120,10 +122,11 @@ documentation, benchmarking, multicast, link-local, and reserved IPv4/IPv6
 ranges unless explicitly allowed by the host configuration. It does not restrict
 host-initiated connections to the VM, including SSH.
 
-Configure the `host_access` and `internal_network` objects in
+Configure `host_access`, `internal_network_deny`, and `internal_network_allow` in
 `infrastructure/devvm.tfvars`. `host_access` lists exact host IPs and allowed
-ports; `internal_network` lists denied CIDRs plus per-IP allow rules. Each rule
-specifies one IP and its own allowed ports, over both TCP and UDP.
+ports. The internal network deny list and per-IP allow rules are separate
+variables, so changing the allow rules preserves the default deny CIDRs. Each
+allow rule specifies one IP and its own allowed ports, over both TCP and UDP.
 For example, add `2049` under
 `host_access.ports` to let the VM reach a host's NFSv4 service. The
 default `host_access` allows DNS to `192.168.122.1`, the usual gateway address
@@ -132,14 +135,13 @@ host IP. Add any other host IPs the VM could reach to `host_access.ips` so their
 access is limited to the configured ports. Update the default IP if the network
 uses another DNS gateway.
 
-`internal_network.deny_cidrs` defaults to the standard special-use, private,
+`internal_network_deny` defaults to the standard special-use, private,
 documentation, benchmarking, multicast, link-local, and reserved IPv4/IPv6
-ranges. Add organization-specific internal CIDRs there. If you override
-`internal_network`, retain the defaults you still want blocked because the
-object replaces the default as a whole. Each `internal_network.allow` entry
-allows selected ports to one IP within those ranges. Set that entry's
+ranges. If you override this list, include any defaults you still want denied
+along with organization-specific CIDRs. Each `internal_network_allow` entry
+allows selected ports to one IP within the denied ranges. Set that entry's
 `all_ports = true` and `ports = []` to allow every protocol and port to that IP.
-By default the allow list is empty, so internal network access is denied.
+The allow list defaults to empty, so internal network access remains denied.
 Apply changes with `tofu apply`.
 
 Provisioning accepts a new SSH host key into `.runtime/<name>/known_hosts` on
@@ -177,24 +179,30 @@ Host OpenTofu variable changes affect infrastructure, but **do not overwrite the
 guest machine settings or checkouts after bootstrap**. Edit settings in the VM
 and rebuild when changing its operating system configuration.
 
-Host convenience commands:
+Common commands:
 
 | Command | Action |
 | --- | --- |
-| `scripts/nixvm.py ssh` | Interactive guest shell |
-| `scripts/nixvm.py ssh uname -a` | Execute a guest command |
-| `scripts/nixvm.py rebuild` | Activate the guest's current checkout |
-| `scripts/nixvm.py rollback` | Activate the preceding system generation |
-| `scripts/nixvm.py password` | Set/change the guest login password |
-| `scripts/nixvm.py reboot` | Reboot the guest |
-| `scripts/nixvm.py start --wait-ssh` | Start the VM and wait for SSH readiness |
-| `scripts/nixvm.py stop` | Request graceful guest shutdown and wait up to 120 seconds |
-| `scripts/nixvm.py stop --timeout 300` | Allow up to five minutes for graceful shutdown |
-| `scripts/nixvm.py stop --force` | Abruptly power off a stuck VM; unsaved guest writes may be lost |
-| `scripts/nixvm.py reprovision -var-file=devvm.tfvars` | Explicit bootstrap retry |
-| `scripts/nixvm.py setup-host-nfs -var-file=devvm.tfvars` | Install/configure host NFS exports after confirmation |
-| `scripts/nixvm.py remove-image` | Remove the default VM's local generated image cache |
-| `scripts/nixvm.py remove-image --name workvm` | Remove another VM's local generated image cache |
+| `./nixvm up` | Prepare configured host NFS exports, then create/update the VM |
+| `./nixvm plan` / `./nixvm destroy` | Review changes / destroy the VM resources |
+| `./nixvm ssh` | Interactive guest shell |
+| `./nixvm ssh uname -a` | Execute a guest command |
+| `./nixvm rebuild` / `./nixvm rollback` | Activate the guest checkout / previous generation |
+| `./nixvm password` / `./nixvm reboot` | Change the guest password / reboot |
+| `./nixvm start --wait-ssh` | Start the VM and wait for SSH readiness |
+| `./nixvm stop` | Gracefully stop the guest and wait up to 120 seconds |
+| `./nixvm stop --timeout 300` | Allow up to five minutes for graceful shutdown |
+| `./nixvm stop --force` | Abruptly power off a stuck VM; unsaved guest writes may be lost |
+| `./nixvm reprovision` | Explicit bootstrap retry |
+| `./nixvm nfs setup` / `./nixvm nfs cleanup` | Configure host exports / remove managed exports after confirmation |
+| `./nixvm image remove` | Remove the default VM's generated image cache |
+| `./nixvm image remove --name workvm` | Remove another VM's generated image cache |
+
+The wrapper uses `infrastructure/devvm.tfvars` when present. Choose another
+variable file with `-var-file=PATH` or `NIXVM_VAR_FILE=PATH`. OpenTofu's direct
+commands remain available, but direct `tofu apply` does not run the wrapper's
+host NFS setup step. `scripts/nixvm.py` contains lower-level callbacks and
+helpers; use `./nixvm` for normal host operations.
 
 The optional root-level `nixvm_test_ed25519` key is Git-ignored but is copied
 into the guest with the repository. Keep private identities outside repository
@@ -213,7 +221,7 @@ the VM domain, disk volume, and dedicated storage pool. Destroying the disk
 permanently removes the guest filesystem and any edits or data not backed up
 elsewhere. Push both repositories and back up other needed data before
 destroying. The generated bootstrap image in `.build/<VM name>/` is kept, so
-the next `tofu apply` can reuse it. Run `scripts/nixvm.py remove-image` to delete
+the next `./nixvm up` can reuse it. Run `./nixvm image remove` to delete
 the default VM's cache; add `--name <VM name>` for a custom VM. This only removes
 the host-side cache and does not affect an existing VM disk. Remove the cache
 before applying if you want to regenerate the bootstrap image with changed
@@ -265,10 +273,10 @@ entry maps an absolute host `host_path` to an absolute guest `guest_path`. The
 guest uses `streaming.host_address` as the host's libvirt-network address
 (default `192.168.122.1`).
 
-Before applying a nonempty `host_nfs_exports` list, run
-`scripts/nixvm.py setup-host-nfs -var-file=devvm.tfvars` in a terminal. The script
-detects the host distribution, prints the package/service/export changes, and
-requires you to type `yes` before proceeding. It supports Debian/Ubuntu,
+When `host_nfs_exports` is nonempty, `./nixvm up` invokes host setup before
+OpenTofu. The script detects the host distribution, prints the
+package/service/export changes, and requires you to type `yes` before
+proceeding. It supports Debian/Ubuntu,
 Fedora/RHEL, Arch, and openSUSE families; it installs the NFS server package if
 needed and writes `/etc/exports.d/nixvm-<name>.exports`. Source directories must
 already exist. Exports are limited to the selected libvirt network's IPv4 CIDR;
@@ -278,10 +286,9 @@ the host firewall is active. On SELinux-enforcing hosts, assign suitable NFS
 export labels to the source directories yourself; the script does not change
 SELinux policy. When `host_nfs_exports` is nonempty, OpenTofu checks
 that the managed export file and NFS service are ready, and allows guest traffic
-to host port 2049 in the VM's libvirt filter. Set `host_nfs_exports = []` and
-rerun the setup command to remove the managed export file; the package and
-service remain installed. `tofu destroy` does not remove host exports, so run
-the setup command with an empty list before destroying if you want them removed.
+to host port 2049 in the VM's libvirt filter. Run `./nixvm nfs cleanup` to remove
+the managed export file after confirmation; the package and service remain
+installed. `./nixvm destroy` retains host exports.
 
 Match guest UID/GID with the host owner for normal NFS AUTH_SYS permissions.
 The NFSv4 automount does not block boot when the host export is down. Once in use,
@@ -322,7 +329,7 @@ Hardware acceptance after the first boot:
 2. Make uncommitted changes in both guest repositories, reapply OpenTofu, and
    confirm those changes remain. Interrupt a bootstrap transfer and retry.
 3. Verify NFS read/write with matching ownership and boot with the export down.
-4. With GPU enabled, run `scripts/nixvm.py gpu-check`, pair Moonlight, and verify
+4. With GPU enabled, run `./nixvm gpu-check`, pair Moonlight, and verify
    1080p60 video, audio, input, and successful streaming after reboot.
 5. Verify GPG signing and PIV CLI/browser certificates in shared mode; attach
    USB, verify browser FIDO2, detach, and restart forwarding to verify recovery.

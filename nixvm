@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""User-facing commands for the local NixOS VM workflow."""
+
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+
+ROOT = Path(__file__).resolve().parent
+INFRA = ROOT / "infrastructure"
+INTERNAL = ROOT / "scripts" / "nixvm.py"
+
+
+def usage():
+    print("""Usage: nixvm <command> [options]
+
+VM lifecycle:
+  up | apply [tofu options]  Prepare host NFS exports, then run tofu apply
+  init [tofu options]        Initialize OpenTofu
+  plan [tofu options]        Run tofu plan
+  destroy [tofu options]     Run tofu destroy; host NFS exports are retained
+  preflight [var options]    Check host tools, libvirt, and VM settings
+  start [options]            Start the VM
+  stop [options]             Gracefully stop the VM
+  ssh [guest command...]     Open a guest shell or run a guest command
+  rebuild | rollback         Rebuild or roll back the guest system
+  reboot | password          Reboot the guest or change its password
+  reprovision [tofu options] Retry OpenTofu bootstrap
+
+Host setup:
+  nfs setup [var options]    Confirm and configure host NFS exports
+  nfs cleanup [var options]  Confirm removal of this VM's managed exports
+  image remove [--name NAME] Remove a generated bootstrap image cache
+
+Variable files default to infrastructure/devvm.tfvars when it exists. Pass
+-var-file=PATH or set NIXVM_VAR_FILE to select another file.""")
+
+
+def run(command):
+    subprocess.run(command, cwd=ROOT, check=True)
+
+
+def split_arguments(arguments):
+    """Separate OpenTofu variable flags from operation-specific flags."""
+    variables = []
+    operation = []
+    index = 0
+    explicit_file = False
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "-var-file":
+            if index + 1 >= len(arguments):
+                raise ValueError("-var-file requires a path")
+            value = arguments[index + 1]
+            variables.append(f"-var-file={resolve_var_file(value)}")
+            explicit_file = True
+            index += 2
+        elif argument.startswith("-var-file="):
+            variables.append(f"-var-file={resolve_var_file(argument.split('=', 1)[1])}")
+            explicit_file = True
+            index += 1
+        elif argument == "-var":
+            if index + 1 >= len(arguments):
+                raise ValueError("-var requires a value")
+            variables.append(f"-var={arguments[index + 1]}")
+            index += 2
+        elif argument.startswith("-var="):
+            variables.append(argument)
+            index += 1
+        else:
+            operation.append(argument)
+            index += 1
+
+    if not explicit_file:
+        configured = os.environ.get("NIXVM_VAR_FILE")
+        default = resolve_var_file(configured) if configured else INFRA / "devvm.tfvars"
+        if default.is_file():
+            variables.insert(0, f"-var-file={default}")
+    return variables, operation
+
+
+def resolve_var_file(value):
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        under_infra = INFRA / path
+        path = under_infra if under_infra.exists() else ROOT / path
+    return path.resolve()
+
+
+def tofu(command, arguments):
+    run(["tofu", f"-chdir={INFRA}", command, *arguments])
+
+
+def internal(command, arguments=()):
+    run([sys.executable, str(INTERNAL), command, *arguments])
+
+
+def main(arguments):
+    if not arguments or arguments[0] in ("-h", "--help", "help"):
+        usage()
+        return 0
+
+    command, *extra = arguments
+    if command in ("up", "apply"):
+        variables, operation = split_arguments(extra)
+        internal("setup-host-nfs", variables)
+        tofu("apply", [*variables, *operation])
+    elif command == "init":
+        tofu("init", extra)
+    elif command == "plan":
+        variables, operation = split_arguments(extra)
+        tofu("plan", [*variables, *operation])
+    elif command == "destroy":
+        variables, operation = split_arguments(extra)
+        tofu("destroy", [*variables, *operation])
+    elif command == "preflight":
+        variables, operation = split_arguments(extra)
+        if operation:
+            raise ValueError("nixvm preflight accepts only -var-file and -var options")
+        internal("preflight", variables)
+    elif command == "nfs":
+        if not extra or extra[0] not in ("setup", "cleanup"):
+            raise ValueError("Use 'nixvm nfs setup' or 'nixvm nfs cleanup'")
+        action, *options = extra
+        variables, operation = split_arguments(options)
+        if operation:
+            raise ValueError("nixvm nfs accepts only -var-file and -var options")
+        if action == "cleanup":
+            if any("host_nfs_exports=" in arg for arg in variables):
+                raise ValueError("Do not override host_nfs_exports when using 'nixvm nfs cleanup'")
+            variables.append("-var=host_nfs_exports=[]")
+        internal("setup-host-nfs", variables)
+    elif command == "image":
+        if len(extra) < 1 or extra[0] != "remove":
+            raise ValueError("Use 'nixvm image remove [--name NAME]'")
+        internal("remove-image", extra[1:])
+    elif command == "reprovision":
+        variables, operation = split_arguments(extra)
+        internal("setup-host-nfs", variables)
+        tofu("apply", [*variables, "-replace=terraform_data.bootstrap", *operation])
+    elif command in {"ssh", "start", "stop", "rebuild", "rollback", "reboot",
+                     "password", "forward", "usb-attach", "usb-detach", "gpu-check",
+                     "token-check", "sunshine-ui", "import-public-keys"}:
+        internal(command, extra)
+    else:
+        raise ValueError(f"Unknown command: {command}. Run 'nixvm help' for usage.")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except (ValueError, subprocess.CalledProcessError) as error:
+        print(error, file=sys.stderr)
+        raise SystemExit(getattr(error, "returncode", 2) or 2)
+    except KeyboardInterrupt:
+        raise SystemExit(130)

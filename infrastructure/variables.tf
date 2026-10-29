@@ -128,59 +128,58 @@ variable "host_access" {
     error_message = "Set host_access.ports to an empty list when host_access.all_ports is true."
   }
 }
-variable "internal_network" {
-  description = "CIDRs denied by default and per-IP allow rules. Ports apply to TCP and UDP; all_ports allows all IP protocols for that IP."
-  type = object({
-    deny_cidrs = list(string)
-    allow = list(object({
-      ip        = string
-      ports     = list(number)
-      all_ports = bool
-    }))
-  })
-  default = {
-    deny_cidrs = [
-      "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
-      "169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24",
-      "192.88.99.0/24", "192.168.0.0/16", "198.18.0.0/15", "198.51.100.0/24",
-      "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4", "255.255.255.255/32",
-      "::/128", "::1/128", "::ffff:0:0/96", "64:ff9b:1::/48", "100::/64",
-      "100:0:0:1::/64", "2001::/23", "2001:2::/48", "2001:10::/28", "2001:db8::/32",
-      "3fff::/20", "5f00::/16", "fc00::/7", "fe80::/10", "fec0::/10", "ff00::/8",
-    ]
-    allow = []
-  }
+variable "internal_network_deny" {
+  description = "CIDR blocks denied for guest-initiated traffic unless an internal_network_allow rule permits access."
+  type        = list(string)
+  default = [
+    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
+    "169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24",
+    "192.88.99.0/24", "192.168.0.0/16", "198.18.0.0/15", "198.51.100.0/24",
+    "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4", "255.255.255.255/32",
+    "::/128", "::1/128", "::ffff:0:0/96", "64:ff9b:1::/48", "100::/64",
+    "100:0:0:1::/64", "2001::/23", "2001:2::/48", "2001:10::/28", "2001:db8::/32",
+    "3fff::/20", "5f00::/16", "fc00::/7", "fe80::/10", "fec0::/10", "ff00::/8",
+  ]
   validation {
     condition = alltrue([
-      for cidr in var.internal_network.deny_cidrs : can(cidrhost(cidr, 0))
+      for cidr in var.internal_network_deny : can(cidrhost(cidr, 0))
     ])
-    error_message = "internal_network.deny_cidrs must contain valid IPv4 or IPv6 CIDR blocks."
+    error_message = "internal_network_deny must contain valid IPv4 or IPv6 CIDR blocks."
   }
+}
+variable "internal_network_allow" {
+  description = "Per-IP internal network allow rules. Ports apply to TCP and UDP; all_ports allows all IP protocols for that IP."
+  type = list(object({
+    ip        = string
+    ports     = list(number)
+    all_ports = bool
+  }))
+  default = []
   validation {
     condition = alltrue([
-      for rule in var.internal_network.allow : can(cidrhost("${rule.ip}/32", 0)) || can(cidrhost("${rule.ip}/128", 0))
+      for rule in var.internal_network_allow : can(cidrhost("${rule.ip}/32", 0)) || can(cidrhost("${rule.ip}/128", 0))
     ])
-    error_message = "Each internal_network allow rule must use an individual IPv4 or IPv6 address."
+    error_message = "Each internal_network_allow rule must use an individual IPv4 or IPv6 address."
   }
   validation {
     condition = alltrue(flatten([
-      for rule in var.internal_network.allow : [
+      for rule in var.internal_network_allow : [
         for port in rule.ports : port >= 1 && port <= 65535 && floor(port) == port
       ]
     ]))
-    error_message = "Each internal_network allow rule's ports must be integers from 1 to 65535."
+    error_message = "Each internal_network_allow rule's ports must be integers from 1 to 65535."
   }
   validation {
     condition = alltrue([
-      for rule in var.internal_network.allow : !rule.all_ports || length(rule.ports) == 0
+      for rule in var.internal_network_allow : !rule.all_ports || length(rule.ports) == 0
     ])
     error_message = "Set an allow rule's ports to an empty list when all_ports is true."
   }
   validation {
     condition = length(distinct([
-      for rule in var.internal_network.allow : rule.ip
-    ])) == length(var.internal_network.allow)
-    error_message = "Each IP may appear only once in internal_network.allow."
+      for rule in var.internal_network_allow : rule.ip
+    ])) == length(var.internal_network_allow)
+    error_message = "Each IP may appear only once in internal_network_allow."
   }
 }
 variable "guest" {

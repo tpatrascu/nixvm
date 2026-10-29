@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Host-side provisioning and explicit lifecycle commands. No private keys are copied."""
+"""Internal OpenTofu callbacks and helpers for the nixvm wrapper."""
 from __future__ import annotations
 
 import argparse
@@ -250,7 +250,7 @@ def define_network_filter():
     internal_ips = {ipaddress.ip_address(item["ip"]).compressed for item in internal_allow}
     overlap = host_ips.intersection(internal_ips)
     if overlap:
-        raise ValueError("List host IPs only in host_access, not internal_network.allow: " + ", ".join(sorted(overlap)))
+        raise ValueError("List host IPs only in host_access, not internal_network_allow: " + ", ".join(sorted(overlap)))
     for address in sorted(host_ips):
         ip = ipaddress.ip_address(address)
         add_network_filter_rule(
@@ -263,7 +263,7 @@ def define_network_filter():
         address = rule["ip"]
         ip = ipaddress.ip_address(address)
         if not any(ip.version == network.version and ip in network for network in internal_ranges):
-            raise ValueError(f"Internal allow rule {address} is outside internal_network.deny_cidrs")
+            raise ValueError(f"Internal allow rule {address} is outside internal_network_deny")
     for network in internal_ranges:
         add_network_filter_rule(
             root, "drop", element="ip" if network.version == 4 else "ipv6", priority=900,
@@ -421,6 +421,15 @@ def configure_host_nfs(extra):
         contents = host_nfs_exports_text(config, cidrs)
         if shutil.which("systemctl") is None:
             raise RuntimeError("Automatic host NFS setup requires systemd on the host.")
+        if (exports_file.is_file() and exports_file.read_text() == contents
+                and shutil.which("exportfs")):
+            try:
+                run(["systemctl", "is-active", "--quiet", service])
+            except subprocess.CalledProcessError:
+                pass
+            else:
+                print(f"Host NFS exports are already configured in {exports_file}.")
+                return
         admin = host_admin_prefix()
         package_missing = shutil.which("exportfs") is None
         print(f"Detected host distribution: {values.get('PRETTY_NAME', values.get('ID', 'unknown'))}")
