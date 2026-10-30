@@ -38,13 +38,4 @@ in
     confirm_os_window_close 0
     enable_audio_bell no
   '';
-
-  home.file.".config/zed/settings.json".text = builtins.toJSON {
-    theme = "One Dark";
-    buffer_font_family = "0xProto Nerd Font";
-    buffer_font_size = 14;
-    ui_font_family = "0xProto Nerd Font";
-    ui_font_size = 14;
-    terminal = { font_family = "0xProto Nerd Font"; };
-  };
 }

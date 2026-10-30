@@ -252,7 +252,12 @@ variable "dotfiles_path" {
 variable "dotfiles_links" {
   description = "Home-relative destination -> dotfiles-relative source."
   type        = map(string)
-  default     = { ".p10k.zsh" = ".p10k.zsh" }
+  default = {
+    ".p10k.zsh"                  = ".p10k.zsh"
+    ".config/zed/settings.json" = ".config/zed/settings.json"
+    ".config/zed/tasks.json"    = ".config/zed/tasks.json"
+    ".config/zed/debug.json"    = ".config/zed/debug.json"
+  }
   validation {
     condition = alltrue(flatten([for dest, src in var.dotfiles_links : [
       !startswith(dest, "/") && !contains(split("/", dest), ".."),

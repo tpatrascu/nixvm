@@ -291,6 +291,10 @@ resource "libvirt_domain" "vm" {
     # Keep a host-local SPICE console available alongside Sunshine streaming,
     # using the same virtio display device.
     graphics = [{ spice = { auto_port = true, listen = "127.0.0.1" } }]
+    # Provide guest audio through an emulated Intel HD Audio device and carry
+    # playback over the existing SPICE connection.
+    audios = [{ id = 1, spice = {} }]
+    sounds = [{ model = "ich9" }]
     hostdevs = var.gpu.enabled ? [for index, pci in var.gpu.pci_functions : {
       managed = true
       subsys_pci = {

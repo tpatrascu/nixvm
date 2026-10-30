@@ -28,9 +28,31 @@
 
   programs.firefox = {
     nativeMessagingHosts = [ pkgs.gnome-browser-connector ];
-    policies.ExtensionSettings."chrome-gnome-shell@gnome.org" = {
-      installation_mode = "force_installed";
-      install_url = "https://addons.mozilla.org/firefox/downloads/latest/gnome-shell-integration/latest.xpi";
+    policies.ExtensionSettings = {
+      "chrome-gnome-shell@gnome.org" = {
+        installation_mode = "force_installed";
+        install_url = "https://addons.mozilla.org/firefox/downloads/latest/gnome-shell-integration/latest.xpi";
+      };
+      "addon@darkreader.org" = {
+        installation_mode = "force_installed";
+        install_url = "https://addons.mozilla.org/firefox/downloads/latest/darkreader/latest.xpi";
+      };
+      "uBlock0@raymondhill.net" = {
+        installation_mode = "force_installed";
+        install_url = "https://addons.mozilla.org/firefox/downloads/latest/ublock-origin/latest.xpi";
+      };
+      "simple-translate@sienori" = {
+        installation_mode = "force_installed";
+        install_url = "https://addons.mozilla.org/firefox/downloads/latest/simple-translate/latest.xpi";
+      };
+      "{252ee273-8c8d-4609-b54d-62ae345be0a1}" = {
+        installation_mode = "force_installed";
+        install_url = "https://addons.mozilla.org/firefox/downloads/latest/indicatetls/latest.xpi";
+      };
+      "gdpr@cavi.au.dk" = {
+        installation_mode = "force_installed";
+        install_url = "https://addons.mozilla.org/firefox/downloads/latest/consent-o-matic/latest.xpi";
+      };
     };
   };
 

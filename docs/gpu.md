@@ -71,9 +71,10 @@ administration, not for viewing the desktop. Add the guest's IP manually to
 Moonlight and pair its PIN in Sunshine. Start the Desktop entry. Select
 1920x1080, 60 FPS, H.264, and SDR in Moonlight and configure the guest display to
 the same mode. Optionally set `streaming.capture_output` to the output identifier
-listed by Sunshine. The server disables HEVC/AV1 in this initial profile. The
-`nixvm-audio` PipeWire sink supplies stream audio even without a physical audio
-output; select it as the desktop's output if necessary.
+listed by Sunshine. The server disables HEVC/AV1 in this initial profile. The VM
+has an emulated ICH9 audio device, with playback available through the
+SPICE connection. `nixvm-audio` PipeWire sink supplies Sunshine stream audio even
+without a physical audio output; select it as the desktop's output if necessary.
 
 `gpu-check` runs `nvidia-smi`, `vulkaninfo --summary`, and an actual one-second
 NVENC encode. A failed NVENC initialization is a failed accelerated acceptance
