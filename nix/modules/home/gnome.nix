@@ -1,5 +1,21 @@
 { lib, machine, pkgs, ... }:
 {
+  # GNOME 50 no longer starts spice-vdagent's legacy XDG autostart entry.
+  # Start its Xwayland session agent from the graphical user session instead.
+  systemd.user.services.spice-vdagent = {
+    Unit = {
+      Description = "SPICE guest session agent";
+      PartOf = [ "graphical-session.target" ];
+      After = [ "graphical-session.target" ];
+    };
+    Service = {
+      ExecStart = "${pkgs.spice-vdagent}/bin/spice-vdagent --foreground";
+      Restart = "on-failure";
+      RestartSec = 2;
+    };
+    Install.WantedBy = [ "graphical-session.target" ];
+  };
+
   programs.gnome-shell.extensions = map (package: { inherit package; }) [
     pkgs.gnomeExtensions.appindicator
     pkgs.gnomeExtensions.battery-health-charging

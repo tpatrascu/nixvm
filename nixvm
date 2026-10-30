@@ -19,6 +19,7 @@ def usage():
 
 VM lifecycle:
   up | apply [tofu options]  Run firewall tests, prepare NFS, then tofu apply
+  u [tofu options]           Apply infrastructure, then activate host NixOS config
   init [tofu options]        Initialize OpenTofu
   plan [tofu options]        Run tofu plan
   destroy [tofu options]     Destroy VM, clear its SSH host key; retain host NFS exports
@@ -128,11 +129,13 @@ def main(arguments):
         return 0
 
     command, *extra = arguments
-    if command in ("up", "apply"):
+    if command in ("up", "apply", "u"):
         variables, operation = split_arguments(extra)
         internal("setup-host-nfs", variables)
         tofu("apply", [*variables, *operation])
         firewall_tests(variables)
+        if command == "u":
+            internal("update-config")
     elif command == "init":
         tofu("init", extra)
     elif command == "plan":

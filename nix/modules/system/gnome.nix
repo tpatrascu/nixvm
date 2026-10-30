@@ -8,7 +8,7 @@
     enable = machine.streaming.autologin;
     user = machine.username;
   };
-  services.spice-vdagentd.enable = !machine.gpu.enabled;
+  services.spice-vdagentd.enable = true;
   security.rtkit.enable = true;
   services.pipewire = { enable = true; alsa.enable = true; pulse.enable = true; };
   environment.systemPackages = with pkgs; [ gnome-tweaks ];

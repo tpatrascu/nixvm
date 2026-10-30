@@ -224,6 +224,7 @@ Common commands:
 | Command | Action |
 | --- | --- |
 | `./nixvm up` | Prepare host NFS, apply VM/network resources, then check firewall policy |
+| `./nixvm u` | Apply infrastructure, then stage and activate the host's NixOS config in the guest |
 | `./nixvm firewall-test` | Check the managed test network and live firewall policy |
 | `./nixvm plan` / `./nixvm destroy` | Review changes / destroy the managed VM and test network |
 | `./nixvm ssh` | Interactive guest shell |

@@ -36,10 +36,10 @@ before creating the VM. The default open NVIDIA kernel module targets Turing or
 newer supported devices. For older supported cards, select compatible driver
 settings; the stable driver is not a universal legacy-driver solution.
 
-GPU mode uses UEFI/Q35, managed PCI host devices, host CPU passthrough, and no
-emulated display. SSH and `virsh -c qemu:///system console devvm` remain available.
-Without GPU passthrough, a localhost SPICE display is available through
-`virt-viewer -c qemu:///system devvm`.
+GPU mode uses UEFI/Q35, managed PCI host devices, and host CPU passthrough. SSH
+and `virsh -c qemu:///system console devvm` remain available. SPICE guest agent
+integration and the localhost SPICE display are enabled by default, including
+with GPU passthrough; use `virt-viewer -c qemu:///system devvm` to connect.
 
 When adding a GPU to an existing VM, first enable the matching guest driver and
 streaming settings in `nix/machines/current.json` and rebuild. Shut down the VM,

@@ -273,11 +273,10 @@ resource "libvirt_domain" "vm" {
         filter_ref = { filter = local.network_filter_name }
       },
     ]
-    channels = concat([
-      { source = { unix = {} }, target = { virt_io = { name = "org.qemu.guest_agent.0" } } }
-      ], var.gpu.enabled ? [] : [
+    channels = [
+      { source = { unix = {} }, target = { virt_io = { name = "org.qemu.guest_agent.0" } } },
       { source = { spice_vmc = true }, target = { virt_io = { name = "com.redhat.spice.0" } } }
-    ])
+    ]
     controllers = [{ type = "usb", model = "qemu-xhci" }]
     # Keep a virtual display even with GPU passthrough. Laptop dGPUs often have
     # no physical display outputs wired to them, while Sunshine needs a screen
