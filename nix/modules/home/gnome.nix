@@ -16,14 +16,23 @@
     Install.WantedBy = [ "graphical-session.target" ];
   };
 
-  programs.gnome-shell.extensions = map (package: { inherit package; }) [
-    pkgs.gnomeExtensions.appindicator
-    pkgs.gnomeExtensions.battery-health-charging
-    pkgs.gnomeExtensions.caffeine
-    pkgs.gnomeExtensions.dash-to-panel
-    pkgs.gnomeExtensions.repeat-to-cycle
-    pkgs.gnomeExtensions.tiling-assistant
-  ];
+  programs.gnome-shell = {
+    enable = true;
+    extensions = map (package: { inherit package; }) [
+      pkgs.gnomeExtensions.appindicator
+      pkgs.gnomeExtensions.dash-to-panel
+      pkgs.gnomeExtensions.repeat-to-cycle
+      pkgs.gnomeExtensions.tiling-assistant
+    ];
+  };
+
+  programs.firefox = {
+    nativeMessagingHosts = [ pkgs.gnome-browser-connector ];
+    policies.ExtensionSettings."chrome-gnome-shell@gnome.org" = {
+      installation_mode = "force_installed";
+      install_url = "https://addons.mozilla.org/firefox/downloads/latest/gnome-shell-integration/latest.xpi";
+    };
+  };
 
   dconf.settings = {
     "org/gnome/desktop/interface" = {
@@ -41,14 +50,6 @@
     };
     "org/gnome/desktop/session".idle-delay = lib.hm.gvariant.mkUint32 0;
     "org/gnome/shell" = {
-      enabled-extensions = [
-        "appindicatorsupport@rgcjonas.gmail.com"
-        "Battery-Health-Charging@maniacx.github.com"
-        "caffeine@patapon.info"
-        "dash-to-panel@jderose9.github.com"
-        "repeat-to-cycle@alternateved.com"
-        "tiling-assistant@leleat-on-github"
-      ];
       favorite-apps = [
         "nixvm-firefox.desktop"
         "kitty.desktop"
@@ -86,10 +87,25 @@
     };
     "org/gnome/desktop/screensaver".lock-enabled = false;
     "org/gnome/shell/extensions/dash-to-panel" = {
+      animate-appicon-hover-animation-extent = lib.hm.gvariant.mkArray "{si}" [
+        (lib.hm.gvariant.mkDictionaryEntry [ "PLANK" 4 ])
+        (lib.hm.gvariant.mkDictionaryEntry [ "RIPPLE" 4 ])
+        (lib.hm.gvariant.mkDictionaryEntry [ "SIMPLE" 1 ])
+      ];
       appicon-margin = 4;
       dot-position = "BOTTOM";
       group-apps = true;
-      intellihide = true;
+      intellihide = false;
+      intellihide-animation-time = 10;
+      intellihide-close-delay = 50;
+      intellihide-revealed-hover-limit-size = true;
+      intellihide-use-pointer-limit-size = true;
+      intellihide-use-pressure = true;
+      hotkeys-overlay-combo = "TEMPORARILY";
+      panel-element-positions-monitors-sync = true;
+      show-tooltip = false;
+      show-window-previews = false;
+      window-preview-title-position = "TOP";
       panel-size = 32;
     };
   };
