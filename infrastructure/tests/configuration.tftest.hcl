@@ -7,11 +7,11 @@ variables {
 run "default_vm" {
   command = plan
   assert {
-    condition     = libvirt_pool.vm.target.path == "/var/lib/libvirt/images/devvm-user" && libvirt_pool.vm.target.permissions.owner == "1000" && libvirt_pool.vm.target.permissions.group == "64055" && libvirt_pool.vm.target.permissions.mode == "0770"
+    condition     = libvirt_pool.vm.target.path == "/var/lib/libvirt/images/nixvm-user" && libvirt_pool.vm.target.permissions.owner == "1000" && libvirt_pool.vm.target.permissions.group == "64055" && libvirt_pool.vm.target.permissions.mode == "0770"
     error_message = "The dedicated pool must be user-owned and accessible to the host QEMU group."
   }
   assert {
-    condition     = libvirt_volume.user_root.pool == "devvm-user" && libvirt_volume.user_root.target.permissions.owner == "1000" && libvirt_volume.user_root.target.permissions.group == "64055" && libvirt_volume.user_root.target.permissions.mode == "0660" && libvirt_domain.vm.devices.disks[0].source.file.file == libvirt_volume.user_root.path
+    condition     = libvirt_volume.user_root.pool == "nixvm-user" && libvirt_volume.user_root.target.permissions.owner == "1000" && libvirt_volume.user_root.target.permissions.group == "64055" && libvirt_volume.user_root.target.permissions.mode == "0660" && libvirt_domain.vm.devices.disks[0].source.file.file == libvirt_volume.user_root.path
     error_message = "The VM disk must use the dedicated pool, be accessible to QEMU, and appear as a file path for AppArmor."
   }
   assert {

@@ -8,11 +8,12 @@ Confirm the selected model supports NVENC using NVIDIA's
 The MX450 visible during development is not a suitable NVENC example.
 
 Enable VT-d/AMD-Vi in firmware. On Ubuntu, configure the appropriate IOMMU kernel
-arguments (`intel_iommu=on` or `amd_iommu=on`, optionally `iommu=pt`) and early
-`vfio-pci` binding for the selected GPU and companion functions. Update GRUB and
-the initramfs and reboot. Host configuration is machine-specific; this repository
-does not edit it. Use PCI addresses to distinguish identical GPUs rather than
-blindly binding every device with the same vendor/product ID.
+arguments (`intel_iommu=on` or `amd_iommu=on`, optionally `iommu=pt`) and reboot.
+When `nixvm up` or `nixvm start` finds a selected GPU function bound to another
+driver or missing its persistent override, it reports and runs
+`driverctl set-override <PCI address> vfio-pci` before starting or provisioning
+the VM. Use PCI addresses to distinguish identical GPUs rather than blindly
+binding every device with the same vendor/product ID.
 
 Inspect before enabling passthrough:
 
@@ -22,10 +23,10 @@ find /sys/kernel/iommu_groups/ -type l
 scripts/nixvm.py preflight -var-file=devvm.tfvars
 ```
 
-Preflight requires selected functions to be bound to `vfio-pci`, checks companion
-functions and non-bridge IOMMU peers, and rejects a host boot VGA device. It never
-detaches hardware. Group isolation, laptop firmware, reset support, and GPU ROM
-requirements remain hardware-specific. Do not use ACS override as a default.
+Preflight checks companion functions and non-bridge IOMMU peers, and rejects a
+host boot VGA device before it changes any driver bindings. Group isolation,
+laptop firmware, reset support, and GPU ROM requirements remain hardware-specific.
+Do not use ACS override as a default.
 An optional `gpu.rom_file` is a host path accessible to libvirt/QEMU and applies
 to the first selected function. Supply only a ROM suitable for that exact card.
 
@@ -37,9 +38,9 @@ newer supported devices. For older supported cards, select compatible driver
 settings; the stable driver is not a universal legacy-driver solution.
 
 GPU mode uses UEFI/Q35, managed PCI host devices, and host CPU passthrough. SSH
-and `virsh -c qemu:///system console devvm` remain available. SPICE guest agent
+and `virsh -c qemu:///system console nixvm` remain available. SPICE guest agent
 integration and the localhost SPICE display are enabled by default, including
-with GPU passthrough; use `virt-viewer -c qemu:///system devvm` to connect.
+with GPU passthrough; use `virt-viewer -c qemu:///system nixvm` to connect.
 
 When adding a GPU to an existing VM, first enable the matching guest driver and
 streaming settings in `nix/machines/current.json` and rebuild. Shut down the VM,

@@ -17,6 +17,10 @@ import time
 import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[1]
+HOSTS_FILE = Path("/etc/hosts")
+HOSTS_MARKER = "# Managed by nixvm"
+
+
 def run(args, *, capture=False, **kwargs):
     return subprocess.run([str(x) for x in args], check=True, text=True,
                           stdout=subprocess.PIPE if capture else None, **kwargs)
@@ -141,9 +145,13 @@ def start_vm(c, timeout=120, wait_for_ssh=False):
     if state == "running":
         print(f"{c['name']} is already running.")
     elif state == "paused":
+        validate_gpu_for_start(c)
+        ensure_vfio_devices(c)
         virsh(c, "resume", c["name"])
         wait_domain_state(c, "running", timeout)
     elif state in {"shut off", "crashed"}:
+        validate_gpu_for_start(c)
+        ensure_vfio_devices(c)
         virsh(c, "start", c["name"])
         wait_domain_state(c, "running", timeout)
     else:
@@ -279,7 +287,7 @@ def existing_network_filter_uuid(uri, name):
 
 def build_network_filter(name, access, filter_uuid=None):
     """Build the libvirt nwfilter XML for the supplied access policy."""
-    if not re.fullmatch(r"nixvm-[a-z][a-z0-9-]{0,30}-access", name):
+    if not re.fullmatch(r"[a-z][a-z0-9-]{0,30}-access", name):
         raise ValueError(f"Invalid libvirt network filter name: {name}")
     root = ET.Element("filter", {"name": name, "chain": "root"})
     if filter_uuid:
@@ -536,7 +544,7 @@ def host_admin_prefix():
     if os.geteuid() == 0:
         return []
     if shutil.which("sudo") is None:
-        raise RuntimeError("Host NFS setup needs root privileges; run as root or install sudo.")
+        raise RuntimeError("Host setup needs root privileges; run as root or install sudo.")
     return ["sudo"]
 
 
@@ -651,10 +659,80 @@ def bootstrap():
     config = c["guest_config"]
     copy_checkout(c, os.environ["NIXVM_DOTFILES"], config["dotfilesPath"])
     copy_checkout(c, os.environ["NIXVM_REPOSITORY"], config["repoPath"], settings=config)
-    flake = "path:" + config["repoPath"] + "/nix#devvm"
+    flake = "path:" + config["repoPath"] + "/nix#nixvm"
     remote(c, f"sudo nixos-rebuild switch --flake {shlex.quote(flake)}")
     reboot_guest(c)
     print("Provisioned and rebooted into the graphical system. SSH and GNOME are ready.")
+
+
+def hosts_text_with_vm_name(contents, address, hostname):
+    """Add or refresh the managed VM hostname without changing user entries."""
+    if not re.fullmatch(r"[a-z][a-z0-9-]{0,30}", hostname):
+        raise ValueError(f"Invalid VM hostname for {HOSTS_FILE}: {hostname!r}")
+    address = str(ipaddress.ip_address(address))
+    lines = contents.splitlines()
+    matching_lines = []
+    for index, line in enumerate(lines):
+        body, _, comment = line.partition("#")
+        fields = body.split()
+        if len(fields) < 2 or hostname not in fields[1:]:
+            continue
+        try:
+            existing_address = str(ipaddress.ip_address(fields[0]))
+        except ValueError:
+            continue
+        matching_lines.append((index, fields, comment, existing_address))
+
+    entry = f"{address} {hostname} {HOSTS_MARKER}"
+    if len(matching_lines) == 1:
+        index, fields, comment, existing_address = matching_lines[0]
+        if existing_address == address and fields == [address, hostname] and comment.strip() == HOSTS_MARKER:
+            return contents, False
+
+    for index, fields, comment, _ in reversed(matching_lines):
+        remaining_aliases = [alias for alias in fields[1:] if alias != hostname]
+        if remaining_aliases:
+            replacement = " ".join([fields[0], *remaining_aliases])
+            if comment:
+                replacement += f" #{comment.lstrip()}"
+            lines[index] = replacement
+        else:
+            lines[index] = None
+    lines = [line for line in lines if line is not None]
+    lines.append(entry)
+    return "\n".join(lines) + ("\n" if contents.endswith("\n") or contents == "" else ""), True
+
+
+def confirm_vm_hosts_change(hostname):
+    if not sys.stdin.isatty():
+        raise RuntimeError("Adding the VM hostname requires an interactive terminal for confirmation; run nixvm up directly in a terminal.")
+    print(f"Add {hostname} to /etc/hosts (required for Sunshine)")
+    answer = input(f"Add or update the managed {hostname} entry in /etc/hosts? Type 'yes' to proceed: ").strip().lower()
+    if answer != "yes":
+        raise RuntimeError("Hostname setup cancelled; /etc/hosts was not changed.")
+
+
+def setup_host_hostname():
+    c = connection()
+    hostname = c["name"]
+    address = wait_guest_ip(c)
+    if HOSTS_FILE.is_symlink():
+        raise RuntimeError(f"{HOSTS_FILE} is a symlink managed by the host OS; add the {hostname} mapping through that system's configuration.")
+    contents = HOSTS_FILE.read_text(encoding="utf-8")
+    updated, changed = hosts_text_with_vm_name(contents, address, hostname)
+    if not changed:
+        print(f"The host already resolves {hostname} to {address}; no hosts file change is needed.")
+        return
+    confirm_vm_hosts_change(hostname)
+    mode = HOSTS_FILE.stat().st_mode & 0o777
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", prefix="nixvm-hosts-", delete=False) as staged:
+        staged.write(updated)
+        staged_path = Path(staged.name)
+    try:
+        run(host_admin_prefix() + ["install", "-m", format(mode, "04o"), str(staged_path), str(HOSTS_FILE)])
+    finally:
+        staged_path.unlink(missing_ok=True)
+    print(f"Added {hostname} -> {address} to {HOSTS_FILE}.")
 
 
 def update_config():
@@ -675,7 +753,7 @@ def update_config():
             ssh = ssh_args(c)
             run(["rsync", "-a", "--delete", "--protect-args", "-e", shlex.join(ssh[:-1]),
                  str(staged_nix) + "/", f"{ssh[-1]}:{remote_stage}/nix/"])
-            flake = f"path:{remote_stage}/nix#devvm"
+            flake = f"path:{remote_stage}/nix#nixvm"
             remote(c, f"sudo nixos-rebuild switch --flake {shlex.quote(flake)}")
         finally:
             remote(c, f"rm -rf -- {shlex.quote(remote_stage)}")
@@ -693,8 +771,18 @@ def preflight(c):
         virsh(c, "list", "--all")
     except subprocess.CalledProcessError:
         failures.append("Cannot access libvirt")
-    selected = set(c["guest_config"]["gpu"]["pci_functions"])
-    if c["guest_config"]["gpu"]["enabled"]:
+    failures.extend(gpu_preflight_failures(c))
+    if failures:
+        raise RuntimeError("Preflight failed:\n  " + "\n  ".join(dict.fromkeys(failures)))
+    ensure_vfio_devices(c)
+    print("Host preflight passed. GPU reset/NVENC/display still require guest verification.")
+
+
+def gpu_preflight_failures(c):
+    failures = []
+    gpu = c.get("guest_config", {}).get("gpu", {})
+    selected = set(gpu.get("pci_functions", []))
+    if gpu.get("enabled"):
         for pci in sorted(selected):
             dev = Path("/sys/bus/pci/devices") / pci
             if not dev.exists():
@@ -707,8 +795,6 @@ def preflight(c):
             peers = sorted(p.name for p in (group / "devices").iterdir())
             driver = (dev / "driver").resolve().name if (dev / "driver").exists() else "none"
             print(f"{pci}: group {group.resolve().name}, driver={driver}, members={', '.join(peers)}")
-            if driver != "vfio-pci":
-                failures.append(f"{pci} must already be bound to vfio-pci; preflight never detaches devices")
             for peer in peers:
                 peerdev = dev.parent / peer
                 klass = (peerdev / "class").read_text().strip()
@@ -719,9 +805,47 @@ def preflight(c):
             for companion in dev.parent.glob(pci.rsplit(".", 1)[0] + ".*"):
                 if companion.name not in selected:
                     failures.append(f"Include GPU companion PCI function: {companion.name}")
+    return failures
+
+
+def validate_gpu_for_start(c):
+    failures = gpu_preflight_failures(c)
     if failures:
-        raise RuntimeError("Preflight failed:\n  " + "\n  ".join(dict.fromkeys(failures)))
-    print("Host preflight passed. GPU reset/NVENC/display still require guest verification.")
+        raise RuntimeError("GPU preflight failed:\n  " + "\n  ".join(dict.fromkeys(failures)))
+
+
+def ensure_vfio_devices(c):
+    """Bind selected GPU functions to vfio-pci before starting or provisioning the VM."""
+    gpu = c.get("guest_config", {}).get("gpu", {})
+    if not gpu.get("enabled"):
+        return
+    for pci in sorted(gpu.get("pci_functions", [])):
+        device = Path("/sys/bus/pci/devices") / pci
+        if not device.exists():
+            raise RuntimeError(f"Cannot bind missing PCI function to vfio-pci: {pci}")
+        driver_link = device / "driver"
+        driver = driver_link.resolve().name if driver_link.exists() else "none"
+        driverctl = shutil.which("driverctl")
+        override = None
+        if driverctl:
+            for line in output([driverctl, "list-overrides"]).splitlines():
+                fields = line.split()
+                if len(fields) == 2 and fields[0] == pci:
+                    override = fields[1]
+                    break
+        if driver == "vfio-pci" and (not driverctl or override == "vfio-pci"):
+            continue
+        if not driverctl:
+            raise RuntimeError(f"{pci} needs vfio-pci, but driverctl is not installed.")
+        print(
+            f"{pci} needs a persistent vfio-pci binding (current driver: {driver}); "
+            f"running driverctl set-override {pci} vfio-pci.",
+            flush=True,
+        )
+        run(host_admin_prefix() + [driverctl, "set-override", pci, "vfio-pci"])
+        driver = driver_link.resolve().name if driver_link.exists() else "none"
+        if driver != "vfio-pci":
+            raise RuntimeError(f"driverctl did not bind {pci} to vfio-pci (current driver: {driver}).")
 
 
 def forward(c):
@@ -804,10 +928,10 @@ def usb(c, attach, selector=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["build-image", "remove-image", "define-network-filter", "firewall-test", "check-host-nfs", "setup-host-nfs", "bootstrap", "preflight", "ssh", "forward",
+    parser.add_argument("command", choices=["build-image", "remove-image", "define-network-filter", "firewall-test", "check-host-nfs", "setup-host-nfs", "setup-hostname", "bootstrap", "preflight", "ssh", "forward",
                         "usb-attach", "usb-detach", "rebuild", "rollback", "password", "reboot", "start", "stop",
                         "reprovision", "import-public-keys", "gpu-check", "token-check", "update-config", "ip"])
-    parser.add_argument("--name", default="devvm", help="VM name for remove-image (default: devvm)")
+    parser.add_argument("--name", default="nixvm", help="VM name for remove-image (default: nixvm)")
     parser.add_argument("--device", help="YubiKey USB port name or serial; mandatory if selection is ambiguous")
     parser.add_argument("--timeout", type=int, default=120, help="Seconds to wait for start/stop transitions (default: 120)")
     parser.add_argument("--force", action="store_true", help="Abruptly destroy the VM instead of graceful shutdown (stop only)")
@@ -829,6 +953,8 @@ def main():
         return run_firewall_tests(extra)
     if args.command == "setup-host-nfs":
         return configure_host_nfs(extra)
+    if args.command == "setup-hostname":
+        return setup_host_hostname()
     if args.command == "check-host-nfs":
         return check_host_nfs()
     if args.command == "bootstrap":

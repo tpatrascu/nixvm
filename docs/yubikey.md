@@ -92,7 +92,7 @@ Detach returns USB before making an SSH connection, so the key can authenticate
 host SSH if needed. If Firefox prevents the guest mode reset, close it and retry
 detach; the saved attachment record allows retry without detaching twice. USB
 attachment is live-only and does not survive a guest shutdown. After unplugging
-the key or an unexpected VM restart, inspect `virsh dumpxml devvm`; retry detach
+the key or an unexpected VM restart, inspect `virsh dumpxml nixvm`; retry detach
 to reconcile a stale record and restore shared mode. Do not attach the same key
 manually through another viewer while using these commands.
 

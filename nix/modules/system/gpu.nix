@@ -45,7 +45,7 @@
         encoder = machine.streaming.encoder;
         upnp = "disabled";
         origin_web_ui_allowed = "lan";
-        csrf_allowed_origins = "https://192.168.124.13:47990";
+        csrf_allowed_origins = "https://${machine.hostname}:47990";
         hevc_mode = 1;
         av1_mode = 1;
         audio_sink = "nixvm-audio";

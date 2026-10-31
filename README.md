@@ -66,6 +66,7 @@ copied too.
 ```sh
 cp infrastructure/devvm.tfvars.example infrastructure/devvm.tfvars
 # Edit: replace ssh_public_keys with an actual key and set repository paths.
+# Optionally set `name`; it is also the guest hostname and host /etc/hosts alias.
 ./nixvm init
 ./nixvm preflight
 ./nixvm plan
@@ -74,13 +75,13 @@ cp infrastructure/devvm.tfvars.example infrastructure/devvm.tfvars
 ./nixvm reboot
 ```
 
-If a failed earlier apply left `devvm` defined in libvirt but absent from
+If a failed earlier apply left `nixvm` defined in libvirt but absent from
 `tofu state list`, confirm it is shut off and remove only that stale domain
 definition before applying the pool migration:
 
 ```sh
-virsh -c qemu:///system domstate devvm
-virsh -c qemu:///system undefine devvm --keep-nvram
+virsh -c qemu:///system domstate nixvm
+virsh -c qemu:///system undefine nixvm --keep-nvram
 ```
 
 This removes only the stale domain definition; it leaves the managed VM disk
@@ -101,6 +102,12 @@ before installing packages or changing host services. OpenTofu then applies
 the VM and its managed firewall test subnet; after apply, the `nixvm-firewall-test`
 suite checks the live libvirt network and filter. Rerun those checks with
 `./nixvm firewall-test`.
+
+After apply, `nixvm up` asks before adding the current guest DHCP address to the
+host's `/etc/hosts` under the configured VM name. Sunshine uses that name for
+its trusted web UI origin, so this mapping lets the host resolve the VM name
+even when the guest's DHCP address changes. The entry is marked as managed by
+nixvm and refreshed on later `up` runs when the guest address changes.
 
 1. Check host tools, KVM/libvirt access, and selected GPU devices.
 2. Reuse the cached NixOS UEFI QCOW2 image, or build it on the first apply.
@@ -233,7 +240,7 @@ Common commands:
 | `./nixvm rebuild` / `./nixvm rollback` | Activate the guest checkout / previous generation |
 | `./nixvm update-config` | Stage and activate the host's NixOS config in the guest |
 | `./nixvm password` / `./nixvm reboot` | Change the guest password / reboot |
-| `./nixvm start --wait-ssh` | Start the VM and wait for SSH readiness |
+| `./nixvm start --wait-ssh` / `./nixvm s` | Start the VM and wait for SSH readiness |
 | `./nixvm stop` | Gracefully stop the guest and wait up to 120 seconds |
 | `./nixvm stop --timeout 300` | Allow up to five minutes for graceful shutdown |
 | `./nixvm stop --force` | Abruptly power off a stuck VM; unsaved guest writes may be lost |

@@ -33,7 +33,7 @@
     text = ''
       #!${pkgs.runtimeShell}
       set -eu
-      exec sudo nixos-rebuild "''${1:-switch}" --flake ${lib.escapeShellArg ("path:" + machine.repoPath + "/nix#devvm")}
+      exec sudo nixos-rebuild "''${1:-switch}" --flake ${lib.escapeShellArg ("path:" + machine.repoPath + "/nix#nixvm")}
     '';
   };
   home.sessionPath = [ "$HOME/.local/bin" "${machine.dotfilesPath}/scripts" ];

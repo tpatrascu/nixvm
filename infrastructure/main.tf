@@ -2,6 +2,7 @@ locals {
   root      = abspath("${path.module}/..")
   build_dir = "${local.root}/.build/${var.name}"
   guest_config = merge(var.guest, {
+    hostname       = var.name
     sshPublicKeys  = var.ssh_public_keys
     repoPath       = "/home/${var.guest.username}/nixvm"
     dotfilesPath   = "/home/${var.guest.username}/.dotfiles"
@@ -41,7 +42,7 @@ locals {
     gateway = cidrhost(var.vm_network_cidr, 1)
     prefix  = tonumber(split("/", var.vm_network_cidr)[1])
   }
-  network_filter_name        = "nixvm-${var.name}-access"
+  network_filter_name        = "${var.name}-access"
   firewall_test_network_name = "nixvm-firewall-test-subnet"
   firewall_test_network = {
     cidr            = var.firewall_test_network_cidr

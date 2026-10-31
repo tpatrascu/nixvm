@@ -46,7 +46,7 @@ class NixvmFirewallTest(unittest.TestCase):
                 ],
             },
         }
-        self.filter = nixvm.build_network_filter("nixvm-devvm-access", self.access)
+        self.filter = nixvm.build_network_filter("nixvm-access", self.access)
 
     def rules(self, *, action=None, priority=None, element=None):
         rules = list(self.filter.findall("rule"))
@@ -233,7 +233,7 @@ class NixvmFirewallTest(unittest.TestCase):
             },
         }
         with self.assertRaisesRegex(ValueError, "outside internal_network_deny"):
-            nixvm.build_network_filter("nixvm-devvm-access", access)
+            nixvm.build_network_filter("nixvm-access", access)
 
     def test_host_and_internal_allow_lists_cannot_overlap(self):
         access = {
@@ -244,12 +244,12 @@ class NixvmFirewallTest(unittest.TestCase):
             },
         }
         with self.assertRaisesRegex(ValueError, "only in host_access"):
-            nixvm.build_network_filter("nixvm-devvm-access", access)
+            nixvm.build_network_filter("nixvm-access", access)
 
     def test_filter_xml_round_trips(self):
         serialized = ET.tostring(self.filter)
         parsed = ET.fromstring(serialized)
-        self.assertEqual(parsed.get("name"), "nixvm-devvm-access")
+        self.assertEqual(parsed.get("name"), "nixvm-access")
         self.assertEqual(len(parsed.findall("rule")), len(self.filter.findall("rule")))
 
     def test_up_runs_live_firewall_tests_after_apply(self):
@@ -266,6 +266,7 @@ class NixvmFirewallTest(unittest.TestCase):
             ("internal", "setup-host-nfs", []),
             ("tofu", "apply", []),
             "firewall-tests",
+            ("internal", "setup-hostname"),
         ])
 
     @unittest.skipUnless(os.environ.get("NIXVM_FIREWALL_TEST_CONFIG"),

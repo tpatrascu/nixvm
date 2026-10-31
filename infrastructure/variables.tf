@@ -1,6 +1,6 @@
 variable "name" {
   type    = string
-  default = "devvm"
+  default = "nixvm"
   validation {
     condition     = can(regex("^[a-z][a-z0-9-]{0,30}$", var.name))
     error_message = "Use a lowercase VM name with letters, digits and hyphens."
@@ -212,7 +212,6 @@ variable "guest" {
     username = optional(string, "gigid")
     uid      = optional(number, 1000)
     gid      = optional(number, 1000)
-    hostname = optional(string, "devvm")
     timezone = optional(string, "Europe/Bucharest")
     locale   = optional(string, "en_US.UTF-8")
     keyboard = optional(string, "us")
@@ -221,11 +220,10 @@ variable "guest" {
   validation {
     condition = (
       can(regex("^[a-z_][a-z0-9_-]*$", var.guest.username)) &&
-      can(regex("^[a-z][a-z0-9-]{0,62}$", var.guest.hostname)) &&
       var.guest.uid >= 1000 && floor(var.guest.uid) == var.guest.uid &&
       var.guest.gid >= 1000 && floor(var.guest.gid) == var.guest.gid
     )
-    error_message = "Provide a valid username/hostname and integer UID/GID >= 1000."
+    error_message = "Provide a valid username and integer UID/GID >= 1000."
   }
 }
 variable "ssh_public_keys" {

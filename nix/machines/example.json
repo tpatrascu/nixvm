@@ -2,7 +2,7 @@
   "username": "gigid",
   "uid": 1000,
   "gid": 1000,
-  "hostname": "devvm",
+  "hostname": "nixvm",
   "timezone": "Europe/Bucharest",
   "locale": "en_US.UTF-8",
   "keyboard": "us",

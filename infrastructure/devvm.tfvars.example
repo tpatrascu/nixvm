@@ -1,3 +1,5 @@
+# VM/libvirt name; also used as the guest hostname and host /etc/hosts alias.
+# name = "nixvm"
 vcpu       = 4
 memory_mib = 8192 # MiB
 disk_gib   = 80   # GiB
@@ -54,8 +56,8 @@ dotfiles_path   = "~/.dotfiles"
 # Override these IDs for your host; find them with `id -u` and `id libvirt-qemu`.
 # storage_owner_uid = 1000
 # disk_permissions = { gid = 64055 }
-# vm_storage_pool_name = "devvm-user"
-# vm_storage_pool_path = "/var/lib/libvirt/images/devvm-user"
+# vm_storage_pool_name = "nixvm-user"
+# vm_storage_pool_path = "/var/lib/libvirt/images/nixvm-user"
 
 # Defaults for Ubuntu's ovmf package. Override for another distribution.
 # uefi = {
@@ -67,7 +69,6 @@ guest = {
   username = "gigid"
   uid      = 1000
   gid      = 1000
-  hostname = "devvm"
   timezone = "Europe/Bucharest"
 }
 

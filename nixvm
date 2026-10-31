@@ -24,7 +24,7 @@ VM lifecycle:
   plan [tofu options]        Run tofu plan
   destroy [tofu options]     Destroy VM, clear its SSH host key; retain host NFS exports
   preflight [var options]    Check host tools, libvirt, and VM settings
-  start [options]            Start the VM
+  s | start [options]        Start the VM
   stop [options]             Gracefully stop the VM
   ssh [guest command...]     Open a guest shell or run a guest command
   ip                         Print the VM's current IPv4 address
@@ -134,6 +134,7 @@ def main(arguments):
         internal("setup-host-nfs", variables)
         tofu("apply", [*variables, *operation])
         firewall_tests(variables)
+        internal("setup-hostname")
         if command == "u":
             internal("update-config")
     elif command == "init":
@@ -177,10 +178,10 @@ def main(arguments):
         variables, operation = split_arguments(extra)
         internal("setup-host-nfs", variables)
         tofu("apply", [*variables, "-replace=terraform_data.bootstrap", *operation])
-    elif command in {"ssh", "ip", "start", "stop", "rebuild", "rollback", "reboot",
+    elif command in {"ssh", "ip", "start", "s", "stop", "rebuild", "rollback", "reboot",
                      "password", "forward", "usb-attach", "usb-detach", "gpu-check",
                      "token-check", "import-public-keys", "update-config"}:
-        internal(command, extra)
+        internal("start" if command == "s" else command, extra)
     else:
         raise ValueError(f"Unknown command: {command}. Run 'nixvm help' for usage.")
     return 0

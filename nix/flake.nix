@@ -40,7 +40,7 @@
       });
       pkgs = import nixpkgs { inherit system; config.allowUnfree = true; };
     in {
-      nixosConfigurations = { devvm = workstation; bootstrap = bootstrap; minimal = minimal; };
+      nixosConfigurations = { nixvm = workstation; bootstrap = bootstrap; minimal = minimal; };
       packages.${system} = {
         bootstrap = bootstrap.config.system.build.image;
         default = workstation.config.system.build.toplevel;
