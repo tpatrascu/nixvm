@@ -16,14 +16,19 @@ The project's scripts do not modify host GnuPG settings. Shared PC/SC serializes
 card operations; PIV/OpenPGP applet switching can require retries. Do not run
 concurrent card administration or key generation from multiple clients.
 
-With Firefox closed in the guest:
+Close Firefox in the guest. Then, **on the host**, from the host's nixvm checkout,
+start the forwarding command:
 
 ```sh
 scripts/nixvm.py forward
-# Keep this foreground command running. In another host terminal:
+# Keep this foreground command running. In a second host terminal:
 scripts/nixvm.py import-public-keys
 scripts/nixvm.py token-check
 ```
+
+Run `scripts/nixvm.py forward` on the host, not in the guest. It uses the host's
+GnuPG and PC/SC sockets and opens the SSH tunnel into the guest. Run the
+`nixvm-gpg`, `nixvm-piv`, and `nixvm-firefox` client commands inside the guest.
 
 The command forwards the host GnuPG **restricted extra socket** to the socket
 reported by the guest's `gpgconf`, and the host PC/SC socket to a private guest
@@ -36,6 +41,38 @@ actually lists PKCS#11 slots over the selected socket; a protocol/version error
 requires aligning pcsc-lite versions, not bypassing permissions. The default
 supported path is same-architecture x86-64 Linux on both sides. Cross-architecture
 PC/SC forwarding is not promised.
+
+### Test OpenPGP signing in the guest
+
+Keep the host's `scripts/nixvm.py forward` command running. In another **host**
+terminal, import the public key into the guest if you have not already:
+
+```sh
+scripts/nixvm.py import-public-keys
+```
+
+Then, in a **guest** terminal, list the available secret-key entries and choose
+the fingerprint of the signing key or signing subkey:
+
+```sh
+nixvm-gpg --list-secret-keys --keyid-format long
+```
+
+Make a test file, sign it through the forwarded host agent, and verify the
+signature against the guest's public keyring:
+
+```sh
+printf 'OpenPGP forwarding test\n' > /tmp/nixvm-pgp-test.txt
+nixvm-gpg --local-user YOUR_SIGNING_FINGERPRINT --armor --detach-sign \
+  /tmp/nixvm-pgp-test.txt
+gpg --verify /tmp/nixvm-pgp-test.txt.asc /tmp/nixvm-pgp-test.txt
+rm /tmp/nixvm-pgp-test.txt /tmp/nixvm-pgp-test.txt.asc
+```
+
+Replace `YOUR_SIGNING_FINGERPRINT` with the full fingerprint selected above.
+The PIN or touch request is handled by the host. Verification should report a
+good signature; a separate warning that the key is not certified or trusted is
+about the guest's trust database, not whether the signature verifies.
 
 Guest commands:
 
@@ -81,7 +118,7 @@ reopen `nixvm-firefox` for PIV certificates or WebAuthn/FIDO2. USB OpenPGP uses 
 separate guest GnuPG home and public-key import; it never starts an agent on the
 forwarded shared-mode socket. Plain `gpg` remains configured for shared mode.
 
-To return the key, close Firefox and run:
+To return the key, close Firefox in the guest, then run **on the host**:
 
 ```sh
 scripts/nixvm.py usb-detach
