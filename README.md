@@ -289,7 +289,15 @@ smartcard services. `nix/modules/home/` holds user settings, mutable dotfile lin
 GNOME preferences, token clients, applications, and independent Python/Node/LLVM/Rust modules.
 Home Manager activates with `nixos-rebuild`; no separate activation is needed.
 
-The Home Manager application module installs Zed, Kitty, and Oh My Pi. OMP uses
+The Home Manager application module installs Zed, Kitty, and Oh My Pi. OpenAI
+Codex CLI is enabled by default in the example configuration; set
+`apps.codex` to `false` in `nix/machines/current.json` to omit it, or set it to
+`true` to install it. The ChatGPT desktop app, which includes Codex, is also
+enabled by default; control it separately with `apps.codexDesktop`. Claude Code
+Claude Code, OpenCode, and VS Code are also enabled by default in the example.
+Set `apps.claudeCode`, `apps.opencode`, or `apps.vscode` to `false` in
+`nix/machines/current.json` to disable a tool. NixOS is not among the desktop app's formally supported Linux
+distributions. OMP uses
 the upstream Linux x86_64 release binary at version 18.12.6, pinned by SHA-256
 in `nix/packages/omp-binary.nix`, so rebuilding does not compile its source tree.
 GNOME uses the packaged Adw-gtk3 dark theme and the packaged Vanilla-DMZ white
@@ -299,11 +307,20 @@ with launcher icons pointing directly at their packaged icon assets. The support
 and enabled declaratively; Ubuntu Snap-specific extensions and Desktop Icons NG
 are not available in the pinned NixOS package set.
 
-All four language modules are enabled in the example. Toggle them with the
-`toolchains` object or the guest machine JSON. Python includes pip and uv; use
-`uv venv`/`python -m venv` for project packages. Node includes npm and Corepack.
-LLVM includes Clang, clangd, LLDB, CMake, Ninja, and pkg-config. Rust includes
-Cargo, rustfmt, Clippy, and rust-analyzer. Versions follow the committed lock file.
+Python, Node, LLVM, and Rust toolchains are enabled in the example. Toggle them
+with the `toolchains` object in the guest machine JSON. Python includes pip and
+uv; use `uv venv`/`python -m venv` for project packages. Node includes npm and
+Corepack. LLVM includes Clang, clangd, LLDB, CMake, Ninja, and pkg-config. Rust
+includes Cargo, rustfmt, Clippy, and rust-analyzer. Versions follow the
+committed lock file.
+
+The optional `jdk` and `garmin` toolkits install the Nix JDK (`pkgs.jdk`). Set
+`toolchains.jdk` or `toolchains.garmin` to `true` to enable either one. Garmin's
+Connect IQ SDK Manager and SDK are downloaded through Garmin's [SDK page](https://developer.garmin.com/connect-iq/sdk/)
+after accepting its developer agreement and signing in; Nix does not download
+those licensed files. After enabling the Garmin toolkit, download and install
+the SDK Manager yourself, then use it to fetch the Connect IQ SDK and device
+simulators.
 
 User-wide compilers do not provide every project's native library. Python wheels,
 Node native addons, CMake projects, and downloaded ELF binaries may need explicit

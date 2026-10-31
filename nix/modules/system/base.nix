@@ -56,5 +56,8 @@
     };
   };
   services.qemuGuest.enable = true;
-  environment.systemPackages = with pkgs; [ git rsync vim curl python3 ];
+  environment.systemPackages = with pkgs; [
+    git rsync vim neovim curl python3
+    htop atop btop sysstat iotop iptraf-ng nettools
+  ];
 }

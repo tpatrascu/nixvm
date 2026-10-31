@@ -36,7 +36,7 @@
       bootstrap = mkSystem true machine;
       workstation = mkSystem false machine;
       minimal = mkSystem false (machine // {
-        toolchains = { python = false; node = false; llvm = false; rust = false; };
+        toolchains = { python = false; node = false; llvm = false; rust = false; jdk = false; garmin = false; };
       });
       pkgs = import nixpkgs { inherit system; config.allowUnfree = true; };
     in {

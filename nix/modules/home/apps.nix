@@ -1,4 +1,4 @@
-{ pkgs, ... }:
+{ lib, pkgs, machine, ... }:
 let
   omp = pkgs.callPackage ../../packages/omp-binary.nix { };
 in
@@ -10,7 +10,12 @@ in
     pkgs.vanilla-dmz
     pkgs.nerd-fonts._0xproto
     omp
-  ];
+  ]
+    ++ lib.optionals (machine.apps.codex or false) [ pkgs.codex ]
+    ++ lib.optionals (machine.apps.codexDesktop or false) [ pkgs.chatgpt ]
+    ++ lib.optionals (machine.apps.claudeCode or false) [ pkgs.claude-code ]
+    ++ lib.optionals (machine.apps.opencode or false) [ pkgs.opencode ]
+    ++ lib.optionals (machine.apps.vscode or false) [ pkgs.vscode ];
 
   xdg.desktopEntries = {
     kitty = {

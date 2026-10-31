@@ -15,7 +15,8 @@
     ".config/zed/tasks.json": ".config/zed/tasks.json",
     ".config/zed/debug.json": ".config/zed/debug.json"
   },
-  "toolchains": {"python": true, "node": true, "llvm": true, "rust": true},
+  "toolchains": {"python": true, "node": true, "llvm": true, "rust": true, "jdk": false, "garmin": false},
+  "apps": {"codex": true, "codexDesktop": true, "claudeCode": true, "opencode": true, "vscode": true},
   "nfsMounts": [],
   "hostNfsExports": [],
   "hostAddress": "192.168.122.1",

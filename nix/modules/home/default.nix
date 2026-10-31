@@ -4,6 +4,7 @@
     ./gnome.nix ./apps.nix ./dotfiles.nix ./yubikey.nix
     ./toolchains/python.nix ./toolchains/node.nix
     ./toolchains/llvm.nix ./toolchains/rust.nix
+    ./toolchains/jdk.nix ./toolchains/garmin.nix
   ];
   home.username = machine.username;
   home.homeDirectory = "/home/${machine.username}";
