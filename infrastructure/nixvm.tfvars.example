@@ -79,4 +79,5 @@ guest = {
 #   open_driver   = true # Turing or newer; check your specific GPU
 # }
 # streaming = { enabled = true, encoder = "nvenc", autologin = true }
-# toolchains = { python = true, node = true, llvm = true, rust = true }
+# Optional development toolchains default to disabled.
+# toolchains = { python = true, node = true, llvm = true, rust = true, jdk = false, garmin = false }

@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 
@@ -27,6 +28,7 @@ VM lifecycle:
   s | start [options]        Start the VM
   stop [options]             Gracefully stop the VM
   ssh [guest command...]     Open a guest shell or run a guest command
+  spice [viewer options...]  Open the SPICE console with automatic guest resizing
   ip                         Print the VM's current IPv4 address
   rebuild | rollback         Rebuild or roll back the guest system
   update-config              Activate this host checkout's NixOS config in the guest
@@ -39,7 +41,7 @@ Host setup:
   image remove [--name NAME] Remove a generated bootstrap image cache
   firewall-test [var options] Check the managed firewall network and policy
 
-Variable files default to infrastructure/devvm.tfvars when it exists. Pass
+Variable files default to infrastructure/nixvm.tfvars when it exists. Pass
 -var-file=PATH or set NIXVM_VAR_FILE to select another file.""")
 
 
@@ -80,7 +82,7 @@ def split_arguments(arguments):
 
     if not explicit_file:
         configured = os.environ.get("NIXVM_VAR_FILE")
-        default = resolve_var_file(configured) if configured else INFRA / "devvm.tfvars"
+        default = resolve_var_file(configured) if configured else INFRA / "nixvm.tfvars"
         if default.is_file():
             variables.insert(0, f"-var-file={default}")
     return variables, operation
@@ -119,6 +121,68 @@ def internal(command, arguments=()):
     run([sys.executable, str(INTERNAL), command, *arguments])
 
 
+def desktop_exec_arg(value):
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    escaped = escaped.replace("`", "\\`").replace("$", "\\$")
+    return f'"{escaped}"'
+
+
+def install_spice_shortcut(vm_name):
+    # Use the viewer directly so the launcher does not depend on GNOME inheriting
+    # the interactive shell's PATH for nixvm's OpenTofu lookup.
+    viewer = shutil.which("virt-viewer") or "virt-viewer"
+    entry = "\n".join([
+        "[Desktop Entry]",
+        "Type=Application",
+        "Name=NixVM SPICE",
+        "Comment=Open the NixVM console with automatic resolution resizing",
+        f"Exec={desktop_exec_arg(viewer)} --auto-resize=always -c qemu:///system --domain-name {desktop_exec_arg(vm_name)}",
+        f"TryExec={viewer}",
+        "Icon=computer",
+        "Terminal=false",
+        "Categories=Utility;",
+        "Keywords=nixvm-spice;nixvm;spice;virt-viewer;console;",
+        "StartupWMClass=virt-viewer",
+        "StartupNotify=true",
+        "",
+    ])
+    data_homes = [Path.home() / ".local/share"]
+    configured_data_home = os.environ.get("XDG_DATA_HOME")
+    if configured_data_home:
+        configured_data_home = Path(configured_data_home).expanduser()
+        if configured_data_home.is_absolute() and configured_data_home not in data_homes:
+            data_homes.append(configured_data_home)
+    for data_home in data_homes:
+        applications = data_home / "applications"
+        applications.mkdir(parents=True, exist_ok=True)
+        launcher = applications / "nixvm-spice.desktop"
+        if not launcher.exists() or launcher.read_text(encoding="utf-8") != entry:
+            launcher.write_text(entry, encoding="utf-8")
+        launcher.chmod(0o644)
+        update_db = shutil.which("update-desktop-database")
+        if update_db:
+            subprocess.run([update_db, str(applications)], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, check=False)
+
+    desktop_path = Path.home() / "Desktop"
+    xdg_user_dir = shutil.which("xdg-user-dir")
+    if xdg_user_dir:
+        result = subprocess.run([xdg_user_dir, "DESKTOP"], check=False,
+                                capture_output=True, text=True)
+        if result.returncode == 0 and result.stdout.strip():
+            desktop_path = Path(result.stdout.strip()).expanduser()
+    desktop = desktop_path
+    if desktop.is_dir():
+        shortcut = desktop / "nixvm-spice.desktop"
+        if not shortcut.exists() or shortcut.read_text(encoding="utf-8") != entry:
+            shortcut.write_text(entry, encoding="utf-8")
+        shortcut.chmod(0o755)
+        gio = shutil.which("gio")
+        if gio:
+            subprocess.run([gio, "set", str(shortcut), "metadata::trusted", "true"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+
 def firewall_tests(variables):
     internal("firewall-test", variables)
 
@@ -135,6 +199,7 @@ def main(arguments):
         tofu("apply", [*variables, *operation])
         firewall_tests(variables)
         internal("setup-hostname")
+        install_spice_shortcut(current_vm_name() or "nixvm")
         if command == "u":
             internal("update-config")
     elif command == "init":
@@ -180,7 +245,7 @@ def main(arguments):
         tofu("apply", [*variables, "-replace=terraform_data.bootstrap", *operation])
     elif command in {"ssh", "ip", "start", "s", "stop", "rebuild", "rollback", "reboot",
                      "password", "forward", "usb-attach", "usb-detach", "gpu-check",
-                     "token-check", "import-public-keys", "update-config"}:
+                     "token-check", "import-public-keys", "update-config", "spice"}:
         internal("start" if command == "s" else command, extra)
     else:
         raise ValueError(f"Unknown command: {command}. Run 'nixvm help' for usage.")

@@ -85,6 +85,12 @@ def remote(c, command, **kwargs):
     return run(ssh_args(c) + [command], **kwargs)
 
 
+def spice(c, extra=()):
+    """Open the local SPICE console and resize the guest to fit the viewer."""
+    run(["virt-viewer", "-c", c["uri"], "--domain-name", c["name"], *extra,
+         "--auto-resize", "always"])
+
+
 def reset_guest_host_key(c):
     """Allow first-contact trust after an explicitly triggered bootstrap."""
     runtime = ROOT / ".runtime" / c["name"]
@@ -509,7 +515,7 @@ def check_host_nfs():
         if exports_file.exists():
             raise RuntimeError(
                 f"A managed host NFS export still exists at {exports_file}; set host_nfs_exports = [] "
-                "and run 'scripts/nixvm.py setup-host-nfs -var-file=devvm.tfvars' to remove it before applying."
+                "and run 'scripts/nixvm.py setup-host-nfs -var-file=nixvm.tfvars' to remove it before applying."
             )
         print("No host_nfs_exports are configured; no host export check is needed.")
         return
@@ -519,7 +525,7 @@ def check_host_nfs():
     if not exports_file.is_file() or exports_file.read_text() != expected:
         raise RuntimeError(
             f"Host NFS exports are not configured for these variables. Run "
-            f"'scripts/nixvm.py setup-host-nfs -var-file=devvm.tfvars' in a terminal first."
+            f"'scripts/nixvm.py setup-host-nfs -var-file=nixvm.tfvars' in a terminal first."
         )
     values = host_os_release()
     _, _, service = host_nfs_distro(values)
@@ -703,6 +709,16 @@ def hosts_text_with_vm_name(contents, address, hostname):
     return "\n".join(lines) + ("\n" if contents.endswith("\n") or contents == "" else ""), True
 
 
+def vm_hosts_entry_exists(contents, hostname):
+    """Return whether /etc/hosts already maps any address to hostname."""
+    for line in contents.splitlines():
+        body = line.partition("#")[0]
+        fields = body.split()
+        if hostname in fields[1:]:
+            return True
+    return False
+
+
 def confirm_vm_hosts_change(hostname):
     if not sys.stdin.isatty():
         raise RuntimeError("Adding the VM hostname requires an interactive terminal for confirmation; run nixvm up directly in a terminal.")
@@ -723,7 +739,9 @@ def setup_host_hostname():
     if not changed:
         print(f"The host already resolves {hostname} to {address}; no hosts file change is needed.")
         return
-    confirm_vm_hosts_change(hostname)
+    entry_exists = vm_hosts_entry_exists(contents, hostname)
+    if not entry_exists:
+        confirm_vm_hosts_change(hostname)
     mode = HOSTS_FILE.stat().st_mode & 0o777
     with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", prefix="nixvm-hosts-", delete=False) as staged:
         staged.write(updated)
@@ -732,7 +750,8 @@ def setup_host_hostname():
         run(host_admin_prefix() + ["install", "-m", format(mode, "04o"), str(staged_path), str(HOSTS_FILE)])
     finally:
         staged_path.unlink(missing_ok=True)
-    print(f"Added {hostname} -> {address} to {HOSTS_FILE}.")
+    action = "Updated" if entry_exists else "Added"
+    print(f"{action} {hostname} -> {address} in {HOSTS_FILE}.")
 
 
 def update_config():
@@ -928,7 +947,7 @@ def usb(c, attach, selector=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["build-image", "remove-image", "define-network-filter", "firewall-test", "check-host-nfs", "setup-host-nfs", "setup-hostname", "bootstrap", "preflight", "ssh", "forward",
+    parser.add_argument("command", choices=["build-image", "remove-image", "define-network-filter", "firewall-test", "check-host-nfs", "setup-host-nfs", "setup-hostname", "bootstrap", "preflight", "ssh", "spice", "forward",
                         "usb-attach", "usb-detach", "rebuild", "rollback", "password", "reboot", "start", "stop",
                         "reprovision", "import-public-keys", "gpu-check", "token-check", "update-config", "ip"])
     parser.add_argument("--name", default="nixvm", help="VM name for remove-image (default: nixvm)")
@@ -972,6 +991,8 @@ def main():
         print(guest_ip(c))
     elif args.command == "ssh":
         run(ssh_args(c, tty=not extra) + extra)
+    elif args.command == "spice":
+        spice(c, extra)
     elif args.command == "forward":
         forward(c)
     elif args.command in ["usb-attach", "usb-detach"]:

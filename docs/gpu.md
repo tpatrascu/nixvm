@@ -20,7 +20,7 @@ Inspect before enabling passthrough:
 ```sh
 lspci -nnk
 find /sys/kernel/iommu_groups/ -type l
-scripts/nixvm.py preflight -var-file=devvm.tfvars
+scripts/nixvm.py preflight -var-file=nixvm.tfvars
 ```
 
 Preflight checks companion functions and non-bridge IOMMU peers, and rejects a
@@ -40,7 +40,12 @@ settings; the stable driver is not a universal legacy-driver solution.
 GPU mode uses UEFI/Q35, managed PCI host devices, and host CPU passthrough. SSH
 and `virsh -c qemu:///system console nixvm` remain available. SPICE guest agent
 integration and the localhost SPICE display are enabled by default, including
-with GPU passthrough; use `virt-viewer -c qemu:///system nixvm` to connect.
+with GPU passthrough. Run `nixvm spice` on the host to connect with automatic
+resolution resizing enabled; the guest display adjusts to the viewer window.
+Extra virt-viewer options can follow the command, for example
+`nixvm spice --full-screen`. A successful `nixvm up` also installs a GNOME app
+launcher and, when your desktop directory exists, a desktop shortcut for the
+SPICE console.
 
 When adding a GPU to an existing VM, first enable the matching guest driver and
 streaming settings in `nix/machines/current.json` and rebuild. Shut down the VM,

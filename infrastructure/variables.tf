@@ -271,6 +271,8 @@ variable "toolchains" {
     node   = optional(bool, true)
     llvm   = optional(bool, true)
     rust   = optional(bool, true)
+    jdk    = optional(bool, false)
+    garmin = optional(bool, false)
   })
   default = {}
 }

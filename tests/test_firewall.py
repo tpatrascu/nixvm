@@ -6,8 +6,10 @@ import json
 import os
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
+import shutil
 import socketserver
 import subprocess
+import tempfile
 import threading
 import unittest
 from unittest.mock import patch
@@ -260,14 +262,54 @@ class NixvmFirewallTest(unittest.TestCase):
              patch.object(nixvm_wrapper, "internal",
                           side_effect=lambda *args: events.append(("internal", *args))), \
              patch.object(nixvm_wrapper, "tofu",
-                          side_effect=lambda *args: events.append(("tofu", *args))):
+                          side_effect=lambda *args: events.append(("tofu", *args))), \
+             patch.object(nixvm_wrapper, "current_vm_name", return_value="nixvm"), \
+             patch.object(nixvm_wrapper, "install_spice_shortcut",
+                          side_effect=lambda _name: events.append("install-spice-shortcut")):
             nixvm_wrapper.main(["up"])
         self.assertEqual(events, [
             ("internal", "setup-host-nfs", []),
             ("tofu", "apply", []),
             "firewall-tests",
             ("internal", "setup-hostname"),
+            "install-spice-shortcut",
         ])
+
+    def test_spice_shortcut_installs_gnome_launcher_and_desktop_icon(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            desktop = home / "Desktop"
+            desktop.mkdir(parents=True)
+            data_home = root / "data"
+            with patch.object(nixvm_wrapper.Path, "home", return_value=home), \
+                 patch.dict(os.environ, {"XDG_DATA_HOME": str(data_home)}), \
+                 patch.object(nixvm_wrapper.shutil, "which", side_effect={
+                     "virt-viewer": "/usr/bin/virt-viewer",
+                     "update-desktop-database": "/usr/bin/update-desktop-database",
+                     "xdg-user-dir": "/usr/bin/xdg-user-dir",
+                     "gio": "/usr/bin/gio",
+                 }.get), \
+                 patch.object(nixvm_wrapper.subprocess, "run") as run:
+                nixvm_wrapper.install_spice_shortcut("nixvm")
+
+            launcher = data_home / "applications/nixvm-spice.desktop"
+            shortcut = desktop / "nixvm-spice.desktop"
+            self.assertEqual(launcher.read_text(encoding="utf-8"), shortcut.read_text(encoding="utf-8"))
+            self.assertIn('Exec="/usr/bin/virt-viewer" --auto-resize=always -c qemu:///system --domain-name "nixvm"',
+                          launcher.read_text())
+            self.assertIn("TryExec=/usr/bin/virt-viewer\n", launcher.read_text())
+            self.assertIn("Name=NixVM SPICE\n", launcher.read_text())
+            self.assertIn("Keywords=nixvm-spice;nixvm;spice;virt-viewer;console;", launcher.read_text())
+            self.assertEqual(launcher.stat().st_mode & 0o777, 0o644)
+            self.assertEqual(shortcut.stat().st_mode & 0o777, 0o755)
+            validator = shutil.which("desktop-file-validate")
+            if validator:
+                subprocess.run([validator, str(launcher), str(shortcut)], check=True,
+                               capture_output=True, text=True)
+            run.assert_any_call([
+                "/usr/bin/gio", "set", str(shortcut), "metadata::trusted", "true"
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
 
     @unittest.skipUnless(os.environ.get("NIXVM_FIREWALL_TEST_CONFIG"),
                          "live OpenTofu and libvirt resources are only checked by nixvm up")

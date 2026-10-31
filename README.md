@@ -64,7 +64,7 @@ copied too.
 ## Create the VM
 
 ```sh
-cp infrastructure/devvm.tfvars.example infrastructure/devvm.tfvars
+cp infrastructure/nixvm.tfvars.example infrastructure/nixvm.tfvars
 # Edit: replace ssh_public_keys with an actual key and set repository paths.
 # Optionally set `name`; it is also the guest hostname and host /etc/hosts alias.
 ./nixvm init
@@ -90,7 +90,7 @@ and NVRAM files in place for OpenTofu to reuse.
 The example is intentionally not usable until its placeholder public key is
 replaced. `ssh_public_keys` accepts multiple SSH public keys; add each key as a
 separate list entry to retain access from more than one host or authenticator.
-Set `ssh_identity_file` in `devvm.tfvars` to force a specific local private key
+Set `ssh_identity_file` in `nixvm.tfvars` to force a specific local private key
 for Terraform provisioning; the SSH command then uses `IdentitiesOnly` and does
 not fall back to other keys in the agent. If unset, OpenSSH may use the host
 agent. The private key stays outside the guest and OpenTofu state.
@@ -132,7 +132,7 @@ ranges unless explicitly allowed by the host configuration. It does not restrict
 host-initiated connections to the VM, including SSH.
 
 Configure `host_access`, `internal_network_deny`, and `internal_network_allow` in
-`infrastructure/devvm.tfvars`. `host_access` lists exact host IPs and allowed
+`infrastructure/nixvm.tfvars`. `host_access` lists exact host IPs and allowed
 ports. The internal network deny list and per-IP allow rules are separate
 variables, so changing the allow rules preserves the default deny CIDRs. Each
 allow rule specifies one IP and its own allowed ports, over both TCP and UDP.
@@ -249,7 +249,7 @@ Common commands:
 | `./nixvm image remove` | Remove the default VM's generated image cache |
 | `./nixvm image remove --name workvm` | Remove another VM's generated image cache |
 
-The wrapper uses `infrastructure/devvm.tfvars` when present. Choose another
+The wrapper uses `infrastructure/nixvm.tfvars` when present. Choose another
 variable file with `-var-file=PATH` or `NIXVM_VAR_FILE=PATH`. OpenTofu's direct
 commands remain available, but direct `tofu apply` skips the wrapper's live
 firewall policy tests and host NFS setup. The NAT network and firewall test
@@ -315,7 +315,8 @@ includes Cargo, rustfmt, Clippy, and rust-analyzer. Versions follow the
 committed lock file.
 
 The optional `jdk` and `garmin` toolkits install the Nix JDK (`pkgs.jdk`). Set
-`toolchains.jdk` or `toolchains.garmin` to `true` to enable either one. Garmin's
+`toolchains.jdk` or `toolchains.garmin` to `true` in `infrastructure/nixvm.tfvars`
+to enable either one. Garmin's
 Connect IQ SDK Manager and SDK are downloaded through Garmin's [SDK page](https://developer.garmin.com/connect-iq/sdk/)
 after accepting its developer agreement and signing in; Nix does not download
 those licensed files. After enabling the Garmin toolkit, download and install
