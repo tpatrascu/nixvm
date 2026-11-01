@@ -42,6 +42,8 @@ and `virsh -c qemu:///system console nixvm` remain available. SPICE guest agent
 integration and the localhost SPICE display are enabled by default, including
 with GPU passthrough. Run `nixvm spice` on the host to connect with automatic
 resolution resizing enabled; the guest display adjusts to the viewer window.
+The viewer runs through XWayland at scale 1 to avoid oversized guest modes from
+Wayland fractional scaling.
 Extra virt-viewer options can follow the command, for example
 `nixvm spice --full-screen`. A successful `nixvm up` also installs a GNOME app
 launcher and, when your desktop directory exists, a desktop shortcut for the

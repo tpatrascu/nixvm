@@ -93,8 +93,10 @@ def remote(c, command, **kwargs):
 
 def spice(c, extra=()):
     """Open the local SPICE console and resize the guest to fit the viewer."""
+    env = os.environ.copy()
+    env.update({"GDK_BACKEND": "x11", "GDK_SCALE": "1"})
     run(["virt-viewer", "-c", c["uri"], "--domain-name", c["name"], *extra,
-         "--auto-resize", "always"])
+         "--auto-resize", "always"], env=env)
 
 
 def reset_guest_host_key(c):

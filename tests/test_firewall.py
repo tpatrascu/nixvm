@@ -386,7 +386,7 @@ class NixvmFirewallTest(unittest.TestCase):
             launcher = data_home / "applications/nixvm-spice-nixvm.desktop"
             shortcut = desktop / "nixvm-spice-nixvm.desktop"
             self.assertEqual(launcher.read_text(encoding="utf-8"), shortcut.read_text(encoding="utf-8"))
-            self.assertIn('Exec="/usr/bin/virt-viewer" --auto-resize=always -c qemu:///system --domain-name "nixvm"',
+            self.assertIn('Exec=env GDK_BACKEND=x11 GDK_SCALE=1 "/usr/bin/virt-viewer" --auto-resize=always -c qemu:///system --domain-name "nixvm"',
                           launcher.read_text())
             self.assertIn("TryExec=/usr/bin/virt-viewer\n", launcher.read_text())
             self.assertIn("Name=NixVM SPICE (nixvm)\n", launcher.read_text())

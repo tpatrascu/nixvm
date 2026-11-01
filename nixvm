@@ -181,7 +181,7 @@ def install_spice_shortcut(vm_name):
         "Type=Application",
         f"Name=NixVM SPICE ({vm_name})",
         "Comment=Open the NixVM console with automatic resolution resizing",
-        f"Exec={desktop_exec_arg(viewer)} --auto-resize=always -c qemu:///system --domain-name {desktop_exec_arg(vm_name)}",
+        f"Exec=env GDK_BACKEND=x11 GDK_SCALE=1 {desktop_exec_arg(viewer)} --auto-resize=always -c qemu:///system --domain-name {desktop_exec_arg(vm_name)}",
         f"TryExec={viewer}",
         "Icon=computer",
         "Terminal=false",
