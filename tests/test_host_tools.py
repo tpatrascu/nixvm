@@ -37,6 +37,43 @@ class RepositoryTransferTests(unittest.TestCase):
 
 
 class HostTests(unittest.TestCase):
+    def test_ufw_rule_reconciliation_keeps_exact_matches(self):
+        status = "\n".join([
+            "Status: active",
+            "[ 1] 192.168.124.1 53/udp ALLOW IN 192.168.124.0/24 # nixvm-nixvm",
+            "[ 2] 192.168.124.1 53/tcp ALLOW IN 192.168.124.0/24 # nixvm-nixvm",
+            "[ 3] 192.168.124.1 8080/tcp ALLOW IN 192.168.124.0/24 # nixvm-nixvm",
+            "[ 4] 192.168.124.1 2049/tcp ALLOW IN 192.168.124.0/24 # nixvm-nixvm",
+            "[ 5] 192.168.124.1 9999/tcp ALLOW IN 192.168.124.0/24 # nixvm-nixvm",
+            "[ 6] 192.168.124.1 80/tcp ALLOW IN 192.168.124.0/24 # other-rule",
+        ])
+        existing = nixvm.parse_ufw_managed_rules(status, "nixvm-nixvm")
+        desired = [
+            ("192.168.124.0/24", "192.168.124.1", 53, "udp"),
+            ("192.168.124.0/24", "192.168.124.1", 53, "tcp"),
+            ("192.168.124.0/24", "192.168.124.1", 8080, "tcp"),
+            ("192.168.124.0/24", "192.168.124.1", 2049, "tcp"),
+            ("192.168.124.0/24", "192.168.124.1", 443, "tcp"),
+        ]
+        remove, add = nixvm.reconcile_ufw_rules(existing, desired)
+        self.assertEqual(remove, [5])
+        self.assertEqual(add, [("192.168.124.0/24", "192.168.124.1", 443, "tcp")])
+
+    def test_ufw_rules_are_not_touched_when_already_current(self):
+        status = "[ 8] 192.168.124.1 53/udp ALLOW IN 192.168.124.0/24 # nixvm-nixvm"
+        existing = nixvm.parse_ufw_managed_rules(status, "nixvm-nixvm")
+        desired = [("192.168.124.0/24", "192.168.124.1", 53, "udp")]
+        self.assertEqual(nixvm.reconcile_ufw_rules(existing, desired), ([], []))
+
+    def test_guest_access_waits_up_to_two_minutes_for_dhcp_and_ssh(self):
+        events = []
+        with patch.object(nixvm, "wait_guest_ip",
+                          side_effect=lambda _c, timeout: events.append(("ip", timeout))), \
+             patch.object(nixvm, "wait_ssh",
+                          side_effect=lambda _c, timeout: events.append(("ssh", timeout))):
+            nixvm.wait_for_guest_access({})
+        self.assertEqual(events, [("ip", 120), ("ssh", 120)])
+
     def test_mitmproxy_domain_allowlist_overrides_blocklist_with_glob_and_regex(self):
         with tempfile.TemporaryDirectory() as directory:
             policy_file = Path(directory) / "policy.json"

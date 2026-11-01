@@ -1,5 +1,9 @@
 { config, lib, pkgs, machine, modulesPath, ... }:
 let
+  apps = machine.apps or { };
+  browsers = apps.browsers or { };
+  chromiumEnabled = (browsers.chromium or false)
+    || (machine.defaultBrowser or "firefox") == "chromium";
   mitmproxyEnabled =
     (machine.mitmproxy.enabled or false)
     && builtins.pathExists ../../machines/mitmproxy-ca.pem;
@@ -33,6 +37,14 @@ in {
   nix.settings.trusted-users = [ "root" "@wheel" ];
   nixpkgs.config.allowUnfree = true;
   networking.hostName = machine.hostname;
+  environment.etc = lib.mkIf chromiumEnabled {
+    "chromium/policies/managed/nixvm-search.json".text = builtins.toJSON {
+      DefaultSearchProviderEnabled = true;
+      DefaultSearchProviderName = "DuckDuckGo";
+      DefaultSearchProviderKeyword = "duckduckgo.com";
+      DefaultSearchProviderSearchURL = "https://duckduckgo.com/?q={searchTerms}";
+    };
+  };
   networking.networkmanager.enable = true;
   networking.proxy = lib.mkIf mitmproxyEnabled {
     httpProxy = proxyUrl;

@@ -48,6 +48,7 @@ in {
   programs.firefox = lib.mkIf firefoxEnabled {
     nativeMessagingHosts = [ pkgs.gnome-browser-connector ];
     policies.Certificates.ImportEnterpriseRoots = true;
+    policies.SearchEngines.Default = "DuckDuckGo";
     policies.Proxy = lib.mkIf mitmproxyEnabled {
       Mode = "manual";
       Locked = true;

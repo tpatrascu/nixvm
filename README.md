@@ -426,6 +426,7 @@ choose the corresponding defaults; selecting an editor, terminal, or browser
 enables it and pins its icon to the GNOME dock. Defaults are Neovim, Kitty,
 Zsh, and Firefox. Set `additional_nix_pkgs` to Nixpkgs attribute paths to add
 packages to the guest, for example `"ripgrep"` or `"python3Packages.pip"`.
+Firefox and Chromium use DuckDuckGo as their default search engine.
 The default editor is Neovim; set `default_editor` to `"zed"` or `"vscode"`
 to select and enable that editor.
 ChatGPT uses a NixOS-compatible repackaging of OpenAI's signed Linux application because

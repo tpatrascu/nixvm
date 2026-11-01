@@ -117,6 +117,11 @@ def wait_ssh(c, timeout=600):
     raise RuntimeError("Timed out waiting for SSH; inspect virsh console and the DHCP network")
 
 
+def wait_for_guest_access(c, *, ip_timeout=120, ssh_timeout=120):
+    wait_guest_ip(c, timeout=ip_timeout)
+    wait_ssh(c, timeout=ssh_timeout)
+
+
 def reboot_guest(c, timeout=600):
     """Reboot into the just-activated generation and verify GNOME starts."""
     remote(c, "sudo systemd-run --quiet --on-active=2s --collect "
@@ -900,7 +905,30 @@ def tofu_host_firewall_config(extra):
         raise RuntimeError(f"Could not read host firewall configuration from OpenTofu: {result}") from error
 
 
-def ufw_managed_rule_numbers(admin, marker):
+def parse_ufw_managed_rules(status, marker):
+    matching = []
+    for line in status.splitlines():
+        match = re.match(r"^\[\s*(\d+)\]\s+(.*?)\s+#\s*(\S+)\s*$", line)
+        if match and match.group(3) == marker:
+            number = int(match.group(1))
+            rule_text = match.group(2)
+            before_action, separator, after_action = rule_text.partition("ALLOW IN")
+            rule = None
+            if separator:
+                destination_fields = before_action.split()
+                source_fields = after_action.split()
+                if len(destination_fields) >= 2 and source_fields:
+                    service = re.fullmatch(r"(\d+)/(tcp|udp)", destination_fields[-1])
+                    if service:
+                        rule = (
+                            source_fields[0], destination_fields[-2],
+                            int(service.group(1)), service.group(2),
+                        )
+            matching.append({"number": number, "rule": rule})
+    return matching
+
+
+def ufw_managed_rules(admin, marker):
     result = subprocess.run(
         admin + ["ufw", "status", "numbered"], check=False, text=True,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -908,12 +936,26 @@ def ufw_managed_rule_numbers(admin, marker):
     )
     if result.returncode:
         raise RuntimeError(f"Could not inspect UFW rules: {result.stderr.strip()}")
-    matching = []
-    for line in result.stdout.splitlines():
-        match = re.match(r"^\[\s*(\d+)\]\s+.*#\s*(\S+)\s*$", line)
-        if match and match.group(2) == marker:
-            matching.append(int(match.group(1)))
-    return sorted(matching, reverse=True)
+    return parse_ufw_managed_rules(result.stdout, marker)
+
+
+def ufw_managed_rule_numbers(admin, marker):
+    return sorted((item["number"] for item in ufw_managed_rules(admin, marker)), reverse=True)
+
+
+def reconcile_ufw_rules(existing, desired):
+    """Return numbered managed rules to delete and desired rules to add."""
+    desired = set(desired)
+    kept = set()
+    remove = []
+    for item in existing:
+        rule = item["rule"]
+        if rule in desired and rule not in kept:
+            kept.add(rule)
+        else:
+            remove.append(item["number"])
+    missing = desired - kept
+    return sorted(remove, reverse=True), sorted(missing)
 
 
 def configure_host_firewall(extra=()):
@@ -928,27 +970,28 @@ def configure_host_firewall(extra=()):
 
     admin = host_admin_prefix()
     marker = f"nixvm-{config['name']}"
-    # Remove older rules for this VM first, so subnet and service changes do
-    # not leave obsolete persistent allows behind. The marker scopes removal
-    # to rules created by this NixVM profile.
-    for number in ufw_managed_rule_numbers(admin, marker):
-        run(admin + ["ufw", "--force", "delete", str(number)])
-
     rules = [
-        (config["gateway"], 53, "udp"),
-        (config["gateway"], 53, "tcp"),
+        (config["network_cidr"], config["gateway"], 53, "udp"),
+        (config["network_cidr"], config["gateway"], 53, "tcp"),
     ]
     if config["mitmproxy_enabled"]:
-        rules.append((config["gateway"], 8080, "tcp"))
+        rules.append((config["network_cidr"], config["gateway"], 8080, "tcp"))
     if config["nfs_enabled"]:
-        rules.append((config["nfs_host"], 2049, "tcp"))
+        rules.append((config["network_cidr"], config["nfs_host"], 2049, "tcp"))
 
-    for destination, port, protocol in rules:
-        run(admin + ["ufw", "allow", "in", "from", config["network_cidr"],
+    existing = ufw_managed_rules(admin, marker)
+    remove, add = reconcile_ufw_rules(existing, rules)
+    for number in remove:
+        run(admin + ["ufw", "--force", "delete", str(number)])
+    for network_cidr, destination, port, protocol in add:
+        run(admin + ["ufw", "allow", "in", "from", network_cidr,
                      "to", destination, "port", str(port), "proto", protocol,
                      "comment", marker])
-    print(f"Configured persistent UFW rules for {config['name']}: "
-          + ", ".join(f"{port}/{protocol}" for _, port, protocol in rules))
+    if not remove and not add:
+        print(f"Persistent UFW rules for {config['name']} are already current.")
+    else:
+        print(f"Configured persistent UFW rules for {config['name']}: "
+              + ", ".join(f"{port}/{protocol}" for _, _, port, protocol in rules))
 
 
 def host_os_release():
@@ -1417,6 +1460,9 @@ def cleanup_host_hostname(hostname):
 def update_config(extra=()):
     """Build and activate the host checkout's NixOS config in the existing guest."""
     c = connection()
+    # OpenTofu may report apply complete before the guest networking and SSH
+    # service are reachable, especially on a fresh or slow VM startup.
+    wait_for_guest_access(c)
     # Connection outputs can lag current tfvars before apply or on an existing
     # VM. Evaluate the machine settings from the selected OpenTofu inputs.
     settings = tofu_guest_config(extra)
