@@ -1,22 +1,38 @@
 { lib, pkgs, machine, ... }:
 let
   omp = pkgs.callPackage ../../packages/omp-binary.nix { };
+  editors = machine.apps.editors or { };
+  terminals = machine.apps.terminals or { };
+  browsers = machine.apps.browsers or { };
+  codingAgents = machine.apps.coding_agents or { };
+  additionalNixPkgs = map (name:
+    let
+      package = lib.attrByPath (lib.splitString "." name) null pkgs;
+    in
+    if package == null || !(lib.isDerivation package) then
+      throw "additional_nix_pkgs entry '${name}' does not resolve to a Nixpkgs derivation"
+    else
+      package
+  ) (machine.additionalNixPkgs or [ ]);
 in
 {
   home.packages = [
-    pkgs.zed-editor
-    pkgs.kitty
     pkgs.adw-gtk3
     pkgs.vanilla-dmz
     pkgs.nerd-fonts._0xproto
-    omp
   ]
-    ++ lib.optionals (machine.apps.codex or false) [ pkgs.codex ]
-    ++ lib.optionals (machine.apps.claudeCode or false) [ pkgs.claude-code ]
-    ++ lib.optionals (machine.apps.opencode or false) [ pkgs.opencode ]
-    ++ lib.optionals (machine.apps.vscode or false) [ pkgs.vscode ];
+    ++ lib.optionals (terminals.kitty or false) [ pkgs.kitty ]
+    ++ lib.optionals (terminals.ghostty or false) [ pkgs.ghostty ]
+    ++ lib.optionals (codingAgents.omp or false) [ omp ]
+    ++ lib.optionals (editors.zed or false) [ pkgs.zed-editor ]
+    ++ lib.optionals (codingAgents.codex or false) [ pkgs.codex ]
+    ++ lib.optionals (codingAgents.claudeCode or false) [ pkgs.claude-code ]
+    ++ lib.optionals (codingAgents.opencode or false) [ pkgs.opencode ]
+    ++ lib.optionals (editors.vscode or false) [ pkgs.vscode ]
+    ++ lib.optionals (browsers.chromium or false) [ pkgs.chromium ]
+    ++ additionalNixPkgs;
 
-  xdg.desktopEntries = {
+  xdg.desktopEntries = lib.optionalAttrs (terminals.kitty or false) {
     kitty = {
       name = "Kitty";
       genericName = "Terminal emulator";
@@ -25,6 +41,7 @@ in
       terminal = false;
       categories = [ "System" "TerminalEmulator" ];
     };
+  } // lib.optionalAttrs (editors.zed or false) {
     "dev.zed.Zed" = {
       name = "Zed";
       genericName = "Text Editor";
@@ -36,10 +53,12 @@ in
     };
   };
 
-  home.file.".config/kitty/kitty.conf".text = ''
-    font_family 0xProto Nerd Font
-    font_size 12.0
-    confirm_os_window_close 0
-    enable_audio_bell no
-  '';
+  home.file = lib.optionalAttrs (terminals.kitty or false) {
+    ".config/kitty/kitty.conf".text = ''
+      font_family 0xProto Nerd Font
+      font_size 12.0
+      confirm_os_window_close 0
+      enable_audio_bell no
+    '';
+  };
 }

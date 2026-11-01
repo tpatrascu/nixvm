@@ -1,5 +1,18 @@
 { lib, machine, pkgs, ... }:
 let
+  editors = machine.apps.editors or { };
+  terminals = machine.apps.terminals or { };
+  browsers = machine.apps.browsers or { };
+  firefoxEnabled = browsers.firefox or true;
+  defaultEditor = machine.defaultEditor or "nvim";
+  defaultTerminal = machine.defaultTerminal or "kitty";
+  defaultBrowser = machine.defaultBrowser or "firefox";
+  browserDesktop = if defaultBrowser == "chromium"
+    then "nixvm-chromium.desktop" else "nixvm-firefox.desktop";
+  terminalDesktop = if defaultTerminal == "ghostty"
+    then "com.mitchellh.ghostty.desktop" else "kitty.desktop";
+  editorDesktop = if defaultEditor == "zed" then [ "dev.zed.Zed.desktop" ]
+    else if defaultEditor == "vscode" then [ "code.desktop" ] else [ ];
   mitmproxyEnabled =
     (machine.mitmproxy.enabled or false)
     && builtins.pathExists ../../machines/mitmproxy-ca.pem;
@@ -32,7 +45,7 @@ in {
     ];
   };
 
-  programs.firefox = {
+  programs.firefox = lib.mkIf firefoxEnabled {
     nativeMessagingHosts = [ pkgs.gnome-browser-connector ];
     policies.Certificates.ImportEnterpriseRoots = true;
     policies.Proxy = lib.mkIf mitmproxyEnabled {
@@ -100,12 +113,9 @@ in {
     };
     "org/gnome/desktop/session".idle-delay = lib.hm.gvariant.mkUint32 0;
     "org/gnome/shell" = {
-      favorite-apps = [
-        "nixvm-firefox.desktop"
-        "kitty.desktop"
-        "dev.zed.Zed.desktop"
-        "org.gnome.Nautilus.desktop"
-      ];
+      favorite-apps = [ browserDesktop terminalDesktop ]
+        ++ editorDesktop
+        ++ [ "org.gnome.Nautilus.desktop" ];
     };
     "org/gnome/desktop/peripherals/mouse".speed = -0.5726495726495726;
     "org/gnome/desktop/peripherals/touchpad" = {

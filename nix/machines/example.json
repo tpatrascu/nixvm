@@ -15,8 +15,18 @@
     ".config/zed/tasks.json": ".config/zed/tasks.json",
     ".config/zed/debug.json": ".config/zed/debug.json"
   },
-  "toolchains": {"python": true, "node": true, "llvm": true, "rust": true, "jdk": true, "garmin": true},
-  "apps": {"codex": true, "chatgpt": true, "claudeCode": true, "opencode": true, "vscode": true},
+  "toolchains": {"python": false, "node": false, "llvm": false, "rust": false, "jdk": false, "garmin": false},
+  "apps": {
+    "editors": {"zed": false, "vscode": false},
+    "terminals": {"kitty": true, "ghostty": false},
+    "browsers": {"firefox": true, "chromium": false},
+    "coding_agents": {"omp": false, "codex": false, "chatgpt": false, "claudeCode": false, "opencode": false}
+  },
+  "defaultEditor": "nvim",
+  "defaultTerminal": "kitty",
+  "defaultShell": "zsh",
+  "defaultBrowser": "firefox",
+  "additionalNixPkgs": [],
   "nfsMounts": [],
   "hostNfsExports": [],
   "hostAddress": "192.168.122.1",

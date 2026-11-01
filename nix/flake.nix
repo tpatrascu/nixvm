@@ -27,7 +27,7 @@
           ./modules/system/yubikey.nix
           chatgpt-linux.nixosModules.default
           ({ machine, ... }: {
-            programs.codexDesktopLinux.enable = machine.apps.chatgpt or false;
+            programs.codexDesktopLinux.enable = machine.apps.coding_agents.chatgpt or false;
             environment.sessionVariables.CODEX_LINUX_DISABLE_USAGE_REPORTING = "1";
           })
           home-manager.nixosModules.home-manager

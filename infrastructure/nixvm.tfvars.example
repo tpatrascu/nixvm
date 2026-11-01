@@ -13,6 +13,9 @@ dotfiles_path   = "~/.dotfiles"
 # Guest-initiated host access. The dedicated VM NAT gateway is included
 # automatically; these IPs add other host addresses. Ports permit TCP and UDP;
 # the managed mitmproxy is separately allowed on gateway TCP/8080.
+# Host firewall integration: "disabled" leaves host rules unchanged; "ufw"
+# adds persistent rules for gateway DNS, enabled mitmproxy, and host NFS exports.
+# host_firewall = "ufw"
 # host_access = {
 #   ips       = []
 #   ports     = [53, 2049]
@@ -23,10 +26,12 @@ dotfiles_path   = "~/.dotfiles"
 # pulls the configured image on every run; `latest` tracks the current stable
 # mitmproxy release. Domains include their subdomains. An empty inspect list
 # passes HTTPS through without TLS decryption.
+# mitmproxy_enabled = true # default: false; false enables direct web egress
 # mitmproxy_policy = {
 #   image           = "docker.io/mitmproxy/mitmproxy:latest"
 #   inspect_domains = ["api.example.com", "updates.example.net"]
 #   blocked_domains = ["telemetry.example.org"]
+#   allowed_domains = ["glob:trusted-*.example.org", "regex:api[0-9]+\\.example\\.net"]
 # }
 
 # The firewall test subnet is managed on the VM's NAT bridge and removed by
@@ -89,7 +94,18 @@ guest = {
 # }
 # streaming = { enabled = true, encoder = "nvenc", autologin = true }
 
-# Development toolchains and applications are enabled by default; override any
-# entry to false to omit it. Platform-unavailable applications are skipped.
+# Development toolchains and applications are disabled by default; opt into
+# only the ones this VM needs. Platform-unavailable applications are skipped.
 # toolchains = { python = true, node = true, llvm = true, rust = true, jdk = true, garmin = true }
-# apps = { codex = true, chatgpt = true, claudeCode = true, opencode = true, vscode = true }
+# Additional Nixpkgs package attribute paths, including nested paths.
+# additional_nix_pkgs = ["ripgrep", "fd", "python3Packages.pip"]
+# apps = {
+#   editors      = { zed = true, vscode = true }
+#   terminals    = { kitty = true, ghostty = true }
+#   browsers     = { firefox = true, chromium = false }
+#   coding_agents = { omp = true, codex = true, chatgpt = true, claudeCode = true, opencode = true }
+# }
+# default_editor   = "nvim" # or "zed" / "vscode"; selected GUI editor is enabled and pinned
+# default_terminal = "kitty" # or "ghostty"; selecting it enables and pins it
+# default_shell    = "zsh" # or "bash"
+# default_browser  = "firefox" # or "chromium"; selecting it enables and pins it

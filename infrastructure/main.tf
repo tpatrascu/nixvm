@@ -1,27 +1,47 @@
 locals {
-  root      = abspath("${path.module}/..")
-  build_dir = "${local.root}/.build/${var.name}"
+  root            = abspath("${path.module}/..")
+  build_dir       = "${local.root}/.build/${var.name}"
   image_cache_dir = "${local.root}/.build/shared"
-  network_index = var.name == "nixvm" ? 124 : 16 + parseint(substr(md5(var.name), 0, 2), 16) % 200
+  network_index   = var.name == "nixvm" ? 124 : 16 + parseint(substr(md5(var.name), 0, 2), 16) % 200
   vm_network_cidr = coalesce(var.vm_network_cidr, "192.168.${local.network_index}.0/24")
   firewall_test_network_cidr = coalesce(var.firewall_test_network_cidr,
-    var.name == "nixvm" ? "192.168.123.0/24" : "10.254.${local.network_index}.0/24")
+  var.name == "nixvm" ? "192.168.123.0/24" : "10.254.${local.network_index}.0/24")
+  guest_apps = {
+    editors = merge(var.apps.editors, {
+      zed    = var.apps.editors.zed || var.default_editor == "zed"
+      vscode = var.apps.editors.vscode || var.default_editor == "vscode"
+    })
+    terminals = merge(var.apps.terminals, {
+      kitty   = var.apps.terminals.kitty || var.default_terminal == "kitty"
+      ghostty = var.apps.terminals.ghostty || var.default_terminal == "ghostty"
+    })
+    browsers = merge(var.apps.browsers, {
+      firefox  = var.apps.browsers.firefox || var.default_browser == "firefox"
+      chromium = var.apps.browsers.chromium || var.default_browser == "chromium"
+    })
+    coding_agents = var.apps.coding_agents
+  }
   guest_config = merge(var.guest, {
-    hostname       = var.name
-    sshPublicKeys  = var.ssh_public_keys
-    repoPath       = "/home/${var.guest.username}/${var.name}"
-    dotfilesPath   = "/home/${var.guest.username}/.dotfiles"
-    dotfilesLinks  = var.dotfiles_links
-    apps           = var.apps
-    toolchains     = var.toolchains
-    nfsMounts      = var.nfs_mounts
-    hostNfsExports = var.host_nfs_exports
-    hostAddress    = coalesce(var.streaming.host_address, local.vm_network.gateway)
+    hostname          = var.name
+    sshPublicKeys     = var.ssh_public_keys
+    repoPath          = "/home/${var.guest.username}/${var.name}"
+    dotfilesPath      = "/home/${var.guest.username}/.dotfiles"
+    dotfilesLinks     = var.dotfiles_links
+    apps              = local.guest_apps
+    defaultEditor     = var.default_editor
+    defaultTerminal   = var.default_terminal
+    defaultShell      = var.default_shell
+    defaultBrowser    = var.default_browser
+    additionalNixPkgs = var.additional_nix_pkgs
+    toolchains        = var.toolchains
+    nfsMounts         = var.nfs_mounts
+    hostNfsExports    = var.host_nfs_exports
+    hostAddress       = coalesce(var.streaming.host_address, local.vm_network.gateway)
     mitmproxy = {
-      enabled  = true
+      enabled  = var.mitmproxy_enabled
       proxyUrl = "http://${local.vm_network.gateway}:8080"
     }
-    gpu            = var.gpu
+    gpu = var.gpu
     streaming = merge(var.streaming, {
       enabled      = var.gpu.enabled && var.streaming.enabled
       host_address = coalesce(var.streaming.host_address, local.vm_network.gateway)
@@ -73,42 +93,75 @@ locals {
       length(var.host_nfs_exports) > 0 ? [2049] : []))
       all_ports = var.host_access.all_ports
     }
-    proxy = {
-      ip   = local.vm_network.gateway
-      port = 8080
-    }
     internal = {
-      deny_cidrs = var.internal_network_deny
-      blocked_ports = [80, 443, 8443, 8080, 8081, 8082]
+      deny_cidrs    = var.internal_network_deny
+      blocked_ports = var.mitmproxy_enabled ? [80, 443, 8443, 8080, 8081, 8082] : []
       # A short-lived host listener on the firewall test subnet gives the
       # guest connectivity probes one narrowly-scoped expected success case.
-      # NFSv4 uses TCP/2049; allow it automatically for each configured remote
-      # NFS server so users do not need a duplicate internal_network_allow rule.
-      allow = concat(var.internal_network_allow, [
-        for ip in distinct([for mount in var.nfs_mounts : mount.server if anytrue([
-          for cidr in var.internal_network_deny : try(cidrcontains(cidr, mount.server), false)
-          ])]) : {
-          ip        = ip
-          ports     = [2049]
-          protocols = ["tcp"]
-          all_ports = false
-        }
-        ], [{
+      # NFSv4 uses TCP/2049; allow each configured IP-literal remote NFS
+      # server regardless of deny CIDRs. Libvirt filters match IPs, not names.
+      allow = concat(
+        var.internal_network_allow,
+        [
+          for ip in distinct([for mount in var.nfs_mounts : mount.server if(
+            can(cidrhost("${mount.server}/32", 0)) || can(cidrhost("${mount.server}/128", 0))
+            )]) : {
+            ip            = ip
+            ports         = [2049]
+            protocols     = ["tcp"]
+            all_ports     = false
+            managed_allow = true
+          }
+        ],
+        [{
+          ip            = local.vm_network.gateway
+          ports         = [53]
+          protocols     = ["tcp", "udp"]
+          all_ports     = false
+          managed_allow = true
+        }],
+        var.mitmproxy_enabled ? [{
+          ip            = local.vm_network.gateway
+          ports         = [8080]
+          protocols     = ["tcp"]
+          all_ports     = false
+          managed_allow = true
+        }] : [],
+        length(var.host_nfs_exports) > 0 ? [{
+          ip            = local.guest_config.hostAddress
+          ports         = [2049]
+          protocols     = ["tcp"]
+          all_ports     = false
+          managed_allow = true
+        }] : [],
+        [{
           ip        = local.firewall_test_network.gateway
           ports     = [local.firewall_test_network.allow_test_port]
           all_ports = false
-      }])
+        }]
+      )
     }
   }
   mitmproxy_config = {
-    name             = var.name
-    uri              = var.libvirt_uri
-    network          = local.vm_network_name
-    gateway          = local.vm_network.gateway
-    image            = var.mitmproxy_policy.image
-    inspect_domains  = var.mitmproxy_policy.inspect_domains
-    blocked_domains  = var.mitmproxy_policy.blocked_domains
-    deny_cidrs       = var.internal_network_deny
+    enabled         = var.mitmproxy_enabled
+    name            = var.name
+    uri             = var.libvirt_uri
+    network         = local.vm_network_name
+    gateway         = local.vm_network.gateway
+    image           = var.mitmproxy_policy.image
+    inspect_domains = var.mitmproxy_policy.inspect_domains
+    blocked_domains = var.mitmproxy_policy.blocked_domains
+    allowed_domains = var.mitmproxy_policy.allowed_domains
+    deny_cidrs      = var.internal_network_deny
+  }
+  host_firewall_config = {
+    name              = var.name
+    method            = var.host_firewall
+    network_cidr      = local.vm_network.cidr
+    gateway           = local.vm_network.gateway
+    nfs_enabled       = length(var.host_nfs_exports) > 0
+    nfs_host          = local.guest_config.hostAddress
+    mitmproxy_enabled = var.mitmproxy_enabled
   }
 }
 
@@ -201,14 +254,14 @@ resource "terraform_data" "image" {
   provisioner "local-exec" {
     command = "python3 \"$NIXVM_ROOT/scripts/nixvm.py\" build-image"
     environment = {
-      NIXVM_ROOT       = local.root
-      NIXVM_BUILD      = local.build_dir
+      NIXVM_ROOT        = local.root
+      NIXVM_BUILD       = local.build_dir
       NIXVM_IMAGE_CACHE = local.image_cache_dir
-      NIXVM_CONFIG     = jsonencode(local.guest_config)
-      NIXVM_CONNECTION = jsonencode(local.connection)
-      NIXVM_REPOSITORY = abspath(pathexpand(var.repository_path))
-      NIXVM_DOTFILES   = abspath(pathexpand(var.dotfiles_path))
-      NIXVM_DISK_GIB   = tostring(var.disk_gib)
+      NIXVM_CONFIG      = jsonencode(local.guest_config)
+      NIXVM_CONNECTION  = jsonencode(local.connection)
+      NIXVM_REPOSITORY  = abspath(pathexpand(var.repository_path))
+      NIXVM_DOTFILES    = abspath(pathexpand(var.dotfiles_path))
+      NIXVM_DISK_GIB    = tostring(var.disk_gib)
     }
   }
 }

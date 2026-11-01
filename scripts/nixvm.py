@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
+import fnmatch
 import hashlib
 import ipaddress
 import json
@@ -296,7 +298,7 @@ def add_network_access_rules(root, access):
                                     dstipaddr=ip.compressed)
             continue
         for port in rule_config["ports"]:
-            for transport in rule_config.get("protocols", ("tcp", "udp")):
+            for transport in rule_config.get("protocols") or ("tcp", "udp"):
                 add_network_filter_rule(
                     root, "accept", element=transport if ip.version == 4 else "ipv6", priority=100,
                     dstipaddr=ip.compressed,
@@ -360,15 +362,6 @@ def build_network_filter(name, access, filter_uuid=None):
     # Host allow rules are explicit and are evaluated before internal-network
     # allow rules; remaining traffic to listed host IPs is denied.
     add_network_access_rules(root, access["host"])
-    proxy = access.get("proxy")
-    if proxy:
-        proxy_ip = ipaddress.ip_address(proxy["ip"])
-        add_network_filter_rule(
-            root, "accept", element="tcp" if proxy_ip.version == 4 else "ipv6",
-            priority=80, dstipaddr=proxy_ip.compressed,
-            **({} if proxy_ip.version == 4 else {"protocol": "tcp"}),
-            dstportstart=proxy["port"], dstportend=proxy["port"],
-        )
 
     # Explicit internal per-IP port rules may override the global web-port
     # block. Keep this exception narrow: all_ports does not include these
@@ -379,7 +372,7 @@ def build_network_filter(name, access, filter_uuid=None):
         if rule_config["all_ports"]:
             continue
         for port in set(rule_config["ports"]).intersection(blocked_ports):
-            for transport in rule_config.get("protocols", ("tcp", "udp")):
+            for transport in rule_config.get("protocols") or ("tcp", "udp"):
                 add_network_filter_rule(
                     root, "accept", element=transport if ip.version == 4 else "ipv6",
                     priority=85, dstipaddr=ip.compressed,
@@ -403,7 +396,10 @@ def build_network_filter(name, access, filter_uuid=None):
 
     host_ips = {ipaddress.ip_address(address).compressed for address in access["host"]["ips"]}
     internal_allow = access["internal"]["allow"]
-    internal_ips = {ipaddress.ip_address(item["ip"]).compressed for item in internal_allow}
+    internal_ips = {
+        ipaddress.ip_address(item["ip"]).compressed for item in internal_allow
+        if not item.get("managed_allow")
+    }
     overlap = host_ips.intersection(internal_ips)
     if overlap:
         raise ValueError("List host IPs only in host_access, not internal_network_allow: " + ", ".join(sorted(overlap)))
@@ -420,6 +416,8 @@ def build_network_filter(name, access, filter_uuid=None):
 
     internal_ranges = [ipaddress.ip_network(cidr) for cidr in access["internal"]["deny_cidrs"]]
     for rule in internal_allow:
+        if rule.get("managed_allow"):
+            continue
         address = rule["ip"]
         ip = ipaddress.ip_address(address)
         if not any(ip.version == network.version and ip in network for network in internal_ranges):
@@ -437,6 +435,18 @@ def build_network_filter(name, access, filter_uuid=None):
     return root
 
 
+def define_network_filter_config(name, access, uri):
+    filter_uuid = existing_network_filter_uuid(uri, name)
+    root = build_network_filter(name, access, filter_uuid)
+
+    with tempfile.NamedTemporaryFile(mode="wb", prefix="nixvm-nwfilter-", suffix=".xml") as xml:
+        ET.ElementTree(root).write(xml, encoding="utf-8", xml_declaration=True)
+        xml.flush()
+        run(["virsh", "--connect", uri, "nwfilter-define", xml.name])
+    action = "Updated" if filter_uuid else "Defined"
+    print(f"{action} host network filter: {name}")
+
+
 def define_network_filter(extra=()):
     if "NIXVM_FILTER_NAME" in os.environ:
         name = os.environ["NIXVM_FILTER_NAME"]
@@ -447,15 +457,7 @@ def define_network_filter(extra=()):
         name = config["filter_name"]
         access = config["filter_access"]
         uri = config["connection"]["uri"]
-    filter_uuid = existing_network_filter_uuid(uri, name)
-    root = build_network_filter(name, access, filter_uuid)
-
-    with tempfile.NamedTemporaryFile(mode="wb", prefix="nixvm-nwfilter-", suffix=".xml") as xml:
-        ET.ElementTree(root).write(xml, encoding="utf-8", xml_declaration=True)
-        xml.flush()
-        run(["virsh", "--connect", uri, "nwfilter-define", xml.name])
-    action = "Updated" if filter_uuid else "Defined"
-    print(f"{action} host network filter: {name}")
+    define_network_filter_config(name, access, uri)
 
 
 def tofu_firewall_test_config(extra):
@@ -506,6 +508,8 @@ def tofu_guest_config(extra):
 
 def ensure_vm_nat(extra=()):
     config = tofu_mitmproxy_config(extra)
+    if not config.get("enabled", True):
+        return
     result = subprocess.run(
         ["virsh", "--connect", config["uri"], "net-info", config["network"]],
         check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -519,9 +523,25 @@ def ensure_vm_nat(extra=()):
 
 def mitmproxy_allow_hosts(inspect_domains):
     patterns = []
-    for domain in inspect_domains:
-        escaped = re.escape(domain.lower().rstrip(".")).replace(r"\.", "[.]")
-        patterns.append(rf"(^|[.]){escaped}(:[0-9]+)?$")
+    for entry in inspect_domains:
+        if entry.startswith("glob:"):
+            host_pattern = fnmatch.translate(entry[5:].lower())
+            if host_pattern.endswith(r"\Z") or host_pattern.endswith(r"\z"):
+                host_pattern = host_pattern[:-2]
+        elif entry.startswith("regex:"):
+            host_pattern = entry[6:]
+            if host_pattern.startswith(r"\A"):
+                host_pattern = host_pattern[2:]
+            elif host_pattern.startswith("^"):
+                host_pattern = host_pattern[1:]
+            if host_pattern.endswith(r"\Z"):
+                host_pattern = host_pattern[:-2]
+            elif host_pattern.endswith("$"):
+                host_pattern = host_pattern[:-1]
+        else:
+            domain = entry.lower().rstrip(".")
+            host_pattern = rf"(?:[^.]+\.)*{re.escape(domain)}"
+        patterns.append(rf"(?i:^(?:{host_pattern})(?::[0-9]+)?$)")
     # An empty list means inspect none. mitmproxy's empty allow-hosts option
     # means inspect everything, so use a regex that cannot match instead.
     return "|".join(patterns) if patterns else r"(?!)"
@@ -717,6 +737,9 @@ def wait_tcp_listener(address, port, timeout=120):
 
 def setup_host_mitmproxy(extra=()):
     config = tofu_mitmproxy_config(extra)
+    if not config.get("enabled", True):
+        print("mitmproxy is disabled for this VM; skipping host proxy setup.")
+        return
     ensure_podman()
     if shutil.which("systemctl") is None or shutil.which("loginctl") is None:
         raise RuntimeError("The host must use systemd to run the Podman mitmproxy service.")
@@ -742,6 +765,7 @@ def setup_host_mitmproxy(extra=()):
     (policy_dir / "mitmproxy_policy.py").chmod(0o644)
     policy = {
         "blocked_domains": config["blocked_domains"],
+        "allowed_domains": config["allowed_domains"],
         "deny_cidrs": config["deny_cidrs"],
     }
     (policy_dir / "policy.json").write_text(json.dumps(policy, indent=2) + "\n", encoding="utf-8")
@@ -803,14 +827,45 @@ def cleanup_host_mitmproxy(name):
     print("Stopped the shared managed mitmproxy service; its Podman CA volume was retained.")
 
 
+def ufw_probe_allow_commands(admin, config, marker):
+    return [
+        admin + ["ufw", "allow", "in", "from", config["vm_network"]["cidr"],
+                 "to", config["network"]["gateway"], "port",
+                 str(config["network"]["allow_test_port"]), "proto", protocol,
+                 "comment", marker]
+        for protocol in ("tcp", "udp")
+    ]
+
+
 def run_firewall_tests(extra):
     config = tofu_firewall_test_config(extra)
+    # Direct `nixvm firewall-test` runs must refresh the host filter too; the
+    # live comparison below should never inspect a stale definition.
+    define_network_filter_config(config["filter_name"], config["filter_access"],
+                                 config["connection"]["uri"])
     print("Waiting for guest SSH before running live firewall probes.")
     wait_ssh(config["connection"], timeout=300)
+    firewall = tofu_host_firewall_config(extra)
+    admin = host_admin_prefix() if firewall["method"] == "ufw" else None
+    probe_marker = f"nixvm-{firewall['name']}-firewall-test"
     env = os.environ.copy()
     env["NIXVM_FIREWALL_TEST_CONFIG"] = json.dumps(config)
-    run([sys.executable, "-m", "unittest", "discover", "-s", ROOT / "tests",
-         "-p", "test_firewall.py", "-v"], env=env)
+    try:
+        if admin is not None:
+            # The test listener is temporary and isn't one of the VM's services.
+            # Open only its probe port while the live guest connectivity tests run.
+            if shutil.which("ufw") is None:
+                raise RuntimeError("host_firewall is set to 'ufw', but ufw is not installed on the host.")
+            for number in ufw_managed_rule_numbers(admin, probe_marker):
+                run(admin + ["ufw", "--force", "delete", str(number)])
+            for command in ufw_probe_allow_commands(admin, config, probe_marker):
+                run(command)
+        run([sys.executable, "-m", "unittest", "discover", "-s", ROOT / "tests",
+             "-p", "test_firewall.py", "-v"], env=env)
+    finally:
+        if admin is not None:
+            for number in ufw_managed_rule_numbers(admin, probe_marker):
+                run(admin + ["ufw", "--force", "delete", str(number)])
 
 
 def tofu_host_nfs_config(extra):
@@ -825,6 +880,75 @@ def tofu_host_nfs_config(extra):
         return json.loads(json.loads(result))
     except (json.JSONDecodeError, TypeError) as error:
         raise RuntimeError(f"Could not read host_nfs_exports from OpenTofu: {result}") from error
+
+
+def tofu_host_firewall_config(extra):
+    expression = (
+        "jsonencode({name = local.host_firewall_config.name, "
+        "method = local.host_firewall_config.method, "
+        "network_cidr = local.host_firewall_config.network_cidr, "
+        "gateway = local.host_firewall_config.gateway, "
+        "nfs_enabled = local.host_firewall_config.nfs_enabled, "
+        "nfs_host = local.host_firewall_config.nfs_host, "
+        "mitmproxy_enabled = local.host_firewall_config.mitmproxy_enabled})"
+    )
+    result = run(["tofu", f"-chdir={ROOT / 'infrastructure'}", "console", *extra],
+                 capture=True, input=expression + "\n").stdout.strip()
+    try:
+        return json.loads(json.loads(result))
+    except (json.JSONDecodeError, TypeError) as error:
+        raise RuntimeError(f"Could not read host firewall configuration from OpenTofu: {result}") from error
+
+
+def ufw_managed_rule_numbers(admin, marker):
+    result = subprocess.run(
+        admin + ["ufw", "status", "numbered"], check=False, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        env={**os.environ, "LC_ALL": "C"},
+    )
+    if result.returncode:
+        raise RuntimeError(f"Could not inspect UFW rules: {result.stderr.strip()}")
+    matching = []
+    for line in result.stdout.splitlines():
+        match = re.match(r"^\[\s*(\d+)\]\s+.*#\s*(\S+)\s*$", line)
+        if match and match.group(2) == marker:
+            matching.append(int(match.group(1)))
+    return sorted(matching, reverse=True)
+
+
+def configure_host_firewall(extra=()):
+    config = tofu_host_firewall_config(extra)
+    if config["method"] == "disabled":
+        print("Host firewall integration is disabled; UFW was not changed.")
+        return
+    if config["method"] != "ufw":
+        raise ValueError(f"Unsupported host firewall method: {config['method']!r}")
+    if shutil.which("ufw") is None:
+        raise RuntimeError("host_firewall is set to 'ufw', but ufw is not installed on the host.")
+
+    admin = host_admin_prefix()
+    marker = f"nixvm-{config['name']}"
+    # Remove older rules for this VM first, so subnet and service changes do
+    # not leave obsolete persistent allows behind. The marker scopes removal
+    # to rules created by this NixVM profile.
+    for number in ufw_managed_rule_numbers(admin, marker):
+        run(admin + ["ufw", "--force", "delete", str(number)])
+
+    rules = [
+        (config["gateway"], 53, "udp"),
+        (config["gateway"], 53, "tcp"),
+    ]
+    if config["mitmproxy_enabled"]:
+        rules.append((config["gateway"], 8080, "tcp"))
+    if config["nfs_enabled"]:
+        rules.append((config["nfs_host"], 2049, "tcp"))
+
+    for destination, port, protocol in rules:
+        run(admin + ["ufw", "allow", "in", "from", config["network_cidr"],
+                     "to", destination, "port", str(port), "proto", protocol,
+                     "comment", marker])
+    print(f"Configured persistent UFW rules for {config['name']}: "
+          + ", ".join(f"{port}/{protocol}" for _, port, protocol in rules))
 
 
 def host_os_release():
@@ -1003,7 +1127,7 @@ def configure_host_nfs(extra):
         for export in config["exports"]:
             print(f"  - export host path {export['host_path']} and mount it in the VM at {export['guest_path']}")
         print(f"  - enable/start {service} and reload NFS exports")
-        print("  - leave host firewall settings unchanged; allow TCP port 2049 from the listed libvirt subnet if firewalled")
+        print("  - configure TCP port 2049 in UFW only when host_firewall = \"ufw\"")
         confirm_host_nfs_plan()
 
         if package_missing:
@@ -1522,7 +1646,7 @@ def usb(c, attach, selector=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["build-image", "remove-image", "define-network-filter", "firewall-test", "check-host-nfs", "setup-host-nfs", "setup-host-mitmproxy", "cleanup-host-mitmproxy", "setup-hostname", "cleanup-hostname", "bootstrap", "preflight", "ssh", "spice", "forward", "ensure-vm-nat",
+    parser.add_argument("command", choices=["build-image", "remove-image", "define-network-filter", "firewall-test", "check-host-nfs", "setup-host-nfs", "setup-host-firewall", "setup-host-mitmproxy", "cleanup-host-mitmproxy", "setup-hostname", "cleanup-hostname", "bootstrap", "preflight", "ssh", "spice", "forward", "ensure-vm-nat",
                         "usb-attach", "usb-detach", "rebuild", "rollback", "password", "reboot", "start", "stop",
                         "reprovision", "import-public-keys", "gpu-check", "token-check", "update-config", "ip"])
     parser.add_argument("--name", default=os.environ.get("NIXVM_PROFILE", "nixvm"),
@@ -1548,6 +1672,8 @@ def main():
         return run_firewall_tests(extra)
     if args.command == "setup-host-nfs":
         return configure_host_nfs(extra)
+    if args.command == "setup-host-firewall":
+        return configure_host_firewall(extra)
     if args.command == "setup-host-mitmproxy":
         return setup_host_mitmproxy(extra)
     if args.command == "ensure-vm-nat":

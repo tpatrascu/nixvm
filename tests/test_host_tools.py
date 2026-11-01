@@ -3,7 +3,9 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
+import types
 import unittest
 from unittest.mock import patch
 
@@ -35,6 +37,42 @@ class RepositoryTransferTests(unittest.TestCase):
 
 
 class HostTests(unittest.TestCase):
+    def test_mitmproxy_domain_allowlist_overrides_blocklist_with_glob_and_regex(self):
+        with tempfile.TemporaryDirectory() as directory:
+            policy_file = Path(directory) / "policy.json"
+            policy_file.write_text(json.dumps({
+                "blocked_domains": ["glob:*.example.com", "regex:telemetry[0-9]+\\.example\\.net"],
+                "allowed_domains": ["regex:api[0-9]+\\.example\\.com", "trusted.example.net"],
+                "deny_cidrs": [],
+            }), encoding="utf-8")
+            mitmproxy_stub = types.ModuleType("mitmproxy")
+            mitmproxy_stub.ctx = types.SimpleNamespace(
+                log=types.SimpleNamespace(warn=lambda _message: None)
+            )
+            mitmproxy_stub.http = types.SimpleNamespace(
+                HTTPFlow=object, Response=types.SimpleNamespace(make=lambda *_args, **_kwargs: None)
+            )
+            addon_path = Path(__file__).parents[1] / "scripts" / "mitmproxy_policy.py"
+            spec = importlib.util.spec_from_file_location("nixvm_test_mitmproxy_policy", addon_path)
+            addon = importlib.util.module_from_spec(spec)
+            with patch.dict(sys.modules, {"mitmproxy": mitmproxy_stub}), \
+                 patch.dict(os.environ, {"NIXVM_MITMPROXY_POLICY": str(policy_file)}):
+                spec.loader.exec_module(addon)
+                policy = addon.NixvmPolicy()
+        self.assertTrue(policy.domain_is_blocked("img.example.com"))
+        self.assertFalse(policy.domain_is_blocked("api42.example.com"))
+        self.assertTrue(policy.domain_is_blocked("telemetry9.example.net"))
+        self.assertFalse(policy.domain_is_blocked("cdn.trusted.example.net"))
+
+    def test_inspection_hosts_accept_glob_and_regex_patterns(self):
+        patterns = nixvm.mitmproxy_allow_hosts([
+            "glob:*.inspect.example.net",
+            r"regex:api[0-9]+\.example\.com",
+        ])
+        self.assertRegex("img.inspect.example.net:443", patterns)
+        self.assertRegex("api23.example.com:443", patterns)
+        self.assertNotRegex("other.example.org:443", patterns)
+
     def test_mitmproxy_ca_is_initialized_in_the_persistent_shared_volume(self):
         with patch.object(nixvm, "run") as run:
             nixvm.initialize_mitmproxy_ca("docker.io/mitmproxy/mitmproxy:latest")

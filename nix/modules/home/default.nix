@@ -40,14 +40,19 @@ in {
   programs.direnv = { enable = true; nix-direnv.enable = true; };
   home.packages = [ pkgs.ripgrep pkgs.fd pkgs.jq pkgs.gnumake pkgs.kubectl ];
   home.sessionVariables = {
-    EDITOR = "zed --wait";
+    EDITOR = if (machine.defaultEditor or "nvim") == "zed" then "zed --wait"
+      else if (machine.defaultEditor or "nvim") == "vscode" then "code --wait"
+      else "nvim";
+    TERMINAL = machine.defaultTerminal or "kitty";
+    BROWSER = if (machine.defaultBrowser or "firefox") == "chromium"
+      then "chromium" else "nixvm-firefox";
     PKCS11_MODULE = "${pkgs.opensc}/lib/opensc-pkcs11.so";
     PCSCLITE_CSOCK_NAME = "/run/user/${toString machine.uid}/nixvm/pcsc.sock";
     NIXVM_REPOSITORY = machine.repoPath;
   } // lib.optionalAttrs mitmproxyEnabled (proxyEnvironment // certificateEnvironment);
   systemd.user.sessionVariables = lib.mkIf mitmproxyEnabled
     (proxyEnvironment // certificateEnvironment);
-  programs.zsh = {
+  programs.zsh = lib.mkIf ((machine.defaultShell or "zsh") == "zsh") {
     enable = true;
     oh-my-zsh = { enable = true; plugins = [ "git" "kubectl" ]; theme = ""; };
     initContent = ''

@@ -1,5 +1,11 @@
 { config, lib, pkgs, machine, ... }:
 let
+  browsers = machine.apps.browsers or { };
+  firefoxEnabled = browsers.firefox or true;
+  chromiumEnabled = browsers.chromium or false;
+  defaultBrowser = machine.defaultBrowser or "firefox";
+  browserDesktop = if defaultBrowser == "chromium"
+    then "nixvm-chromium.desktop" else "nixvm-firefox.desktop";
   state = "\"$HOME/.local/state/nixvm\"";
   modeTools = pkgs.writeShellApplication {
     name = "nixvm-token-mode";
@@ -85,29 +91,43 @@ in {
   programs.gpg = { enable = true; settings.no-autostart = true; };
   services.gpg-agent.enable = false;
   programs.git.settings.gpg.program = "nixvm-gpg";
-  programs.firefox = {
+  programs.firefox = lib.mkIf firefoxEnabled {
     enable = true;
     policies.SecurityDevices.Add."OpenSC PIV" = "${pkgs.opensc}/lib/opensc-pkcs11.so";
     profiles.default = { id = 0; isDefault = true; };
   };
-  xdg.desktopEntries.nixvm-firefox = {
-    name = "Firefox (YubiKey mode)";
-    genericName = "Web Browser";
-    exec = "${firefox}/bin/nixvm-firefox %U";
-    icon = "${config.programs.firefox.finalPackage}/share/icons/hicolor/128x128/apps/firefox.png";
-    terminal = false;
-    categories = [ "Network" "WebBrowser" ];
-    mimeType = [ "text/html" "x-scheme-handler/http" "x-scheme-handler/https" ];
+  xdg.desktopEntries = lib.optionalAttrs firefoxEnabled {
+    nixvm-firefox = {
+      name = "Firefox (YubiKey mode)";
+      genericName = "Web Browser";
+      exec = "${firefox}/bin/nixvm-firefox %U";
+      icon = "${config.programs.firefox.finalPackage}/share/icons/hicolor/128x128/apps/firefox.png";
+      terminal = false;
+      categories = [ "Network" "WebBrowser" ];
+      mimeType = [ "text/html" "x-scheme-handler/http" "x-scheme-handler/https" ];
+    };
+  } // lib.optionalAttrs chromiumEnabled {
+    nixvm-chromium = {
+      name = "Chromium";
+      genericName = "Web Browser";
+      exec = "chromium %U";
+      icon = "chromium";
+      terminal = false;
+      categories = [ "Network" "WebBrowser" ];
+      mimeType = [ "text/html" "x-scheme-handler/http" "x-scheme-handler/https" ];
+    };
   };
   xdg.mimeApps = {
     enable = true;
     defaultApplications = {
-      "text/html" = "nixvm-firefox.desktop";
-      "x-scheme-handler/http" = "nixvm-firefox.desktop";
-      "x-scheme-handler/https" = "nixvm-firefox.desktop";
+      "text/html" = browserDesktop;
+      "x-scheme-handler/http" = browserDesktop;
+      "x-scheme-handler/https" = browserDesktop;
     };
   };
-  home.packages = [ modeTools gpg firefox piv pivSsh ];
+  home.packages = [ modeTools gpg piv pivSsh ]
+    ++ lib.optionals firefoxEnabled [ firefox ]
+    ++ lib.optionals chromiumEnabled [ pkgs.chromium ];
   # Ensure systemd/D-Bus applications get the forwarding socket, not only shells.
   systemd.user.tmpfiles.rules = [ "d %t/nixvm 0700 - - -" ];
   systemd.user.sessionVariables.PCSCLITE_CSOCK_NAME = "/run/user/${toString machine.uid}/nixvm/pcsc.sock";

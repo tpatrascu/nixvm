@@ -19,7 +19,7 @@ def usage():
     print("""Usage: nixvm [-n|--name VM] <command> [options]
 
 VM lifecycle:
-  up | apply [tofu options]  Prepare host NFS/proxy, apply VM, activate proxy policy, test firewall
+  up | apply [tofu options]  Prepare host services/firewall, apply VM, activate config, test firewall
   u [tofu options]           Apply infrastructure, then activate host NixOS config
   init [tofu options]        Initialize OpenTofu
   plan [tofu options]        Run tofu plan
@@ -39,6 +39,7 @@ Host setup:
   nfs setup [var options]    Confirm and configure host NFS exports
   nfs cleanup [var options]  Confirm removal of this VM's managed exports
   mitmproxy password         Print the selected VM's mitmweb UI password
+  mitmproxy cleanup          Stop and remove the host mitmproxy setup
   image remove              Remove this VM's image and workstation build cache
   firewall-test [var options] Check the managed firewall network and policy
 
@@ -260,6 +261,7 @@ def main(arguments):
         internal("check-host-nfs", variables)
         internal("define-network-filter", variables)
         internal("ensure-vm-nat", variables)
+        internal("setup-host-firewall", variables)
         internal("setup-host-mitmproxy", variables)
         apply_args = [*variables, *operation]
         if "-auto-approve" not in apply_args:
@@ -313,8 +315,13 @@ def main(arguments):
             raise ValueError("Use 'nixvm [-n NAME] image remove'")
         internal("remove-image", ["--name", profile])
     elif command == "mitmproxy":
-        if not extra or extra[0] != "password":
-            raise ValueError("Use 'nixvm mitmproxy password [-var-file=PATH]'")
+        if not extra or extra[0] not in ("password", "cleanup"):
+            raise ValueError("Use 'nixvm mitmproxy password [-var-file=PATH]' or 'nixvm mitmproxy cleanup'")
+        if extra[0] == "cleanup":
+            if len(extra) != 1:
+                raise ValueError("nixvm mitmproxy cleanup accepts no options")
+            internal("cleanup-host-mitmproxy", ["--name", profile])
+            return 0
         _, operation = split_arguments(extra[1:], profile)
         if operation:
             raise ValueError("nixvm mitmproxy password accepts only -var-file and -var options")
@@ -331,6 +338,7 @@ def main(arguments):
         internal("check-host-nfs", variables)
         internal("define-network-filter", variables)
         internal("ensure-vm-nat", variables)
+        internal("setup-host-firewall", variables)
         internal("setup-host-mitmproxy", variables)
         tofu("apply", [*variables, "-replace=terraform_data.bootstrap", *operation])
         internal("update-config", variables)

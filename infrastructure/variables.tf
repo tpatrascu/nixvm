@@ -161,21 +161,42 @@ variable "host_access" {
     error_message = "host_access.ports may not include blocked web ports; the proxy's TCP/8080 exception is managed separately."
   }
 }
+variable "host_firewall" {
+  description = "Host firewall integration: disabled leaves host firewall rules alone; ufw configures persistent UFW rules for NixVM services."
+  type        = string
+  default     = "disabled"
+  validation {
+    condition     = contains(["disabled", "ufw"], var.host_firewall)
+    error_message = "host_firewall must be either \"disabled\" or \"ufw\"."
+  }
+}
+variable "mitmproxy_enabled" {
+  description = "Whether this VM uses the shared host mitmproxy and receives its proxy configuration."
+  type        = bool
+  default     = false
+}
 variable "mitmproxy_policy" {
   description = "Host Podman mitmproxy image and HTTPS hostname policy. Empty inspect_domains means TLS is passed through without decryption."
   type = object({
     image           = optional(string, "docker.io/mitmproxy/mitmproxy:latest")
     inspect_domains = optional(list(string), [])
     blocked_domains = optional(list(string), [])
+    allowed_domains = optional(list(string), [])
   })
   default = {}
   validation {
     condition = alltrue(concat(
       [can(regex("^[A-Za-z0-9][A-Za-z0-9._/:@-]*$", var.mitmproxy_policy.image))],
-      [for domain in concat(var.mitmproxy_policy.inspect_domains, var.mitmproxy_policy.blocked_domains) :
-        can(regex("^([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\\.)*[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$", domain))]
+      [for domain in concat(var.mitmproxy_policy.inspect_domains, var.mitmproxy_policy.blocked_domains, var.mitmproxy_policy.allowed_domains) : (
+        startswith(domain, "glob:") ? (
+          length(domain) > 5 && can(regex("^glob:[A-Za-z0-9._*?\\[\\]!-]+$", domain))
+          ) : startswith(domain, "regex:") ? (
+          length(domain) > 6 && can(regexall(substr(domain, 6, length(domain)), "")) &&
+          !strcontains(domain, " ") && !strcontains(domain, "\"")
+        ) : can(regex("^([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\\.)*[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$", domain))
+      )]
     ))
-    error_message = "mitmproxy image must be non-empty and policy entries must be bare hostnames without wildcards or paths."
+    error_message = "mitmproxy domain entries must be hostnames, glob:<pattern>, or regex:<pattern>; regex patterns must be valid and contain no spaces or quotes."
   }
 }
 variable "internal_network_deny" {
@@ -293,25 +314,86 @@ variable "dotfiles_links" {
 variable "toolchains" {
   description = "Development toolchains to install in the guest."
   type = object({
-    python = optional(bool, true)
-    node   = optional(bool, true)
-    llvm   = optional(bool, true)
-    rust   = optional(bool, true)
-    jdk    = optional(bool, true)
-    garmin = optional(bool, true)
+    python = optional(bool, false)
+    node   = optional(bool, false)
+    llvm   = optional(bool, false)
+    rust   = optional(bool, false)
+    jdk    = optional(bool, false)
+    garmin = optional(bool, false)
   })
   default = {}
 }
 variable "apps" {
-  description = "Applications to install in the guest when supported by the target platform."
+  description = "Guest applications grouped by editors, terminals, browsers, and coding agents."
   type = object({
-    codex      = optional(bool, true)
-    chatgpt    = optional(bool, true)
-    claudeCode = optional(bool, true)
-    opencode   = optional(bool, true)
-    vscode     = optional(bool, true)
+    editors = optional(object({
+      zed    = optional(bool, false)
+      vscode = optional(bool, false)
+    }), {})
+    terminals = optional(object({
+      kitty   = optional(bool, false)
+      ghostty = optional(bool, false)
+    }), {})
+    browsers = optional(object({
+      firefox  = optional(bool, true)
+      chromium = optional(bool, false)
+    }), {})
+    coding_agents = optional(object({
+      omp        = optional(bool, false)
+      codex      = optional(bool, false)
+      chatgpt    = optional(bool, false)
+      claudeCode = optional(bool, false)
+      opencode   = optional(bool, false)
+    }), {})
   })
   default = {}
+}
+variable "default_editor" {
+  description = "Default EDITOR command. Selecting zed or vscode also enables that editor."
+  type        = string
+  default     = "nvim"
+  validation {
+    condition     = contains(["nvim", "zed", "vscode"], var.default_editor)
+    error_message = "default_editor must be \"nvim\", \"zed\", or \"vscode\"."
+  }
+}
+variable "default_terminal" {
+  description = "Default terminal command. Selecting a terminal also enables it in apps.terminals."
+  type        = string
+  default     = "kitty"
+  validation {
+    condition     = contains(["kitty", "ghostty"], var.default_terminal)
+    error_message = "default_terminal must be either \"kitty\" or \"ghostty\"."
+  }
+}
+variable "default_shell" {
+  description = "Login shell for the guest user."
+  type        = string
+  default     = "zsh"
+  validation {
+    condition     = contains(["bash", "zsh"], var.default_shell)
+    error_message = "default_shell must be either \"bash\" or \"zsh\"."
+  }
+}
+variable "default_browser" {
+  description = "Default browser. Selecting a browser also enables it in apps.browsers."
+  type        = string
+  default     = "firefox"
+  validation {
+    condition     = contains(["firefox", "chromium"], var.default_browser)
+    error_message = "default_browser must be either \"firefox\" or \"chromium\"."
+  }
+}
+variable "additional_nix_pkgs" {
+  description = "Additional Nixpkgs package attribute paths to install in the guest."
+  type        = list(string)
+  default     = []
+  validation {
+    condition = length(distinct(var.additional_nix_pkgs)) == length(var.additional_nix_pkgs) && alltrue([
+      for package in var.additional_nix_pkgs : can(regex("^[A-Za-z0-9_-]+(\\.[A-Za-z0-9_-]+)*$", package))
+    ])
+    error_message = "additional_nix_pkgs must contain unique Nixpkgs attribute paths, such as ripgrep or python3Packages.pip."
+  }
 }
 variable "nfs_mounts" {
   description = "Manually configured NFS exports on remote servers to mount in the guest."

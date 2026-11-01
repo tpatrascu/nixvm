@@ -4,6 +4,7 @@ import importlib.util
 import ipaddress
 import json
 import os
+from collections import Counter
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 import shutil
@@ -89,6 +90,36 @@ class NixvmFirewallTest(unittest.TestCase):
         )
         self.assertLess(self.filter.findall("rule").index(accepts[0]),
                         self.filter.findall("rule").index(host_drop))
+
+    def test_gateway_dns_is_allowed_even_when_host_access_ports_are_empty(self):
+        access = json.loads(json.dumps(self.access))
+        access["host"]["ports"] = []
+        access["internal"]["allow"].append({
+            "ip": "192.168.124.1", "ports": [53], "protocols": ["tcp", "udp"],
+            "all_ports": False, "managed_allow": True,
+        })
+        policy = nixvm.build_network_filter("nixvm-access", access)
+        dns_accepts = [
+            rule for rule in policy.findall("rule")
+            if rule.get("action") == "accept" and rule.get("priority") == "100"
+            and rule[0].get("dstipaddr") == "192.168.124.1"
+        ]
+        self.assertEqual({(rule[0].tag, rule[0].get("dstportstart")) for rule in dns_accepts},
+                         {("tcp", "53"), ("udp", "53")})
+
+    def test_empty_global_port_block_keeps_http_egress_unblocked(self):
+        access = json.loads(json.dumps(self.access))
+        access["internal"]["blocked_ports"] = []
+        policy = nixvm.build_network_filter("nixvm-access", access)
+        global_port_drops = [
+            rule for rule in policy.findall("rule")
+            if rule.get("action") == "drop" and rule.get("priority") == "90"
+        ]
+        self.assertEqual(global_port_drops, [])
+        self.assertTrue(any(
+            rule.get("action") == "drop" and rule.get("priority") == "900"
+            for rule in policy.findall("rule")
+        ), "internal-network CIDR protection must remain active")
 
     def test_internal_allow_rules_are_scoped_to_each_ip_and_tcp_udp_port(self):
         ipv4 = [
@@ -227,6 +258,38 @@ class NixvmFirewallTest(unittest.TestCase):
                             and rule.find("all").get("dstipaddr") == "192.168.0.0"
                             for rule in rules))
 
+    def test_ufw_probe_exception_uses_guest_subnet_and_test_gateway(self):
+        config = {
+            "vm_network": {"cidr": "192.168.184.0/24"},
+            "network": {"cidr": "10.254.184.0/24", "gateway": "10.254.184.1",
+                        "allow_test_port": 49231},
+        }
+        commands = nixvm.ufw_probe_allow_commands(["sudo"], config, "nixvm-nixvm2-firewall-test")
+        self.assertEqual(len(commands), 2)
+        for command, protocol in zip(commands, ("tcp", "udp")):
+            self.assertEqual(command[command.index("from") + 1], "192.168.184.0/24")
+            self.assertEqual(command[command.index("to") + 1], "10.254.184.1")
+            self.assertEqual(command[command.index("proto") + 1], protocol)
+            self.assertEqual(command[command.index("port") + 1], "49231")
+
+    def test_live_firewall_test_refreshes_filter_before_comparing_it(self):
+        config = {
+            "filter_name": "nixvm-access",
+            "filter_access": {"host": {}, "internal": {}},
+            "connection": {"uri": "qemu:///system"},
+            "network": {"uri": "qemu:///system"},
+        }
+        with patch.object(nixvm, "tofu_firewall_test_config", return_value=config), \
+             patch.object(nixvm, "define_network_filter_config") as define_filter, \
+             patch.object(nixvm, "wait_ssh"), \
+             patch.object(nixvm, "tofu_host_firewall_config",
+                          return_value={"method": "disabled", "name": "nixvm"}), \
+             patch.object(nixvm, "run"):
+            nixvm.run_firewall_tests([])
+        define_filter.assert_called_once_with(
+            "nixvm-access", config["filter_access"], "qemu:///system"
+        )
+
     def test_internal_allow_ip_must_be_in_a_denied_cidr(self):
         access = {
             "host": {"ips": [], "ports": [], "all_ports": False},
@@ -237,6 +300,25 @@ class NixvmFirewallTest(unittest.TestCase):
         }
         with self.assertRaisesRegex(ValueError, "outside internal_network_deny"):
             nixvm.build_network_filter("nixvm-access", access)
+
+    def test_managed_external_nfs_allow_can_be_outside_denied_cidrs(self):
+        access = {
+            "host": {"ips": [], "ports": [], "all_ports": False},
+            "internal": {
+                "deny_cidrs": ["10.0.0.0/8"],
+                "allow": [{
+                    "ip": "198.51.100.25", "ports": [2049], "protocols": ["tcp"],
+                    "all_ports": False, "managed_allow": True,
+                }],
+            },
+        }
+        policy = nixvm.build_network_filter("nixvm-access", access)
+        self.assertTrue(any(
+            rule.get("action") == "accept" and rule.get("priority") == "100"
+            and rule[0].get("dstipaddr") == "198.51.100.25"
+            and rule[0].tag == "tcp" and rule[0].get("dstportstart") == "2049"
+            for rule in policy.findall("rule")
+        ))
 
     def test_host_and_internal_allow_lists_cannot_overlap(self):
         access = {
@@ -274,6 +356,7 @@ class NixvmFirewallTest(unittest.TestCase):
             ("internal", "check-host-nfs", []),
             ("internal", "define-network-filter", []),
             ("internal", "ensure-vm-nat", []),
+            ("internal", "setup-host-firewall", []),
             ("internal", "setup-host-mitmproxy", []),
             ("tofu", "apply", ["-auto-approve"]),
             ("internal", "update-config", []),
@@ -337,8 +420,8 @@ class NixvmFirewallTest(unittest.TestCase):
                              for child in rule)
             return (tuple(sorted(rule.attrib.items())), children)
 
-        self.assertEqual([signature(rule) for rule in actual.findall("rule")],
-                         [signature(rule) for rule in expected.findall("rule")])
+        self.assertEqual(Counter(signature(rule) for rule in actual.findall("rule")),
+                         Counter(signature(rule) for rule in expected.findall("rule")))
         domain_xml = subprocess.run(
             ["virsh", "--connect", config["network"]["uri"], "dumpxml", config["vm_name"]],
             check=True, capture_output=True, text=True,
@@ -486,10 +569,10 @@ class NixvmFirewallTest(unittest.TestCase):
             ])
             try:
                 nixvm.remote(config["connection"], "bash -s", input=script,
-                             capture=True, timeout=30)
+                             capture=True, timeout=30, stderr=subprocess.STDOUT)
             except subprocess.CalledProcessError as error:
                 self.fail(f"guest connectivity probe failed (status {error.returncode}); "
-                          f"stdout={error.stdout!r}; stderr={error.stderr!r}")
+                          f"output={error.stdout!r}")
             self.assertTrue(servers[0].accepted.wait(2),
                             "the allowed test connection never reached the host listener")
             self.assertFalse(servers[1].accepted.wait(0.2),

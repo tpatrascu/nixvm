@@ -144,22 +144,32 @@ project does not use either. Configure them explicitly if your dotfiles do.
 OpenTofu defines a host-side libvirt network filter and attaches it to the VM's
 interface. It blocks guest-initiated traffic to the standard special-use,
 private, documentation, benchmarking, multicast, link-local, and reserved
-IPv4/IPv6 ranges unless explicitly allowed by the host configuration. It also
-blocks guest egress to TCP and UDP destination ports 80, 443, 8443, 8080, 8081,
-and 8082. The only web-proxy exception is TCP/8080 to the host's managed
-mitmproxy listener on the VM gateway. Host-initiated connections to the VM,
+IPv4/IPv6 ranges unless explicitly allowed by the host configuration. With
+mitmproxy enabled, it also blocks guest egress to TCP and UDP destination ports
+80, 443, 8443, 8080, 8081, and 8082. The only web-proxy exception is TCP/8080
+to the host's managed mitmproxy listener on the VM gateway. With mitmproxy
+disabled, direct web egress is allowed. Host-initiated connections to the VM,
 including SSH, are not restricted.
 
 Configure `host_access`, `internal_network_deny`, and `internal_network_allow` in
 `infrastructure/nixvm.tfvars`. `host_access` lists exact host IPs and allowed
-ports. The internal network deny list and per-IP allow rules are separate
+ports. DNS to the VM's libvirt gateway is always allowed by the VM policy.
+Enabled host services (gateway DNS, mitmproxy, and configured host NFS) also
+receive automatic exceptions in the internal-network filter, so they do not
+need duplicate `internal_network_allow` or `host_access` entries. The internal
+network deny list and per-IP allow rules are separate
 variables, so changing the allow rules preserves the default deny CIDRs. Each
 allow rule specifies one IP and its own allowed ports, over both TCP and UDP.
 For example, add `2049` under
 `host_access.ports` to let the VM reach a host's NFSv4 service. The
-default `host_access` allows DNS to the dedicated VM NAT gateway and denies
-other guest-initiated access to that host IP, except the managed proxy port
-TCP/8080 on the VM gateway.
+default `host_access` denies other guest-initiated access to the gateway;
+DNS and enabled service ports receive separate automatic exceptions.
+Set `host_firewall = "ufw"` to have `nixvm up` add persistent UFW allows from
+this VM's subnet for gateway DNS (TCP and UDP 53), enabled mitmproxy (TCP
+8080), and host NFS exports (TCP 2049 when configured). Rules are scoped to
+the VM subnet and service destination. Set `host_firewall = "disabled"` to
+leave UFW unchanged; this is the default. The `ufw` choice requires UFW to be
+installed and does not enable UFW itself.
 Blocked web ports cannot be added to `host_access.ports`. An explicit port in
 `internal_network_allow` overrides the global web-port block for that IP;
 `all_ports` still leaves those ports blocked. Add any other host IPs the VM
@@ -168,7 +178,12 @@ ports.
 
 ### Host-side HTTPS proxy
 
-`./nixvm up` installs Podman on supported Ubuntu hosts if needed, enables
+Mitmproxy is disabled by default. Set `mitmproxy_enabled = true` in the
+selected tfvars file to enable host proxy setup and guest proxy/CA configuration.
+With it disabled, the VM connects to web services directly, while its
+internal-network denies remain in force.
+
+When enabled, `./nixvm up` installs Podman on supported Ubuntu hosts if needed, enables
 lingering for the current host user, and creates a Quadlet user service for the
 official mitmproxy container. It provisions the rootless Podman subordinate ID
 ranges when needed; if other rootless containers are running, stop them and
@@ -198,14 +213,22 @@ variable below. The default image is `docker.io/mitmproxy/mitmproxy:latest`;
 
 ```hcl
 mitmproxy_policy = {
-  inspect_domains = ["api.example.com"]
-  blocked_domains = ["telemetry.example.net"]
+  inspect_domains = ["api.example.com", "glob:*.inspect.example.net"]
+  blocked_domains = ["telemetry.example.net", "glob:*.ads.example.org"]
+  allowed_domains = ["api.telemetry.example.net", "regex:trusted[0-9]+\\.example\\.com"]
 }
 ```
 
-Entries match the hostname and its subdomains. `inspect_domains` selects the
-HTTPS hosts whose TLS is decrypted; an empty list decrypts none. The VM trusts
-the proxy's generated CA, which `nixvm up` copies into the guest configuration.
+Bare hostnames match themselves and their subdomains. Prefix an entry with
+`glob:` to match a whole hostname using glob syntax (`*`, `?`, and character
+ranges), or with `regex:` to match the whole hostname using a Python/RE2
+compatible regular expression. Glob and regex patterns match the normalized
+hostname as written; use `glob:*.example.com` to match subdomains. Entries in
+`allowed_domains` override matching `blocked_domains`; the internal CIDR deny
+policy still applies. `inspect_domains` selects HTTPS hosts whose TLS is
+decrypted; an empty list decrypts none. It accepts the same hostname, glob, and
+regex forms. The VM trusts the proxy's generated CA, which `nixvm up` copies
+into the guest configuration.
 The mitmproxy add-on also denies connections whose destination resolves into
 any CIDR in `internal_network_deny`, matching the guest-side filter. The host
 CA private key stays in the Podman volume; only its public certificate is
@@ -221,6 +244,16 @@ Certificate-pinned or mutual-TLS applications may need to be left out of
 `inspect_domains`. On
 `nixvm destroy`, the shared proxy stays available to other VMs. Its Podman
 volume is retained so the CA can be reused.
+
+To stop and remove the host-side mitmproxy service and its generated policy,
+password, and public CA copy, run:
+
+```sh
+./nixvm mitmproxy cleanup
+```
+
+The Podman volume containing the proxy CA is retained so a later `nixvm up`
+can reuse it.
 
 `internal_network_deny` defaults to the standard special-use, private,
 documentation, benchmarking, multicast, link-local, and reserved IPv4/IPv6
@@ -314,7 +347,7 @@ Common commands:
 
 | Command | Action |
 | --- | --- |
-| `./nixvm up` | Prepare host NFS and mitmproxy, apply VM/network resources, activate proxy config, then check firewall policy |
+| `./nixvm up` | Prepare enabled host services and selected host firewall rules, apply VM/network resources, activate guest config, then check firewall policy |
 | `./nixvm u` | Same as `up` |
 | `./nixvm firewall-test` | Check the managed test network and live firewall policy |
 | `./nixvm plan` / `./nixvm destroy` | Review changes / destroy the managed VM and test network |
@@ -330,6 +363,7 @@ Common commands:
 | `./nixvm stop --force` | Abruptly power off a stuck VM; unsaved guest writes may be lost |
 | `./nixvm reprovision` | Explicit bootstrap retry |
 | `./nixvm nfs setup` / `./nixvm nfs cleanup` | Configure host exports / remove managed exports after confirmation |
+| `./nixvm mitmproxy cleanup` | Stop and remove the host mitmproxy service and generated setup files; retain its CA volume |
 | `./nixvm image remove` | Remove the selected VM's image and workstation build cache |
 | `./nixvm -n workvm image remove` | Remove another VM's image and workstation build cache |
 
@@ -381,24 +415,35 @@ smartcard services. `nix/modules/home/` holds user settings, mutable dotfile lin
 GNOME preferences, token clients, applications, and independent Python/Node/LLVM/Rust modules.
 Home Manager activates with `nixos-rebuild`; no separate activation is needed.
 
-The Home Manager application module installs Zed, Kitty, Oh My Pi, Codex CLI,
-Claude Code, OpenCode, and VS Code. ChatGPT desktop (`apps.chatgpt`) is enabled
-by default through the `apps` object in the selected OpenTofu variable file;
-set an app to `false` to omit it. ChatGPT uses a NixOS-compatible repackaging
-of OpenAI's signed Linux application because Nixpkgs `pkgs.chatgpt` targets
-macOS. Its optional anonymous launch metric is disabled. OMP uses
-the upstream Linux x86_64 release binary at version 18.12.6, pinned by SHA-256
+The `apps` object groups software into `editors` (Zed and VS Code), `terminals`
+(Kitty and Ghostty), `browsers` (Firefox and Chromium), and `coding_agents` (Oh
+My Pi, Codex CLI, ChatGPT desktop, Claude Code, and OpenCode). Optional app
+toggles default off, except Firefox, which defaults on for YubiKey-backed
+browsing. The selected defaults also enable Kitty. Chromium and Ghostty are
+disabled by default. Configure
+`default_editor`, `default_terminal`, `default_shell`, and `default_browser` to
+choose the corresponding defaults; selecting an editor, terminal, or browser
+enables it and pins its icon to the GNOME dock. Defaults are Neovim, Kitty,
+Zsh, and Firefox. Set `additional_nix_pkgs` to Nixpkgs attribute paths to add
+packages to the guest, for example `"ripgrep"` or `"python3Packages.pip"`.
+The default editor is Neovim; set `default_editor` to `"zed"` or `"vscode"`
+to select and enable that editor.
+ChatGPT uses a NixOS-compatible repackaging of OpenAI's signed Linux application because
+Nixpkgs `pkgs.chatgpt` targets macOS. Its optional anonymous launch metric is disabled. OMP uses
+the upstream Linux x86_64 release binary at version 18.12.6 when
+`apps.coding_agents.omp` is enabled, pinned by SHA-256
 in `nix/packages/omp-binary.nix`, so rebuilding does not compile its source tree.
 GNOME uses the packaged Adw-gtk3 dark theme and the packaged Vanilla-DMZ white
 cursor theme; 0xProto Nerd Font is configured for Zed buffers, Zed's integrated
-terminal, and Kitty. The dock favorites include Firefox, Kitty, Zed, and Files,
-with launcher icons pointing directly at their packaged icon assets. The supported host GNOME extensions are installed
+terminal, and Kitty. The dock favorites include Firefox and Files, plus Kitty
+and Zed when enabled, with launchers pointing at their packaged icons. The
+supported host GNOME extensions are installed
 and enabled declaratively; Ubuntu Snap-specific extensions and Desktop Icons NG
 are not available in the pinned NixOS package set.
 
-Python, Node, LLVM, Rust, JDK, and Garmin toolchain support are enabled by
-default. Toggle them with the `toolchains` object in the selected variable
-file. Python includes pip and uv; use `uv venv`/`python -m venv` for project packages. Node includes npm and
+Python, Node, LLVM, Rust, JDK, and Garmin toolchains are disabled by default.
+Enable them with the `toolchains` object in the selected variable file. Python
+includes pip and uv; use `uv venv`/`python -m venv` for project packages. Node includes npm and
 Corepack. LLVM includes Clang, clangd, LLDB, CMake, Ninja, and pkg-config. Rust
 includes Cargo, rustfmt, Clippy, and rust-analyzer. Versions follow the
 committed lock file.
@@ -432,10 +477,11 @@ entry maps an absolute host `host_path` to an absolute guest `guest_path`. The
 guest uses `streaming.host_address` as the host's libvirt-network address; when
 unset, it uses the dedicated VM NAT gateway.
 
-For an `nfs_mounts` server whose IP falls within `internal_network_deny`, the
-VM firewall automatically allows TCP port 2049 for NFSv4. You do not need to
-add a matching `internal_network_allow` entry. Servers outside the deny ranges
-already follow the general internet access policy.
+For every IP address configured as an `nfs_mounts` server, the VM firewall
+automatically allows TCP port 2049 for NFSv4, including servers outside
+`internal_network_deny`. You do not need to add a matching
+`internal_network_allow` entry. Libvirt filters match IP addresses, so a
+hostname does not get a generated exception.
 
 When `host_nfs_exports` is nonempty, `./nixvm up` invokes host setup before
 OpenTofu. The script detects the host distribution, prints the
@@ -444,11 +490,12 @@ proceeding. It supports Debian/Ubuntu,
 Fedora/RHEL, Arch, and openSUSE families; it installs the NFS server package if
 needed and writes `/etc/exports.d/nixvm-<name>.exports`. Source directories must
 already exist. Exports are limited to the selected libvirt network's IPv4 CIDR;
-other guests attached to that same network can also access them. The script
-does not change host firewall rules, so allow TCP port 2049 from that subnet if
-the host firewall is active. On SELinux-enforcing hosts, assign suitable NFS
-export labels to the source directories yourself; the script does not change
-SELinux policy. When `host_nfs_exports` is nonempty, OpenTofu checks
+other guests attached to that same network can also access them. With
+`host_firewall = "ufw"`, `nixvm up` adds a persistent UFW allow for TCP 2049
+from the VM subnet; with the default `disabled` setting, allow that port
+yourself if the host firewall requires it. On SELinux-enforcing hosts, assign
+suitable NFS export labels to the source directories yourself; the script does
+not change SELinux policy. When `host_nfs_exports` is nonempty, OpenTofu checks
 that the managed export file and NFS service are ready, and allows guest traffic
 to host port 2049 in the VM's libvirt filter. Run `./nixvm nfs cleanup` to remove
 the managed export file after confirmation; the package and service remain

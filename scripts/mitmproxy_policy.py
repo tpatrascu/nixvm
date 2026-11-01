@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import fnmatch
 import ipaddress
 import json
 import os
+import re
 import socket
 
 from mitmproxy import ctx, http
@@ -15,9 +17,8 @@ class NixvmPolicy:
         policy_path = os.environ.get("NIXVM_MITMPROXY_POLICY", "/etc/mitmproxy/policy.json")
         with open(policy_path, encoding="utf-8") as source:
             policy = json.load(source)
-        self.blocked_domains = tuple(
-            self.normalize_domain(domain) for domain in policy.get("blocked_domains", [])
-        )
+        self.blocked_domains = self.compile_domain_patterns(policy.get("blocked_domains", []))
+        self.allowed_domains = self.compile_domain_patterns(policy.get("allowed_domains", []))
         self.denied_networks = tuple(
             ipaddress.ip_network(cidr) for cidr in policy.get("deny_cidrs", [])
         )
@@ -26,14 +27,38 @@ class NixvmPolicy:
     def normalize_domain(domain: str) -> str:
         return domain.strip().rstrip(".").lower()
 
-    def domain_is_blocked(self, host: str) -> bool:
-        host = self.normalize_domain(host)
+    @classmethod
+    def compile_domain_patterns(cls, patterns):
+        compiled = []
+        for pattern in patterns:
+            if pattern.startswith("glob:"):
+                compiled.append(("glob", cls.normalize_domain(pattern[5:])))
+            elif pattern.startswith("regex:"):
+                compiled.append(("regex", re.compile(pattern[6:], re.IGNORECASE)))
+            else:
+                compiled.append(("domain", cls.normalize_domain(pattern)))
+        return tuple(compiled)
+
+    @classmethod
+    def domain_matches(cls, host: str, patterns) -> bool:
+        host = cls.normalize_domain(host)
         try:
             host = ipaddress.ip_address(host).compressed
         except ValueError:
             pass
-        return any(host == domain or host.endswith("." + domain)
-                   for domain in self.blocked_domains)
+        for kind, pattern in patterns:
+            if kind == "domain" and (host == pattern or host.endswith("." + pattern)):
+                return True
+            if kind == "glob" and fnmatch.fnmatchcase(host, pattern):
+                return True
+            if kind == "regex" and pattern.fullmatch(host):
+                return True
+        return False
+
+    def domain_is_blocked(self, host: str) -> bool:
+        if self.domain_matches(host, self.allowed_domains):
+            return False
+        return self.domain_matches(host, self.blocked_domains)
 
     def resolve_and_pin(self, host: str, port: int):
         try:

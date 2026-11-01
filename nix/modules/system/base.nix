@@ -76,7 +76,7 @@ in {
     group = machine.username;
     home = "/home/${machine.username}";
     extraGroups = [ "wheel" "networkmanager" "video" "render" ];
-    shell = pkgs.zsh;
+    shell = if (machine.defaultShell or "zsh") == "zsh" then pkgs.zsh else pkgs.bashInteractive;
     openssh.authorizedKeys.keys = machine.sshPublicKeys;
   };
   # Home Manager's first activation needs a writable Nix profile directory.
@@ -87,7 +87,7 @@ in {
     "d /home/${machine.username}/.local/state/nix 0755 ${machine.username} ${machine.username} -"
     "d /home/${machine.username}/.local/state/nix/profiles 0700 ${machine.username} ${machine.username} -"
   ];
-  programs.zsh.enable = true;
+  programs.zsh.enable = (machine.defaultShell or "zsh") == "zsh";
   security.sudo.wheelNeedsPassword = false;
   services.openssh = {
     enable = true;
@@ -100,7 +100,7 @@ in {
   };
   services.qemuGuest.enable = true;
   environment.systemPackages = with pkgs; [
-    git rsync vim neovim curl python3
+    git rsync vim neovim curl
     htop atop btop sysstat iotop iptraf-ng nettools
   ];
 }
