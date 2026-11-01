@@ -122,11 +122,15 @@ nixvm and refreshed on later `up` runs when the guest address changes.
 
 1. Check host tools, KVM/libvirt access, and selected GPU devices.
 2. Reuse the cached NixOS UEFI QCOW2 image, or build it on the first apply.
-3. Resize its QCOW2 virtual capacity to the requested disk size and upload it.
-4. Create the VM and discover its IPv4 DHCP lease by its configured MAC.
-5. Copy each local directory into temporary staging, transfer it to the guest,
-   write non-secret machine settings, and activate the NixOS/Home Manager
-   configuration over SSH.
+3. Build the configured workstation closure on the host so available packages
+   are fetched into the host Nix store before guest provisioning.
+4. Resize the QCOW2 image to the requested disk size and upload it.
+5. Create the VM and discover its IPv4 DHCP lease by its configured MAC.
+6. Copy each local directory into temporary staging, transfer it to the guest,
+   and write non-secret machine settings.
+7. Import the host-cached workstation closure into the guest Nix store over SSH,
+   then activate NixOS/Home Manager. The guest fetches any remaining paths from
+   its configured Nix substituters.
 
 The host paths are interpreted relative to `infrastructure/` when relative.
 Guest defaults are `~/nixvm` and `~/.dotfiles`, both on the VM disk.
@@ -136,11 +140,13 @@ project does not use either. Configure them explicitly if your dotfiles do.
 ## VM network access
 
 OpenTofu defines a host-side libvirt network filter and attaches it to the VM's
-interface. Guest-initiated internet access remains unrestricted. The filter
-blocks guest-initiated traffic to the standard special-use, private,
-documentation, benchmarking, multicast, link-local, and reserved IPv4/IPv6
-ranges unless explicitly allowed by the host configuration. It does not restrict
-host-initiated connections to the VM, including SSH.
+interface. It blocks guest-initiated traffic to the standard special-use,
+private, documentation, benchmarking, multicast, link-local, and reserved
+IPv4/IPv6 ranges unless explicitly allowed by the host configuration. It also
+blocks guest egress to TCP and UDP destination ports 80, 443, 8443, 8080, 8081,
+and 8082. The only web-proxy exception is TCP/8080 to the host's managed
+mitmproxy listener on the VM gateway. Host-initiated connections to the VM,
+including SSH, are not restricted.
 
 Configure `host_access`, `internal_network_deny`, and `internal_network_allow` in
 `infrastructure/nixvm.tfvars`. `host_access` lists exact host IPs and allowed
@@ -150,17 +156,79 @@ allow rule specifies one IP and its own allowed ports, over both TCP and UDP.
 For example, add `2049` under
 `host_access.ports` to let the VM reach a host's NFSv4 service. The
 default `host_access` allows DNS to the dedicated VM NAT gateway and denies
-other guest-initiated access to that host IP. Add any other host IPs the VM
+other guest-initiated access to that host IP, except the managed proxy port
+TCP/8080 on the VM gateway.
+Blocked web ports cannot be added to `host_access.ports`. An explicit port in
+`internal_network_allow` overrides the global web-port block for that IP;
+`all_ports` still leaves those ports blocked. Add any other host IPs the VM
 could reach to `host_access.ips` so their access is limited to the configured
 ports.
+
+### Host-side HTTPS proxy
+
+`./nixvm up` installs Podman on supported Ubuntu hosts if needed, enables
+lingering for the current host user, and creates a Quadlet user service for the
+official mitmproxy container. It provisions the rootless Podman subordinate ID
+ranges when needed; if other rootless containers are running, stop them and
+rerun `up` so Podman can migrate to the new mappings safely. It pulls the
+configured image each time `up` runs;
+the default `docker.io/mitmproxy/mitmproxy:latest` tag tracks the latest stable
+release. The container uses Podman's rootless pasta network and publishes its
+proxy port directly on the VM gateway address at port 8080. The mitmweb traffic
+viewer is bound to host loopback at
+[http://127.0.0.1:8081](http://127.0.0.1:8081).
+Get the UI password for the selected VM with:
+
+```sh
+./nixvm mitmproxy password
+```
+
+Select another VM by passing its variable file, for example
+`./nixvm mitmproxy password -var-file=workvm.tfvars`. The password is stored
+with mode `0600` in `~/.local/share/nixvm/<VM name>/mitmproxy/web_password`.
+
+The guest sends web requests through the host proxy at the VM network
+gateway's port 8080. The mitmweb page on host port 8081 shows proxied requests
+and is available only from the host itself. Configure the image, HTTPS
+inspection, and hostname blocking through the `mitmproxy_policy` OpenTofu
+variable below. The default image is `docker.io/mitmproxy/mitmproxy:latest`;
+`nixvm up` pulls the configured image on each run.
+
+```hcl
+mitmproxy_policy = {
+  inspect_domains = ["api.example.com"]
+  blocked_domains = ["telemetry.example.net"]
+}
+```
+
+Entries match the hostname and its subdomains. `inspect_domains` selects the
+HTTPS hosts whose TLS is decrypted; an empty list decrypts none. The VM trusts
+the proxy's generated CA, which `nixvm up` copies into the guest configuration.
+The mitmproxy add-on also denies connections whose destination resolves into
+any CIDR in `internal_network_deny`, matching the guest-side filter. The host
+CA private key stays in the Podman volume; only its public certificate is
+copied to the guest. The mitmweb UI shows live flows and keeps them in memory.
+
+`nixvm up` installs the CA and configures lowercase and uppercase proxy
+environment variables for login sessions and system services, GNOME's desktop
+proxy, Firefox's managed proxy policy, and CA bundle paths used by common TLS
+clients. Loopback remains excluded from proxying. Direct web egress is blocked
+by the libvirt filter, including QUIC over UDP/443, so applications that ignore
+system proxy settings cannot connect directly on the standard web ports.
+Certificate-pinned or mutual-TLS applications may need to be left out of
+`inspect_domains`. On
+`nixvm destroy`, the user service and policy files are removed; the named
+Podman volume is retained so its CA can be reused if the VM is recreated.
 
 `internal_network_deny` defaults to the standard special-use, private,
 documentation, benchmarking, multicast, link-local, and reserved IPv4/IPv6
 ranges. If you override this list, include any defaults you still want denied
 along with organization-specific CIDRs. Each `internal_network_allow` entry
-allows selected ports to one IP within the denied ranges. Set that entry's
-`all_ports = true` and `ports = []` to allow every protocol and port to that IP.
-The allow list defaults to empty, so internal network access remains denied.
+allows selected ports to one IP within the denied ranges. The allow list
+defaults to empty, so internal network access remains denied. `all_ports = true`
+allows other ports to that IP while the managed web-port blocks remain in force.
+To permit a blocked port to an internal address, list it explicitly in that
+address's `ports` instead; for example, `{ ip = "10.0.0.25", ports = [443], all_ports = false }` permits HTTPS only to that IP.
 OpenTofu reserves the test network gateway for a single probe port so the live
 test can demonstrate an allowed connection; the host listener exists only while
 the test is running.
@@ -231,19 +299,18 @@ Home Manager owns the global Git configuration; avoid rewriting it with
 
 The flake lives in `nix/` so state, SSH material, and the infrastructure directory
 are outside its source. Only public settings belong anywhere under `nix/`.
-Host OpenTofu variable changes affect infrastructure, but normal applies do not
-overwrite the guest machine settings or checkouts after bootstrap. Use
-`./nixvm update-config` to stage the host's current `nix/` configuration and
-applied machine settings into a temporary guest directory, then rebuild from
-there without changing the guest checkout. Use `./nixvm rebuild` to build from
-the guest checkout instead.
+`./nixvm up` stages the host NixOS configuration and machine settings into a
+temporary guest directory to activate the managed proxy URL and CA trust; it
+does not overwrite the guest checkout. Use `./nixvm update-config` to stage
+other host NixOS changes the same way. Use `./nixvm rebuild` to build from the
+guest checkout instead.
 
 Common commands:
 
 | Command | Action |
 | --- | --- |
-| `./nixvm up` | Prepare host NFS, apply VM/network resources, then check firewall policy |
-| `./nixvm u` | Apply infrastructure, then stage and activate the host's NixOS config in the guest |
+| `./nixvm up` | Prepare host NFS and mitmproxy, apply VM/network resources, activate proxy config, then check firewall policy |
+| `./nixvm u` | Same as `up` |
 | `./nixvm firewall-test` | Check the managed test network and live firewall policy |
 | `./nixvm plan` / `./nixvm destroy` | Review changes / destroy the managed VM and test network |
 | `./nixvm ssh` | Interactive guest shell |
@@ -258,8 +325,8 @@ Common commands:
 | `./nixvm stop --force` | Abruptly power off a stuck VM; unsaved guest writes may be lost |
 | `./nixvm reprovision` | Explicit bootstrap retry |
 | `./nixvm nfs setup` / `./nixvm nfs cleanup` | Configure host exports / remove managed exports after confirmation |
-| `./nixvm image remove` | Remove the selected VM's generated image cache |
-| `./nixvm image remove --name workvm` | Remove another VM's generated image cache |
+| `./nixvm image remove` | Remove the selected VM's image and workstation build cache |
+| `./nixvm image remove --name workvm` | Remove another VM's image and workstation build cache |
 
 The wrapper uses `infrastructure/nixvm.tfvars` when present. Choose another
 variable file with `-var-file=PATH` or `NIXVM_VAR_FILE=PATH`; its basename
@@ -292,10 +359,12 @@ All OpenTofu-managed resources for the selected profile can be destroyed with
 the VM domain, disk volume, and dedicated storage pool. Destroying the disk
 permanently removes the guest filesystem and any edits or data not backed up
 elsewhere. Push both repositories and back up other needed data before
-destroying. The generated bootstrap image in `.build/<VM name>/` is kept, so
-the next `./nixvm up` can reuse it. Run `./nixvm image remove` to delete
-the selected VM's cache; add `--name <VM name>` to remove another profile's cache. This only removes
-the host-side cache and does not affect an existing VM disk. Remove the cache
+destroying. The bootstrap image and host-built workstation closure in
+`.build/<VM name>/` and their Nix store paths are kept for reuse;
+`./nixvm destroy` does not delete or garbage-collect this host cache. Run
+`./nixvm image remove` to delete the selected VM's build cache; add
+`--name <VM name>` to remove another profile's cache. This only removes
+host-side files and does not affect an existing VM disk. Remove the cache
 before applying if you want to regenerate the bootstrap image with changed
 image inputs such as SSH public keys. Host `.runtime/` is also a local artifact,
 not a backup.

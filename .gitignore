@@ -13,3 +13,4 @@ result
 result-*
 __pycache__/
 nix/machines/current.json
+nix/machines/mitmproxy-ca.pem

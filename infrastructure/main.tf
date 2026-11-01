@@ -12,6 +12,10 @@ locals {
     nfsMounts      = var.nfs_mounts
     hostNfsExports = var.host_nfs_exports
     hostAddress    = coalesce(var.streaming.host_address, local.vm_network.gateway)
+    mitmproxy = {
+      enabled  = true
+      proxyUrl = "http://${local.vm_network.gateway}:8080"
+    }
     gpu            = var.gpu
     streaming = merge(var.streaming, {
       enabled      = var.gpu.enabled && var.streaming.enabled
@@ -64,8 +68,13 @@ locals {
       length(var.host_nfs_exports) > 0 ? [2049] : []))
       all_ports = var.host_access.all_ports
     }
+    proxy = {
+      ip   = local.vm_network.gateway
+      port = 8080
+    }
     internal = {
       deny_cidrs = var.internal_network_deny
+      blocked_ports = [80, 443, 8443, 8080, 8081, 8082]
       # A short-lived host listener on the firewall test subnet gives the
       # guest connectivity probes one narrowly-scoped expected success case.
       # NFSv4 uses TCP/2049; allow it automatically for each configured remote
@@ -85,6 +94,16 @@ locals {
           all_ports = false
       }])
     }
+  }
+  mitmproxy_config = {
+    name             = var.name
+    uri              = var.libvirt_uri
+    network          = local.vm_network_name
+    gateway          = local.vm_network.gateway
+    image            = var.mitmproxy_policy.image
+    inspect_domains  = var.mitmproxy_policy.inspect_domains
+    blocked_domains  = var.mitmproxy_policy.blocked_domains
+    deny_cidrs       = var.internal_network_deny
   }
 }
 
@@ -315,6 +334,7 @@ resource "terraform_data" "bootstrap" {
     command = "python3 \"$NIXVM_ROOT/scripts/nixvm.py\" bootstrap"
     environment = {
       NIXVM_ROOT       = local.root
+      NIXVM_BUILD      = local.build_dir
       NIXVM_CONNECTION = jsonencode(local.connection)
       NIXVM_REPOSITORY = abspath(pathexpand(var.repository_path))
       NIXVM_DOTFILES   = abspath(pathexpand(var.dotfiles_path))

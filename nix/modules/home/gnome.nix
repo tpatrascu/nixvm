@@ -1,5 +1,11 @@
 { lib, machine, pkgs, ... }:
-{
+let
+  mitmproxyEnabled =
+    (machine.mitmproxy.enabled or false)
+    && builtins.pathExists ../../machines/mitmproxy-ca.pem;
+  proxyAddress = lib.removePrefix "http://" machine.mitmproxy.proxyUrl;
+  proxyHost = lib.removeSuffix ":8080" proxyAddress;
+in {
   # GNOME 50 no longer starts spice-vdagent's legacy XDG autostart entry.
   # Start its Xwayland session agent from the graphical user session instead.
   systemd.user.services.spice-vdagent = {
@@ -28,6 +34,15 @@
 
   programs.firefox = {
     nativeMessagingHosts = [ pkgs.gnome-browser-connector ];
+    policies.Certificates.ImportEnterpriseRoots = true;
+    policies.Proxy = lib.mkIf mitmproxyEnabled {
+      Mode = "manual";
+      Locked = true;
+      HTTPProxy = lib.removePrefix "http://" machine.mitmproxy.proxyUrl;
+      SSLProxy = lib.removePrefix "http://" machine.mitmproxy.proxyUrl;
+      UseHTTPProxyForAllProtocols = true;
+      Passthrough = "localhost,127.0.0.1,::1";
+    };
     policies.ExtensionSettings = {
       "chrome-gnome-shell@gnome.org" = {
         installation_mode = "force_installed";
@@ -57,6 +72,19 @@
   };
 
   dconf.settings = {
+    "system/proxy" = lib.mkIf mitmproxyEnabled {
+      mode = "manual";
+      ignore-hosts = [ "localhost" "127.0.0.0/8" "::1" ];
+      use-same-proxy = true;
+    };
+    "system/proxy/http" = lib.mkIf mitmproxyEnabled {
+      host = proxyHost;
+      port = 8080;
+    };
+    "system/proxy/https" = lib.mkIf mitmproxyEnabled {
+      host = proxyHost;
+      port = 8080;
+    };
     "org/gnome/desktop/interface" = {
       color-scheme = "prefer-dark";
       enable-animations = true;

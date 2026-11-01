@@ -7,9 +7,12 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import pwd
 import re
+import secrets
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -196,23 +199,42 @@ def build_image():
     build = Path(os.environ["NIXVM_BUILD"])
     build.mkdir(parents=True, exist_ok=True)
     image = build / "bootstrap.qcow2"
-    if image.is_file():
-        print(f"Using cached bootstrap image: {image}")
-        run(["qemu-img", "resize", image, os.environ["NIXVM_DISK_GIB"] + "G"])
-        return
     snapshot = build / "nix-source"
     if snapshot.exists():
         shutil.rmtree(snapshot)
     shutil.copytree(ROOT / "nix", snapshot, ignore=shutil.ignore_patterns("current.json", "result*"))
     (snapshot / "machines/current.json").write_text(json.dumps(settings, indent=2) + "\n")
+    proxy_ca = ROOT / ".runtime" / build.name / "mitmproxy-ca-cert.pem"
+    if proxy_ca.is_file():
+        shutil.copyfile(proxy_ca, snapshot / "machines" / "mitmproxy-ca.pem")
+    nix = ["nix", "--extra-experimental-features", "nix-command flakes"]
+    if image.is_file():
+        print(f"Using cached bootstrap image: {image}")
+        run(["qemu-img", "resize", image, os.environ["NIXVM_DISK_GIB"] + "G"])
+    else:
+        run([*nix, "build", f"path:{snapshot}#bootstrap", "--out-link", build / "image-result"])
+        images = list((build / "image-result").rglob("*.qcow2"))
+        if len(images) != 1:
+            raise RuntimeError(f"Expected one QCOW2 image, found {len(images)}")
+        shutil.copyfile(images[0], image)
+        # An upload overwrites the QCOW2 header, including its virtual capacity.
+        run(["qemu-img", "resize", image, os.environ["NIXVM_DISK_GIB"] + "G"])
+
+    build_workstation_cache(build, settings)
+
+
+def build_workstation_cache(build, settings):
+    """Build the selected workstation closure into the host Nix store."""
+    snapshot = build / "workstation-source"
+    if snapshot.exists():
+        shutil.rmtree(snapshot)
+    shutil.copytree(ROOT / "nix", snapshot, ignore=shutil.ignore_patterns("current.json", "result*"))
+    (snapshot / "machines/current.json").write_text(json.dumps(settings, indent=2) + "\n")
+    proxy_ca = ROOT / ".runtime" / build.name / "mitmproxy-ca-cert.pem"
+    if proxy_ca.is_file():
+        shutil.copyfile(proxy_ca, snapshot / "machines" / "mitmproxy-ca.pem")
     run(["nix", "--extra-experimental-features", "nix-command flakes",
-         "build", f"path:{snapshot}#bootstrap", "--out-link", build / "image-result"])
-    images = list((build / "image-result").rglob("*.qcow2"))
-    if len(images) != 1:
-        raise RuntimeError(f"Expected one QCOW2 image, found {len(images)}")
-    shutil.copyfile(images[0], image)
-    # An upload overwrites the QCOW2 header, including its virtual capacity.
-    run(["qemu-img", "resize", image, os.environ["NIXVM_DISK_GIB"] + "G"])
+         "build", f"path:{snapshot}#default", "--out-link", build / "workstation-result"])
 
 
 def remove_image_cache(name):
@@ -220,10 +242,10 @@ def remove_image_cache(name):
         raise ValueError("VM name must match [a-z][a-z0-9-]{0,30}")
     build = ROOT / ".build" / name
     if not build.exists():
-        print(f"No image cache found for {name}.")
+        print(f"No build cache found for {name}.")
         return
     shutil.rmtree(build)
-    print(f"Removed image cache for {name}: {build}")
+    print(f"Removed build cache for {name}: {build}")
 
 
 def add_network_filter_rule(root, action, *, element, direction="out", priority,
@@ -323,7 +345,46 @@ def build_network_filter(name, access, filter_uuid=None):
     # Host allow rules are explicit and are evaluated before internal-network
     # allow rules; remaining traffic to listed host IPs is denied.
     add_network_access_rules(root, access["host"])
+    proxy = access.get("proxy")
+    if proxy:
+        proxy_ip = ipaddress.ip_address(proxy["ip"])
+        add_network_filter_rule(
+            root, "accept", element="tcp" if proxy_ip.version == 4 else "ipv6",
+            priority=80, dstipaddr=proxy_ip.compressed,
+            **({} if proxy_ip.version == 4 else {"protocol": "tcp"}),
+            dstportstart=proxy["port"], dstportend=proxy["port"],
+        )
+
+    # Explicit internal per-IP port rules may override the global web-port
+    # block. Keep this exception narrow: all_ports does not include these
+    # ports, and host_access never overrides the global block.
+    blocked_ports = set(access["internal"].get("blocked_ports", []))
+    for rule_config in access["internal"]["allow"]:
+        ip = ipaddress.ip_address(rule_config["ip"])
+        if rule_config["all_ports"]:
+            continue
+        for port in set(rule_config["ports"]).intersection(blocked_ports):
+            for transport in rule_config.get("protocols", ("tcp", "udp")):
+                add_network_filter_rule(
+                    root, "accept", element=transport if ip.version == 4 else "ipv6",
+                    priority=85, dstipaddr=ip.compressed,
+                    **({} if ip.version == 4 else {"protocol": transport}),
+                    dstportstart=port, dstportend=port,
+                )
     add_network_access_rules(root, access["internal"])
+
+    # Apply global web-port blocks before broad per-IP allow rules, including
+    # all_ports. The narrowly-scoped proxy exception above is evaluated first.
+    for port in sorted(blocked_ports):
+        for transport in ("tcp", "udp"):
+            add_network_filter_rule(
+                root, "drop", element=transport, priority=90,
+                dstportstart=port, dstportend=port,
+            )
+            add_network_filter_rule(
+                root, "drop", element="ipv6", priority=90,
+                protocol=transport, dstportstart=port, dstportend=port,
+            )
 
     host_ips = {ipaddress.ip_address(address).compressed for address in access["host"]["ips"]}
     internal_allow = access["internal"]["allow"]
@@ -406,6 +467,298 @@ def tofu_firewall_test_config(extra):
         return json.loads(json.loads(result))
     except (json.JSONDecodeError, TypeError) as error:
         raise RuntimeError(f"Could not read firewall test configuration from OpenTofu: {result}") from error
+
+
+def tofu_mitmproxy_config(extra):
+    expression = "jsonencode(local.mitmproxy_config)"
+    result = run(["tofu", f"-chdir={ROOT / 'infrastructure'}", "console", *extra],
+                 capture=True, input=expression + "\n").stdout.strip()
+    try:
+        return json.loads(json.loads(result))
+    except (json.JSONDecodeError, TypeError) as error:
+        raise RuntimeError(f"Could not read mitmproxy configuration from OpenTofu: {result}") from error
+
+
+def tofu_guest_config(extra):
+    expression = "jsonencode(local.guest_config)"
+    result = run(["tofu", f"-chdir={ROOT / 'infrastructure'}", "console", *extra],
+                 capture=True, input=expression + "\n").stdout.strip()
+    try:
+        return json.loads(json.loads(result))
+    except (json.JSONDecodeError, TypeError) as error:
+        raise RuntimeError(f"Could not read guest configuration from OpenTofu: {result}") from error
+
+
+def ensure_vm_nat(extra=()):
+    config = tofu_mitmproxy_config(extra)
+    result = subprocess.run(
+        ["virsh", "--connect", config["uri"], "net-info", config["network"]],
+        check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    if result.returncode == 0 and re.search(r"^Active:\s+yes\s*$", result.stdout, re.MULTILINE):
+        return
+    print(f"Starting the libvirt NAT network {config['network']} before launching mitmproxy.")
+    run(["tofu", f"-chdir={ROOT / 'infrastructure'}", "apply", *extra,
+         "-target=libvirt_network.vm_nat", "-auto-approve"])
+
+
+def mitmproxy_allow_hosts(inspect_domains):
+    patterns = []
+    for domain in inspect_domains:
+        escaped = re.escape(domain.lower().rstrip(".")).replace(r"\.", "[.]")
+        patterns.append(rf"(^|[.]){escaped}(:[0-9]+)?$")
+    # An empty list means inspect none. mitmproxy's empty allow-hosts option
+    # means inspect everything, so use a regex that cannot match instead.
+    return "|".join(patterns) if patterns else r"(?!)"
+
+
+def mitmproxy_addon_policy_source():
+    return ROOT / "scripts" / "mitmproxy_policy.py"
+
+
+def ensure_podman():
+    if not shutil.which("podman"):
+        values = host_os_release()
+        distribution = values.get("PRETTY_NAME", values.get("ID", "unknown"))
+        if shutil.which("apt-get") is None:
+            raise RuntimeError(
+                f"Podman is missing on {distribution}; install Podman and rerun nixvm up."
+            )
+        admin = host_admin_prefix()
+        print(f"Installing Podman on {distribution} for the host user service.")
+        run(admin + ["apt-get", "update"])
+        run(admin + ["apt-get", "install", "-y", "podman"])
+    if not shutil.which("podman"):
+        raise RuntimeError("Podman installation completed but the podman command is still unavailable.")
+    version = output(["podman", "--version"])
+    match = re.search(r"\b(\d+)\.(\d+)", version)
+    if not match or tuple(map(int, match.groups())) < (4, 4):
+        raise RuntimeError(f"Podman Quadlet support is required (Podman 4.4 or newer); found {version!r}.")
+    ensure_podman_subids()
+
+
+def subid_entries(path):
+    entries = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return entries
+    for line in lines:
+        fields = line.split(":")
+        if len(fields) != 3:
+            continue
+        try:
+            start, count = int(fields[1]), int(fields[2])
+        except ValueError:
+            continue
+        if count > 0:
+            entries.append((fields[0], start, start + count - 1))
+    return entries
+
+
+def has_subid_capacity(entries, username, uid, minimum=65536):
+    ranges = sorted((start, end) for owner, start, end in entries
+                    if owner in (username, str(uid)))
+    total = 0
+    last_end = -1
+    for start, end in ranges:
+        start = max(start, last_end + 1)
+        if start <= end:
+            total += end - start + 1
+            last_end = end
+    return total >= minimum
+
+
+def free_subid_range(entries, size=65536):
+    occupied = sorted((start, end) for _, start, end in entries)
+    candidate = 100000
+    maximum = 2**32 - 1
+    for start, end in occupied:
+        if candidate + size - 1 < start:
+            return candidate, candidate + size - 1
+        if candidate <= end:
+            candidate = end + 1
+    if candidate + size - 1 <= maximum:
+        return candidate, candidate + size - 1
+    raise RuntimeError("No free 65,536-ID subordinate range is available for rootless Podman.")
+
+
+def ensure_podman_subids():
+    """Configure subordinate IDs required to unpack normal rootless images."""
+    username = output(["id", "-un"])
+    account = pwd.getpwnam(username)
+    uid_path, gid_path = Path("/etc/subuid"), Path("/etc/subgid")
+    uid_entries, gid_entries = subid_entries(uid_path), subid_entries(gid_path)
+    need_uid = not has_subid_capacity(uid_entries, username, account.pw_uid)
+    need_gid = not has_subid_capacity(gid_entries, username, account.pw_gid)
+    if not need_uid and not need_gid:
+        return
+
+    running = subprocess.run(
+        ["podman", "ps", "-q"], check=False, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    if running.returncode:
+        raise RuntimeError(
+            "Could not check for running rootless Podman containers before changing "
+            "subordinate IDs. Resolve the Podman error and rerun nixvm up."
+        )
+    if running.stdout.strip():
+        raise RuntimeError(
+            "Rootless Podman needs subordinate UID/GID ranges, but this account has "
+            "running containers. Stop them before rerunning nixvm up; podman system "
+            "migrate must stop rootless containers for the mapping change."
+        )
+
+    usermod = shutil.which("usermod")
+    if not usermod:
+        raise RuntimeError("Rootless Podman needs subordinate IDs, but usermod is unavailable.")
+    uid_range = free_subid_range(uid_entries) if need_uid else None
+    gid_range = free_subid_range(gid_entries) if need_gid else None
+    print(f"Configuring subordinate IDs for rootless Podman user {username}.")
+    # Podman requires the old pause namespace to be stopped before subid files
+    # change; with no running containers this does not interrupt other workloads.
+    run(["podman", "system", "migrate"])
+    command = [usermod]
+    if uid_range:
+        command += ["--add-subuids", f"{uid_range[0]}-{uid_range[1]}"]
+    if gid_range:
+        command += ["--add-subgids", f"{gid_range[0]}-{gid_range[1]}"]
+    command.append(username)
+    run(host_admin_prefix() + command)
+
+
+def systemd_unit_value(value):
+    """Escape a filesystem path for a systemd/Quadlet key-value setting."""
+    return str(value).replace("\\", "\\\\").replace(" ", "\\x20")
+
+
+def mitmproxy_quadlet(config, policy_dir, web_password):
+    name = config["name"]
+    safe_name = f"nixvm-{name}-mitmproxy"
+    allow_hosts = mitmproxy_allow_hosts(config["inspect_domains"])
+    return f"""[Unit]
+Description=NixVM HTTPS inspection proxy for {name}
+[Container]
+ContainerName={safe_name}
+Image={config['image']}
+Network=pasta
+Volume={systemd_unit_value(policy_dir)}:/etc/mitmproxy/nixvm:ro
+Volume={safe_name}-data:/home/mitmproxy/.mitmproxy
+PublishPort={config['gateway']}:8080:8080
+PublishPort=127.0.0.1:8081:8081
+Environment=NIXVM_MITMPROXY_POLICY=/etc/mitmproxy/nixvm/policy.json
+Exec=mitmweb --mode regular@0.0.0.0:8080 --web-host 0.0.0.0 --web-port 8081 --set=web_open_browser=false --set=web_password={web_password} --set=confdir=/home/mitmproxy/.mitmproxy --set=show_ignored_hosts=true --allow-hosts="{allow_hosts}" -s /etc/mitmproxy/nixvm/mitmproxy_policy.py
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=default.target
+"""
+
+
+def wait_tcp_listener(address, port, timeout=120):
+    deadline = time.monotonic() + timeout
+    last_error = None
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection((address, port), timeout=2):
+                return
+        except OSError as error:
+            last_error = error
+            time.sleep(1)
+    raise RuntimeError(f"Timed out waiting for listener {address}:{port}: {last_error}")
+
+
+def setup_host_mitmproxy(extra=()):
+    config = tofu_mitmproxy_config(extra)
+    ensure_podman()
+    if shutil.which("systemctl") is None or shutil.which("loginctl") is None:
+        raise RuntimeError("The host must use systemd to run the Podman mitmproxy service.")
+
+    user_name = output(["id", "-un"])
+    admin = host_admin_prefix()
+    linger = output(["loginctl", "show-user", user_name, "--property=Linger", "--value"])
+    if linger != "yes":
+        run(admin + ["loginctl", "enable-linger", user_name])
+
+    data_dir = Path.home() / ".local" / "share" / "nixvm" / config["name"] / "mitmproxy"
+    data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    data_dir.chmod(0o700)
+    policy_dir = data_dir / "policy"
+    policy_dir.mkdir(parents=True, exist_ok=True, mode=0o755)
+    policy_dir.chmod(0o755)
+    password_file = data_dir / "web_password"
+    if not password_file.exists():
+        password_file.write_text(secrets.token_urlsafe(32) + "\n", encoding="utf-8")
+        password_file.chmod(0o600)
+    web_password = password_file.read_text(encoding="utf-8").strip()
+    shutil.copyfile(mitmproxy_addon_policy_source(), policy_dir / "mitmproxy_policy.py")
+    (policy_dir / "mitmproxy_policy.py").chmod(0o644)
+    policy = {
+        "blocked_domains": config["blocked_domains"],
+        "deny_cidrs": config["deny_cidrs"],
+    }
+    (policy_dir / "policy.json").write_text(json.dumps(policy, indent=2) + "\n", encoding="utf-8")
+    (policy_dir / "policy.json").chmod(0o644)
+
+    quadlet_dir = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "containers" / "systemd"
+    quadlet_dir.mkdir(parents=True, exist_ok=True)
+    unit_name = f"nixvm-{config['name']}-mitmproxy"
+    unit_file = quadlet_dir / f"{unit_name}.container"
+    user_unit_dir = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "systemd" / "user"
+    user_unit_dir.mkdir(parents=True, exist_ok=True)
+    unit_contents = mitmproxy_quadlet(config, policy_dir, web_password)
+    if not unit_file.exists() or unit_file.read_text(encoding="utf-8") != unit_contents:
+        unit_file.write_text(unit_contents, encoding="utf-8")
+        unit_file.chmod(0o600)
+
+    # Remove the legacy gateway relay now that pasta publishes the container
+    # port directly on the VM's host-side gateway address.
+    subprocess.run(["systemctl", "--user", "disable", "--now",
+                    f"{unit_name}-forwarder.service"], check=False)
+    legacy_forwarder = user_unit_dir / f"{unit_name}-forwarder.service"
+    legacy_forwarder.unlink(missing_ok=True)
+
+    print(f"Pulling current mitmproxy image {config['image']}.")
+    run(["podman", "pull", config["image"]])
+    run(["systemctl", "--user", "daemon-reload"])
+    run(["systemctl", "--user", "restart", f"{unit_name}.service"])
+    wait_tcp_listener(config["gateway"], 8080)
+    wait_tcp_listener("127.0.0.1", 8081)
+
+    runtime_dir = ROOT / ".runtime" / config["name"]
+    runtime_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    ca_certificate = runtime_dir / "mitmproxy-ca-cert.pem"
+    container = f"nixvm-{config['name']}-mitmproxy"
+    run(["podman", "cp", f"{container}:/home/mitmproxy/.mitmproxy/mitmproxy-ca-cert.pem", ca_certificate])
+    ca_certificate.chmod(0o644)
+    print("mitmproxy is running. Traffic viewer: http://127.0.0.1:8081")
+    print(f"mitmweb password is stored in {password_file}")
+
+
+def cleanup_host_mitmproxy(name):
+    if not re.fullmatch(r"[a-z][a-z0-9-]{0,30}", name):
+        raise ValueError(f"Invalid VM name for mitmproxy cleanup: {name!r}")
+    unit_name = f"nixvm-{name}-mitmproxy"
+    quadlet_dir = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "containers" / "systemd"
+    unit_file = quadlet_dir / f"{unit_name}.container"
+    subprocess.run(["systemctl", "--user", "disable", "--now",
+                    f"{unit_name}-forwarder.service"], check=False)
+    if unit_file.exists():
+        subprocess.run(["systemctl", "--user", "stop", f"{unit_name}.service"], check=False)
+        unit_file.unlink()
+    (Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+     / "systemd" / "user" / f"{unit_name}-forwarder.service").unlink(missing_ok=True)
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+    if shutil.which("podman"):
+        subprocess.run(["podman", "rm", "--force", unit_name], check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    shutil.rmtree(Path.home() / ".local" / "share" / "nixvm" / name / "mitmproxy",
+                  ignore_errors=True)
+    (ROOT / ".runtime" / name / "mitmproxy-ca-cert.pem").unlink(missing_ok=True)
+    print(f"Stopped the managed mitmproxy service for {name}; its Podman CA volume was retained.")
 
 
 def run_firewall_tests(extra):
@@ -675,10 +1028,103 @@ def bootstrap():
     config = c["guest_config"]
     copy_checkout(c, os.environ["NIXVM_DOTFILES"], config["dotfilesPath"])
     copy_checkout(c, os.environ["NIXVM_REPOSITORY"], config["repoPath"], settings=config)
+    sync_guest_mitmproxy_ca(c)
+    # Refresh the host cache for the exact settings being provisioned, including
+    # explicit reprovisions where the VM config may have changed since the
+    # bootstrap image was originally built.
+    build_workstation_cache(Path(os.environ["NIXVM_BUILD"]), config)
+    copy_workstation_closure(c)
     flake = "path:" + config["repoPath"] + "/nix#nixvm"
-    remote(c, f"sudo nixos-rebuild switch --flake {shlex.quote(flake)}")
+    guest_ca = config["repoPath"].rstrip("/") + "/nix/machines/mitmproxy-ca.pem"
+    local_ca = ROOT / ".runtime" / c["name"] / "mitmproxy-ca-cert.pem"
+    bundle = f"/tmp/nixvm-mitmproxy-ca-{os.getpid()}.pem" if local_ca.is_file() else None
+    run_nixos_rebuild(c, flake, config,
+                      ca_bundle=bundle if bundle else None,
+                      ca_certificate=guest_ca if bundle else None)
     reboot_guest(c)
     print("Provisioned and rebooted into the graphical system. SSH and GNOME are ready.")
+
+
+def copy_workstation_closure(c):
+    """Import the host-built workstation closure into the guest Nix store."""
+    result = Path(os.environ["NIXVM_BUILD"]) / "workstation-result"
+    toplevel = str(result.resolve(strict=True))
+    paths = output(["nix-store", "--query", "--requisites", toplevel]).splitlines()
+    if not paths:
+        raise RuntimeError(f"No store paths found in workstation closure {toplevel}")
+    print(f"Copying {len(paths)} host-cached workstation store paths to the guest.")
+
+    exporter = subprocess.Popen(["nix-store", "--export", *paths], stdout=subprocess.PIPE)
+    assert exporter.stdout is not None
+    try:
+        importer = subprocess.run(
+            ssh_args(c) + ["sudo nix-store --import"],
+            stdin=exporter.stdout,
+            check=False,
+        )
+    finally:
+        exporter.stdout.close()
+    export_status = exporter.wait()
+    if importer.returncode:
+        raise subprocess.CalledProcessError(importer.returncode, importer.args)
+    if export_status:
+        raise subprocess.CalledProcessError(export_status, exporter.args)
+
+
+def run_nixos_rebuild(c, flake, settings, *, ca_bundle=None, ca_certificate=None):
+    """Build with the managed proxy even when the active system predates it."""
+    rebuild = "sudo nixos-rebuild switch --flake " + shlex.quote(flake)
+    proxy = settings.get("mitmproxy", {})
+    if not (proxy.get("enabled") and proxy.get("proxyUrl")):
+        return remote(c, rebuild)
+
+    proxy_url = proxy["proxyUrl"]
+    ca_file = ca_bundle or "/etc/ssl/certs/ca-certificates.crt"
+    runtime_environment = {
+        "http_proxy": proxy_url,
+        "https_proxy": proxy_url,
+        "all_proxy": proxy_url,
+        "no_proxy": "localhost,127.0.0.1,::1",
+        "HTTP_PROXY": proxy_url,
+        "HTTPS_PROXY": proxy_url,
+        "ALL_PROXY": proxy_url,
+        "NO_PROXY": "localhost,127.0.0.1,::1",
+        "SSL_CERT_FILE": ca_file,
+        "REQUESTS_CA_BUNDLE": ca_file,
+        "CURL_CA_BUNDLE": ca_file,
+        "NODE_EXTRA_CA_CERTS": ca_file,
+        "NIX_SSL_CERT_FILE": ca_file,
+        "GIT_SSL_CAINFO": ca_file,
+        "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH": ca_file,
+    }
+    set_environment = "sudo systemctl set-environment " + shlex.join(
+        [f"{key}={value}" for key, value in runtime_environment.items()]
+    )
+    unset_environment = "sudo systemctl unset-environment " + shlex.join(
+        list(runtime_environment)
+    )
+    if ca_bundle:
+        unset_environment += "; sudo rm -f -- " + shlex.quote(ca_bundle)
+    rebuild = "sudo env NIX_REMOTE=local " + shlex.join(
+        [f"{key}={value}" for key, value in runtime_environment.items()]
+    ) + " nixos-rebuild switch --flake " + shlex.quote(flake)
+    command = ["set -e"]
+    if ca_bundle and ca_certificate:
+        command.append(
+            "sudo sh -c " + shlex.quote(
+                "cat /etc/ssl/certs/ca-certificates.crt "
+                + shlex.quote(ca_certificate)
+                + " > " + shlex.quote(ca_bundle)
+                + " && chmod 0644 " + shlex.quote(ca_bundle)
+            )
+        )
+    command.extend([
+        set_environment,
+        f"trap {shlex.quote(unset_environment)} EXIT",
+        "sudo systemctl restart nix-daemon.service",
+        rebuild,
+    ])
+    return remote(c, "sh -c " + shlex.quote("\n".join(command)))
 
 
 def hosts_text_with_vm_name(contents, address, hostname):
@@ -802,15 +1248,22 @@ def cleanup_host_hostname(hostname):
     print(f"Removed managed {hostname} entry from {HOSTS_FILE}.")
 
 
-def update_config():
+def update_config(extra=()):
     """Build and activate the host checkout's NixOS config in the existing guest."""
     c = connection()
-    settings = c["guest_config"]
+    # Connection outputs can lag current tfvars before apply or on an existing
+    # VM. Evaluate the machine settings from the selected OpenTofu inputs.
+    settings = tofu_guest_config(extra)
+    c["guest_config"] = settings
+    sync_guest_mitmproxy_ca(c)
     remote_stage = f"/tmp/nixvm-config-{os.getpid()}-{time.time_ns()}"
     with tempfile.TemporaryDirectory(prefix="nixvm-config-") as tmp:
         staged_nix = Path(tmp) / "nix"
         shutil.copytree(ROOT / "nix", staged_nix,
                         ignore=shutil.ignore_patterns("current.json", "result*"))
+        ca_certificate = ROOT / ".runtime" / c["name"] / "mitmproxy-ca-cert.pem"
+        if ca_certificate.is_file():
+            shutil.copyfile(ca_certificate, staged_nix / "machines" / "mitmproxy-ca.pem")
         (staged_nix / "machines/current.json").write_text(
             json.dumps(settings, indent=2) + "\n"
         )
@@ -821,10 +1274,26 @@ def update_config():
             run(["rsync", "-a", "--delete", "--protect-args", "-e", shlex.join(ssh[:-1]),
                  str(staged_nix) + "/", f"{ssh[-1]}:{remote_stage}/nix/"])
             flake = f"path:{remote_stage}/nix#nixvm"
-            remote(c, f"sudo nixos-rebuild switch --flake {shlex.quote(flake)}")
+            guest_ca = f"{remote_stage}/nix/machines/mitmproxy-ca.pem"
+            bundle = f"/tmp/nixvm-mitmproxy-ca-{os.getpid()}.pem" if ca_certificate.is_file() else None
+            run_nixos_rebuild(c, flake, settings,
+                              ca_bundle=bundle,
+                              ca_certificate=guest_ca if bundle else None)
         finally:
             remote(c, f"rm -rf -- {shlex.quote(remote_stage)}")
     print("Activated the host NixOS configuration in the guest.")
+
+
+def sync_guest_mitmproxy_ca(c):
+    """Keep the managed proxy CA in the guest checkout for ordinary rebuilds."""
+    certificate = ROOT / ".runtime" / c["name"] / "mitmproxy-ca-cert.pem"
+    if not certificate.is_file():
+        return
+    target = c["guest_config"]["repoPath"].rstrip("/") + "/nix/machines/mitmproxy-ca.pem"
+    remote(c, f"mkdir -p {shlex.quote(str(Path(target).parent))}")
+    ssh = ssh_args(c)
+    run(["rsync", "-a", "--protect-args", "-e", shlex.join(ssh[:-1]),
+         str(certificate), f"{ssh[-1]}:{target}"])
 
 
 def preflight(c):
@@ -1011,7 +1480,7 @@ def usb(c, attach, selector=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["build-image", "remove-image", "define-network-filter", "firewall-test", "check-host-nfs", "setup-host-nfs", "setup-hostname", "cleanup-hostname", "bootstrap", "preflight", "ssh", "spice", "forward",
+    parser.add_argument("command", choices=["build-image", "remove-image", "define-network-filter", "firewall-test", "check-host-nfs", "setup-host-nfs", "setup-host-mitmproxy", "cleanup-host-mitmproxy", "setup-hostname", "cleanup-hostname", "bootstrap", "preflight", "ssh", "spice", "forward", "ensure-vm-nat",
                         "usb-attach", "usb-detach", "rebuild", "rollback", "password", "reboot", "start", "stop",
                         "reprovision", "import-public-keys", "gpu-check", "token-check", "update-config", "ip"])
     parser.add_argument("--name", default=os.environ.get("NIXVM_PROFILE", "nixvm"),
@@ -1037,6 +1506,12 @@ def main():
         return run_firewall_tests(extra)
     if args.command == "setup-host-nfs":
         return configure_host_nfs(extra)
+    if args.command == "setup-host-mitmproxy":
+        return setup_host_mitmproxy(extra)
+    if args.command == "ensure-vm-nat":
+        return ensure_vm_nat(extra)
+    if args.command == "cleanup-host-mitmproxy":
+        return cleanup_host_mitmproxy(args.name)
     if args.command == "setup-hostname":
         return setup_host_hostname()
     if args.command == "cleanup-hostname":
@@ -1088,7 +1563,7 @@ def main():
     elif args.command == "gpu-check":
         remote(c, "nixvm-gpu-check")
     elif args.command == "update-config":
-        update_config()
+        update_config(extra)
     elif args.command == "token-check":
         print("Checking PIV through the selected PC/SC socket; protocol mismatch errors require compatible pcsc-lite versions.")
         remote(c, "nixvm-piv --list-slots")

@@ -129,7 +129,7 @@ variable "mac_address" {
   }
 }
 variable "host_access" {
-  description = "Guest-initiated access to host IPs. Ports apply to TCP and UDP; all_ports allows all IP protocols."
+  description = "Guest-initiated access to host IPs. Ports apply to TCP and UDP; port 8080 to the managed VM gateway proxy is always allowed."
   type = object({
     ips       = list(string)
     ports     = list(number)
@@ -154,6 +154,29 @@ variable "host_access" {
     condition     = !var.host_access.all_ports || length(var.host_access.ports) == 0
     error_message = "Set host_access.ports to an empty list when host_access.all_ports is true."
   }
+  validation {
+    condition = alltrue([
+      for port in var.host_access.ports : !contains([80, 443, 8443, 8080, 8081, 8082], port)
+    ])
+    error_message = "host_access.ports may not include blocked web ports; the proxy's TCP/8080 exception is managed separately."
+  }
+}
+variable "mitmproxy_policy" {
+  description = "Host Podman mitmproxy image and HTTPS hostname policy. Empty inspect_domains means TLS is passed through without decryption."
+  type = object({
+    image           = optional(string, "docker.io/mitmproxy/mitmproxy:latest")
+    inspect_domains = optional(list(string), [])
+    blocked_domains = optional(list(string), [])
+  })
+  default = {}
+  validation {
+    condition = alltrue(concat(
+      [can(regex("^[A-Za-z0-9][A-Za-z0-9._/:@-]*$", var.mitmproxy_policy.image))],
+      [for domain in concat(var.mitmproxy_policy.inspect_domains, var.mitmproxy_policy.blocked_domains) :
+        can(regex("^([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\\.)*[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$", domain))]
+    ))
+    error_message = "mitmproxy image must be non-empty and policy entries must be bare hostnames without wildcards or paths."
+  }
 }
 variable "internal_network_deny" {
   description = "CIDR blocks denied for guest-initiated traffic unless an internal_network_allow rule permits access."
@@ -175,7 +198,7 @@ variable "internal_network_deny" {
   }
 }
 variable "internal_network_allow" {
-  description = "Per-IP internal network allow rules. Ports apply to TCP and UDP; all_ports allows all IP protocols for that IP."
+  description = "Per-IP internal network allow rules. Ports apply to TCP and UDP; explicit ports may override the managed web-port blocks."
   type = list(object({
     ip        = string
     ports     = list(number)

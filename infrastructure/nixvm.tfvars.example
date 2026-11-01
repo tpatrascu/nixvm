@@ -12,11 +12,21 @@ dotfiles_path   = "~/.dotfiles"
 
 # Guest-initiated host access. The dedicated VM NAT gateway is included
 # automatically; these IPs add other host addresses. Ports permit TCP and UDP;
-# set all_ports=true and ports=[] to allow all protocols to the listed IPs.
+# the managed mitmproxy is separately allowed on gateway TCP/8080.
 # host_access = {
 #   ips       = []
 #   ports     = [53, 2049]
 #   all_ports = false
+# }
+
+# mitmproxy runs as a Podman container under the host user's systemd. `up`
+# pulls the configured image on every run; `latest` tracks the current stable
+# mitmproxy release. Domains include their subdomains. An empty inspect list
+# passes HTTPS through without TLS decryption.
+# mitmproxy_policy = {
+#   image           = "docker.io/mitmproxy/mitmproxy:latest"
+#   inspect_domains = ["api.example.com", "updates.example.net"]
+#   blocked_domains = ["telemetry.example.org"]
 # }
 
 # The firewall test subnet is managed on the VM's NAT bridge and removed by
@@ -31,7 +41,7 @@ dotfiles_path   = "~/.dotfiles"
 # Per-IP access rules are independent and preserve the default deny list.
 # internal_network_allow = [
 #   { ip = "10.0.0.25", ports = [443], all_ports = false },
-#   { ip = "10.0.0.26", ports = [], all_ports = true },
+#   { ip = "10.0.0.26", ports = [], all_ports = true }, # still blocks managed web ports
 # ]
 
 # Manually configured NFS exports on other servers mounted in the guest.
@@ -78,6 +88,7 @@ guest = {
 #   open_driver   = true # Turing or newer; check your specific GPU
 # }
 # streaming = { enabled = true, encoder = "nvenc", autologin = true }
+
 # Development toolchains and applications are enabled by default; override any
 # entry to false to omit it. Platform-unavailable applications are skipped.
 # toolchains = { python = true, node = true, llvm = true, rust = true, jdk = true, garmin = true }
