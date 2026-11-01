@@ -12,7 +12,6 @@ in
     omp
   ]
     ++ lib.optionals (machine.apps.codex or false) [ pkgs.codex ]
-    ++ lib.optionals (machine.apps.codexDesktop or false) [ pkgs.chatgpt ]
     ++ lib.optionals (machine.apps.claudeCode or false) [ pkgs.claude-code ]
     ++ lib.optionals (machine.apps.opencode or false) [ pkgs.opencode ]
     ++ lib.optionals (machine.apps.vscode or false) [ pkgs.vscode ];

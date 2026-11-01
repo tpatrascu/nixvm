@@ -35,6 +35,35 @@ class RepositoryTransferTests(unittest.TestCase):
 
 
 class HostTests(unittest.TestCase):
+    def test_hosts_file_is_unchanged_when_hostname_already_has_current_ip(self):
+        hosts = "192.168.124.13 nixvm developer-alias # maintained by user\n"
+        updated, changed = nixvm.hosts_text_with_vm_name(
+            hosts, "192.168.124.13", "nixvm"
+        )
+        self.assertEqual(updated, hosts)
+        self.assertFalse(changed)
+
+    def test_remove_managed_hostname_preserves_unmanaged_mappings(self):
+        hosts = (
+            "127.0.0.1 localhost\n"
+            "192.168.124.13 nixvm # Managed by nixvm\n"
+            "192.0.2.5 nixvm manual-alias\n"
+            "198.51.100.7 nixvm extra # Managed by nixvm\n"
+        )
+        updated, changed = nixvm.remove_vm_hosts_entry(hosts, "nixvm")
+        self.assertTrue(changed)
+        self.assertEqual(updated, (
+            "127.0.0.1 localhost\n"
+            "192.0.2.5 nixvm manual-alias\n"
+            "198.51.100.7 extra\n"
+        ))
+
+    def test_remove_managed_hostname_is_idempotent(self):
+        hosts = "127.0.0.1 localhost\n"
+        updated, changed = nixvm.remove_vm_hosts_entry(hosts, "nixvm")
+        self.assertEqual(updated, hosts)
+        self.assertFalse(changed)
+
     def test_lease_lookup_matches_ipv4(self):
         with patch.object(nixvm, "virsh", return_value="52:54:00:dc:10:01 ipv4 192.168.122.42/24 nixvm -"):
             self.assertEqual(nixvm.guest_ip({"network": "default", "mac": "52:54:00:dc:10:01"}), "192.168.122.42")

@@ -361,10 +361,16 @@ def build_network_filter(name, access, filter_uuid=None):
     return root
 
 
-def define_network_filter():
-    name = os.environ["NIXVM_FILTER_NAME"]
-    access = json.loads(os.environ["NIXVM_NETWORK_ACCESS"])
-    uri = json.loads(os.environ["NIXVM_CONNECTION"])["uri"]
+def define_network_filter(extra=()):
+    if "NIXVM_FILTER_NAME" in os.environ:
+        name = os.environ["NIXVM_FILTER_NAME"]
+        access = json.loads(os.environ["NIXVM_NETWORK_ACCESS"])
+        uri = json.loads(os.environ["NIXVM_CONNECTION"])["uri"]
+    else:
+        config = tofu_firewall_test_config(extra)
+        name = config["filter_name"]
+        access = config["filter_access"]
+        uri = config["connection"]["uri"]
     filter_uuid = existing_network_filter_uuid(uri, name)
     root = build_network_filter(name, access, filter_uuid)
 
@@ -389,7 +395,7 @@ def tofu_firewall_test_config(extra):
         "cidr = local.firewall_test_network.cidr, "
         "gateway = local.firewall_test_network.gateway, "
         "primary_gateway = local.vm_network.gateway, "
-        "primary_mac = var.mac_address, "
+        "primary_mac = local.mac_address, "
         "allow_test_port = local.firewall_test_network.allow_test_port, "
         "deny_test_port = local.firewall_test_network.deny_test_port, "
         "prefix = local.firewall_test_network.prefix}})"
@@ -508,14 +514,18 @@ def host_nfs_exports_text(config, cidrs=None):
     )
 
 
-def check_host_nfs():
-    config = json.loads(os.environ["NIXVM_HOST_NFS_CONFIG"])
+def check_host_nfs(config=None):
+    if config is None:
+        try:
+            config = json.loads(os.environ["NIXVM_HOST_NFS_CONFIG"])
+        except KeyError as error:
+            raise RuntimeError("Host NFS check needs the selected OpenTofu configuration.") from error
     if not config["exports"]:
         exports_file = host_nfs_exports_file(config["name"])
         if exports_file.exists():
             raise RuntimeError(
                 f"A managed host NFS export still exists at {exports_file}; set host_nfs_exports = [] "
-                "and run 'scripts/nixvm.py setup-host-nfs -var-file=nixvm.tfvars' to remove it before applying."
+                "and rerun the selected variable file with 'nixvm nfs cleanup' before applying."
             )
         print("No host_nfs_exports are configured; no host export check is needed.")
         return
@@ -525,7 +535,7 @@ def check_host_nfs():
     if not exports_file.is_file() or exports_file.read_text() != expected:
         raise RuntimeError(
             f"Host NFS exports are not configured for these variables. Run "
-            f"'scripts/nixvm.py setup-host-nfs -var-file=nixvm.tfvars' in a terminal first."
+            "'nixvm nfs setup' with the selected variable file in a terminal first."
         )
     values = host_os_release()
     _, _, service = host_nfs_distro(values)
@@ -690,10 +700,8 @@ def hosts_text_with_vm_name(contents, address, hostname):
         matching_lines.append((index, fields, comment, existing_address))
 
     entry = f"{address} {hostname} {HOSTS_MARKER}"
-    if len(matching_lines) == 1:
-        index, fields, comment, existing_address = matching_lines[0]
-        if existing_address == address and fields == [address, hostname] and comment.strip() == HOSTS_MARKER:
-            return contents, False
+    if any(existing_address == address for _, _, _, existing_address in matching_lines):
+        return contents, False
 
     for index, fields, comment, _ in reversed(matching_lines):
         remaining_aliases = [alias for alias in fields[1:] if alias != hostname]
@@ -717,6 +725,27 @@ def vm_hosts_entry_exists(contents, hostname):
         if hostname in fields[1:]:
             return True
     return False
+
+
+def remove_vm_hosts_entry(contents, hostname):
+    """Remove only nixvm-managed host mappings for the selected hostname."""
+    if not re.fullmatch(r"[a-z][a-z0-9-]{0,30}", hostname):
+        raise ValueError(f"Invalid VM hostname for {HOSTS_FILE}: {hostname!r}")
+    lines = contents.splitlines()
+    changed = False
+    for index, line in enumerate(lines):
+        body, separator, comment = line.partition("#")
+        fields = body.split()
+        if (len(fields) < 2 or hostname not in fields[1:]
+                or not separator or not comment.strip().startswith("Managed by nixvm")):
+            continue
+        aliases = [alias for alias in fields[1:] if alias != hostname]
+        lines[index] = " ".join([fields[0], *aliases]) if aliases else None
+        changed = True
+    lines = [line for line in lines if line is not None]
+    if not changed:
+        return contents, False
+    return "\n".join(lines) + ("\n" if contents.endswith("\n") or contents == "" else ""), True
 
 
 def confirm_vm_hosts_change(hostname):
@@ -752,6 +781,25 @@ def setup_host_hostname():
         staged_path.unlink(missing_ok=True)
     action = "Updated" if entry_exists else "Added"
     print(f"{action} {hostname} -> {address} in {HOSTS_FILE}.")
+
+
+def cleanup_host_hostname(hostname):
+    if HOSTS_FILE.is_symlink():
+        raise RuntimeError(f"{HOSTS_FILE} is a symlink managed by the host OS; remove the {hostname} mapping through that system's configuration.")
+    contents = HOSTS_FILE.read_text(encoding="utf-8")
+    updated, changed = remove_vm_hosts_entry(contents, hostname)
+    if not changed:
+        print(f"No nixvm-managed {hostname} entry in {HOSTS_FILE}.")
+        return
+    mode = HOSTS_FILE.stat().st_mode & 0o777
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", prefix="nixvm-hosts-", delete=False) as staged:
+        staged.write(updated)
+        staged_path = Path(staged.name)
+    try:
+        run(host_admin_prefix() + ["install", "-m", format(mode, "04o"), str(staged_path), str(HOSTS_FILE)])
+    finally:
+        staged_path.unlink(missing_ok=True)
+    print(f"Removed managed {hostname} entry from {HOSTS_FILE}.")
 
 
 def update_config():
@@ -844,10 +892,26 @@ def ensure_vfio_devices(c):
             raise RuntimeError(f"Cannot bind missing PCI function to vfio-pci: {pci}")
         driver_link = device / "driver"
         driver = driver_link.resolve().name if driver_link.exists() else "none"
+        # Libvirt can already have bound a managed passthrough device. Its
+        # active kernel override is sufficient for starting this VM.
+        kernel_override = device / "driver_override"
+        if (driver == "vfio-pci" and kernel_override.is_file()
+                and kernel_override.read_text().strip() == "vfio-pci"):
+            continue
         driverctl = shutil.which("driverctl")
         override = None
         if driverctl:
-            for line in output([driverctl, "list-overrides"]).splitlines():
+            try:
+                overrides = output([driverctl, "list-overrides"])
+            except subprocess.CalledProcessError:
+                # Libvirt's managed hostdev can bind an isolated GPU without
+                # requiring a separate root driverctl session.
+                node = "pci_" + pci.replace(":", "_").replace(".", "_")
+                virsh(c, "nodedev-detach", node)
+                if not driver_link.exists() or driver_link.resolve().name != "vfio-pci":
+                    raise RuntimeError(f"Libvirt did not bind {pci} to vfio-pci.")
+                continue
+            for line in overrides.splitlines():
                 fields = line.split()
                 if len(fields) == 2 and fields[0] == pci:
                     override = fields[1]
@@ -947,10 +1011,11 @@ def usb(c, attach, selector=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["build-image", "remove-image", "define-network-filter", "firewall-test", "check-host-nfs", "setup-host-nfs", "setup-hostname", "bootstrap", "preflight", "ssh", "spice", "forward",
+    parser.add_argument("command", choices=["build-image", "remove-image", "define-network-filter", "firewall-test", "check-host-nfs", "setup-host-nfs", "setup-hostname", "cleanup-hostname", "bootstrap", "preflight", "ssh", "spice", "forward",
                         "usb-attach", "usb-detach", "rebuild", "rollback", "password", "reboot", "start", "stop",
                         "reprovision", "import-public-keys", "gpu-check", "token-check", "update-config", "ip"])
-    parser.add_argument("--name", default="nixvm", help="VM name for remove-image (default: nixvm)")
+    parser.add_argument("--name", default=os.environ.get("NIXVM_PROFILE", "nixvm"),
+                        help="VM name for remove-image (defaults to the selected variable-file basename)")
     parser.add_argument("--device", help="YubiKey USB port name or serial; mandatory if selection is ambiguous")
     parser.add_argument("--timeout", type=int, default=120, help="Seconds to wait for start/stop transitions (default: 120)")
     parser.add_argument("--force", action="store_true", help="Abruptly destroy the VM instead of graceful shutdown (stop only)")
@@ -967,15 +1032,20 @@ def main():
     if args.command == "remove-image":
         return remove_image_cache(args.name)
     if args.command == "define-network-filter":
-        return define_network_filter()
+        return define_network_filter(extra)
     if args.command == "firewall-test":
         return run_firewall_tests(extra)
     if args.command == "setup-host-nfs":
         return configure_host_nfs(extra)
     if args.command == "setup-hostname":
         return setup_host_hostname()
+    if args.command == "cleanup-hostname":
+        return cleanup_host_hostname(args.name)
     if args.command == "check-host-nfs":
-        return check_host_nfs()
+        config = (json.loads(os.environ["NIXVM_HOST_NFS_CONFIG"])
+                  if "NIXVM_HOST_NFS_CONFIG" in os.environ
+                  else tofu_host_nfs_config(extra))
+        return check_host_nfs(config)
     if args.command == "bootstrap":
         return bootstrap()
     if args.command == "preflight" and extra:

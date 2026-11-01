@@ -1,6 +1,7 @@
 variable "name" {
-  type    = string
-  default = "nixvm"
+  description = "VM name and hostname. The nixvm wrapper sets this from the selected variable-file basename."
+  type        = string
+  default     = "nixvm"
   validation {
     condition     = can(regex("^[a-z][a-z0-9-]{0,30}$", var.name))
     error_message = "Use a lowercase VM name with letters, digits and hyphens."
@@ -116,13 +117,14 @@ variable "firewall_test_network_cidr" {
   }
 }
 variable "mac_address" {
-  type    = string
-  default = "52:54:00:dc:10:01"
+  description = "Optional VM MAC. If unset, the wrapper derives a stable value from the VM name."
+  type        = string
+  default     = null
   validation {
-    condition = alltrue([
-      can(regex("^52:54:00(:[0-9a-fA-F]{2}){3}$", var.mac_address)),
-      lower(var.mac_address) != "52:54:00:dc:10:fe",
-    ])
+    condition = var.mac_address == null ? true : (
+      can(regex("^52:54:00(:[0-9a-fA-F]{2}){3}$", var.mac_address)) &&
+      lower(var.mac_address) != "52:54:00:dc:10:fe"
+    )
     error_message = "Use a unique QEMU MAC address beginning with 52:54:00, distinct from the firewall test interface MAC."
   }
 }
@@ -251,7 +253,7 @@ variable "dotfiles_links" {
   description = "Home-relative destination -> dotfiles-relative source."
   type        = map(string)
   default = {
-    ".p10k.zsh"                  = ".p10k.zsh"
+    ".p10k.zsh"                 = ".p10k.zsh"
     ".config/zed/settings.json" = ".config/zed/settings.json"
     ".config/zed/tasks.json"    = ".config/zed/tasks.json"
     ".config/zed/debug.json"    = ".config/zed/debug.json"
@@ -266,13 +268,25 @@ variable "dotfiles_links" {
   }
 }
 variable "toolchains" {
+  description = "Development toolchains to install in the guest."
   type = object({
     python = optional(bool, true)
     node   = optional(bool, true)
     llvm   = optional(bool, true)
     rust   = optional(bool, true)
-    jdk    = optional(bool, false)
-    garmin = optional(bool, false)
+    jdk    = optional(bool, true)
+    garmin = optional(bool, true)
+  })
+  default = {}
+}
+variable "apps" {
+  description = "Applications to install in the guest when supported by the target platform."
+  type = object({
+    codex      = optional(bool, true)
+    chatgpt    = optional(bool, true)
+    claudeCode = optional(bool, true)
+    opencode   = optional(bool, true)
+    vscode     = optional(bool, true)
   })
   default = {}
 }

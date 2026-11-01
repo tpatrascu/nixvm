@@ -4,9 +4,10 @@ locals {
   guest_config = merge(var.guest, {
     hostname       = var.name
     sshPublicKeys  = var.ssh_public_keys
-    repoPath       = "/home/${var.guest.username}/nixvm"
+    repoPath       = "/home/${var.guest.username}/${var.name}"
     dotfilesPath   = "/home/${var.guest.username}/.dotfiles"
     dotfilesLinks  = var.dotfiles_links
+    apps           = var.apps
     toolchains     = var.toolchains
     nfsMounts      = var.nfs_mounts
     hostNfsExports = var.host_nfs_exports
@@ -20,7 +21,7 @@ locals {
   connection = {
     name         = var.name
     uri          = var.libvirt_uri
-    mac          = var.mac_address
+    mac          = local.mac_address
     network      = local.vm_network_name
     username     = var.guest.username
     uid          = var.guest.uid
@@ -37,13 +38,17 @@ locals {
   vm_pool_name    = coalesce(var.vm_storage_pool_name, "${var.name}-user")
   vm_pool_path    = coalesce(var.vm_storage_pool_path, "/var/lib/libvirt/images/${local.vm_pool_name}")
   vm_network_name = "nixvm-${var.name}-nat"
+  mac_address = var.mac_address != null ? var.mac_address : (
+    var.name == "nixvm" ? "52:54:00:dc:10:01" :
+    "52:54:00:${substr(md5(var.name), 0, 2)}:${substr(md5(var.name), 2, 2)}:${substr(md5(var.name), 4, 2)}"
+  )
   vm_network = {
     cidr    = var.vm_network_cidr
     gateway = cidrhost(var.vm_network_cidr, 1)
     prefix  = tonumber(split("/", var.vm_network_cidr)[1])
   }
   network_filter_name        = "${var.name}-access"
-  firewall_test_network_name = "nixvm-firewall-test-subnet"
+  firewall_test_network_name = "${var.name}-firewall-test-subnet"
   firewall_test_network = {
     cidr            = var.firewall_test_network_cidr
     gateway         = cidrhost(var.firewall_test_network_cidr, 1)
@@ -68,16 +73,16 @@ locals {
       allow = concat(var.internal_network_allow, [
         for ip in distinct([for mount in var.nfs_mounts : mount.server if anytrue([
           for cidr in var.internal_network_deny : try(cidrcontains(cidr, mount.server), false)
-        ])]) : {
+          ])]) : {
           ip        = ip
           ports     = [2049]
           protocols = ["tcp"]
           all_ports = false
         }
-      ], [{
-        ip        = local.firewall_test_network.gateway
-        ports     = [local.firewall_test_network.allow_test_port]
-        all_ports = false
+        ], [{
+          ip        = local.firewall_test_network.gateway
+          ports     = [local.firewall_test_network.allow_test_port]
+          all_ports = false
       }])
     }
   }
@@ -142,35 +147,26 @@ resource "libvirt_network" "vm_nat" {
 # libvirt has no nwfilter resource in the pinned provider. Define the filter on
 # the host with virsh; the domain attaches to this host-enforced policy below.
 resource "terraform_data" "network_filter" {
-  triggers_replace = [
-    local.network_filter_name,
-    var.libvirt_uri,
-    filesha256("${local.root}/scripts/nixvm.py"),
-    jsonencode(local.network_filter_access)
-  ]
+  input = {
+    name   = local.network_filter_name
+    uri    = var.libvirt_uri
+    access = local.network_filter_access
+  }
   depends_on = [terraform_data.preflight]
-  provisioner "local-exec" {
-    command = "python3 \"$NIXVM_ROOT/scripts/nixvm.py\" define-network-filter"
-    environment = {
-      NIXVM_ROOT           = local.root
-      NIXVM_CONNECTION     = jsonencode(local.connection)
-      NIXVM_FILTER_NAME    = local.network_filter_name
-      NIXVM_NETWORK_ACCESS = jsonencode(local.network_filter_access)
-    }
+  # Ignore the retired replacement trigger during migration from the previous
+  # callback provisioner so existing instances can be updated in place.
+  lifecycle {
+    ignore_changes = [triggers_replace]
   }
 }
 
 # Host exports are prepared interactively with scripts/nixvm.py setup-host-nfs.
 # This check keeps apply from activating guest mounts before the host export exists.
 resource "terraform_data" "host_nfs" {
-  triggers_replace = [jsonencode(local.host_nfs_config), filesha256("${local.root}/scripts/nixvm.py")]
-  depends_on       = [terraform_data.preflight]
-  provisioner "local-exec" {
-    command = "python3 \"$NIXVM_ROOT/scripts/nixvm.py\" check-host-nfs"
-    environment = {
-      NIXVM_ROOT            = local.root
-      NIXVM_HOST_NFS_CONFIG = jsonencode(local.host_nfs_config)
-    }
+  input      = local.host_nfs_config
+  depends_on = [terraform_data.preflight]
+  lifecycle {
+    ignore_changes = [triggers_replace]
   }
 }
 
@@ -225,7 +221,10 @@ resource "libvirt_volume" "user_root" {
   create     = { content = { url = "${local.build_dir}/bootstrap.qcow2" } }
   depends_on = [terraform_data.image, libvirt_pool.vm]
   lifecycle {
-    ignore_changes = [create, target.permissions]
+    ignore_changes = [
+      create, allocation, allocation_unit, capacity_unit,
+      physical_unit, target, type,
+    ]
   }
 }
 
@@ -268,7 +267,7 @@ resource "libvirt_domain" "vm" {
     }]
     interfaces = [
       {
-        mac        = { address = var.mac_address }
+        mac        = { address = local.mac_address }
         model      = { type = "virtio" }
         source     = { network = { network = local.vm_network_name } }
         filter_ref = { filter = local.network_filter_name }
@@ -282,13 +281,9 @@ resource "libvirt_domain" "vm" {
     # Keep a virtual display even with GPU passthrough. Laptop dGPUs often have
     # no physical display outputs wired to them, while Sunshine needs a screen
     # to capture; Vulkan applications can still use the passed-through GPU.
-    videos = [{
-      model = {
-        type = "virtio"
-        # Advertise at least the host's 16:9 streaming resolution to the guest.
-        resolution = { x = 2560, y = 1440 }
-      }
-    }]
+    # Keep 1080p available as the minimum mode; SPICE guest agent/viewer can
+    # still auto-resize the guest display with the host viewer.
+    videos = [{ model = { type = "virtio", resolution = { x = 1920, y = 1080 } } }]
     # Keep a host-local SPICE console available alongside Sunshine streaming,
     # using the same virtio display device.
     graphics = [{ spice = { auto_port = true, listen = "127.0.0.1" } }]

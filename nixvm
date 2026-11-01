@@ -45,8 +45,47 @@ Variable files default to infrastructure/nixvm.tfvars when it exists. Pass
 -var-file=PATH or set NIXVM_VAR_FILE to select another file.""")
 
 
-def run(command):
-    subprocess.run(command, cwd=ROOT, check=True)
+def run(command, *, env=None, capture=False):
+    return subprocess.run(command, cwd=ROOT, check=True, env=env, text=True,
+                          stdout=subprocess.PIPE if capture else None)
+
+
+def selected_var_file(arguments=()):
+    for index, argument in enumerate(arguments):
+        if argument == "-var-file" and index + 1 < len(arguments):
+            return resolve_var_file(arguments[index + 1])
+        if argument.startswith("-var-file="):
+            return resolve_var_file(argument.split("=", 1)[1])
+    configured = os.environ.get("NIXVM_VAR_FILE")
+    return resolve_var_file(configured) if configured else INFRA / "nixvm.tfvars"
+
+
+def profile_name(arguments=()):
+    name = selected_var_file(arguments).name
+    if name.endswith(".tfvars.json"):
+        name = name[:-len(".tfvars.json")]
+    elif name.endswith(".tfvars"):
+        name = name[:-len(".tfvars")]
+    else:
+        raise ValueError("Select a variable file ending in .tfvars or .tfvars.json")
+    if not re.fullmatch(r"[a-z][a-z0-9-]{0,30}", name):
+        raise ValueError("The variable-file basename must be a lowercase VM name (letters, digits, hyphens).")
+    return name
+
+
+def ensure_workspace(name):
+    env = os.environ.copy()
+    env.pop("TF_WORKSPACE", None)
+    listing = run(["tofu", f"-chdir={INFRA}", "workspace", "list"], env=env, capture=True)
+    workspaces = {line.strip().lstrip("*").strip() for line in listing.stdout.splitlines()}
+    if name in workspaces:
+        run(["tofu", f"-chdir={INFRA}", "workspace", "select", name], env=env)
+    else:
+        args = ["tofu", f"-chdir={INFRA}", "workspace", "new"]
+        args.append(name)
+        run(args, env=env)
+    os.environ["TF_WORKSPACE"] = name
+    os.environ["NIXVM_PROFILE"] = name
 
 
 def split_arguments(arguments):
@@ -85,6 +124,7 @@ def split_arguments(arguments):
         default = resolve_var_file(configured) if configured else INFRA / "nixvm.tfvars"
         if default.is_file():
             variables.insert(0, f"-var-file={default}")
+    variables.append(f"-var=name={profile_name(arguments)}")
     return variables, operation
 
 
@@ -134,14 +174,14 @@ def install_spice_shortcut(vm_name):
     entry = "\n".join([
         "[Desktop Entry]",
         "Type=Application",
-        "Name=NixVM SPICE",
+        f"Name=NixVM SPICE ({vm_name})",
         "Comment=Open the NixVM console with automatic resolution resizing",
         f"Exec={desktop_exec_arg(viewer)} --auto-resize=always -c qemu:///system --domain-name {desktop_exec_arg(vm_name)}",
         f"TryExec={viewer}",
         "Icon=computer",
         "Terminal=false",
         "Categories=Utility;",
-        "Keywords=nixvm-spice;nixvm;spice;virt-viewer;console;",
+        f"Keywords=nixvm-spice;{vm_name};spice;virt-viewer;console;",
         "StartupWMClass=virt-viewer",
         "StartupNotify=true",
         "",
@@ -155,7 +195,7 @@ def install_spice_shortcut(vm_name):
     for data_home in data_homes:
         applications = data_home / "applications"
         applications.mkdir(parents=True, exist_ok=True)
-        launcher = applications / "nixvm-spice.desktop"
+        launcher = applications / f"nixvm-spice-{vm_name}.desktop"
         if not launcher.exists() or launcher.read_text(encoding="utf-8") != entry:
             launcher.write_text(entry, encoding="utf-8")
         launcher.chmod(0o644)
@@ -173,7 +213,7 @@ def install_spice_shortcut(vm_name):
             desktop_path = Path(result.stdout.strip()).expanduser()
     desktop = desktop_path
     if desktop.is_dir():
-        shortcut = desktop / "nixvm-spice.desktop"
+        shortcut = desktop / f"nixvm-spice-{vm_name}.desktop"
         if not shortcut.exists() or shortcut.read_text(encoding="utf-8") != entry:
             shortcut.write_text(entry, encoding="utf-8")
         shortcut.chmod(0o755)
@@ -193,17 +233,41 @@ def main(arguments):
         return 0
 
     command, *extra = arguments
+    commands = {"up", "apply", "u", "init", "plan", "destroy", "preflight", "firewall-test",
+                "nfs", "image", "reprovision", "ssh", "ip", "start", "s", "stop", "rebuild",
+                "rollback", "reboot", "password", "forward", "usb-attach", "usb-detach",
+                "gpu-check", "token-check", "import-public-keys", "update-config", "spice"}
+    if command not in commands:
+        raise ValueError(f"Unknown command: {command}. Run 'nixvm help' for usage.")
+    profile_args = extra if command in {"up", "apply", "u", "init", "plan", "destroy",
+                                         "preflight", "firewall-test", "nfs", "reprovision"} else ()
+    profile = profile_name(profile_args)
+    os.environ["TF_WORKSPACE"] = profile
+    os.environ["NIXVM_PROFILE"] = profile
+    if command in {"init", "image"}:
+        pass
+    else:
+        ensure_workspace(profile)
     if command in ("up", "apply", "u"):
         variables, operation = split_arguments(extra)
         internal("setup-host-nfs", variables)
-        tofu("apply", [*variables, *operation])
+        internal("check-host-nfs", variables)
+        internal("define-network-filter", variables)
+        apply_args = [*variables, *operation]
+        if "-auto-approve" not in apply_args:
+            apply_args.append("-auto-approve")
+        tofu("apply", apply_args)
         firewall_tests(variables)
         internal("setup-hostname")
-        install_spice_shortcut(current_vm_name() or "nixvm")
+        install_spice_shortcut(current_vm_name() or profile)
         if command == "u":
             internal("update-config")
     elif command == "init":
-        tofu("init", extra)
+        _, operation = split_arguments(extra)
+        env = os.environ.copy()
+        env.pop("TF_WORKSPACE", None)
+        run(["tofu", f"-chdir={INFRA}", "init", *operation], env=env)
+        ensure_workspace(profile)
     elif command == "plan":
         variables, operation = split_arguments(extra)
         tofu("plan", [*variables, *operation])
@@ -213,6 +277,7 @@ def main(arguments):
         tofu("destroy", [*variables, *operation])
         if vm_name:
             (ROOT / ".runtime" / vm_name / "known_hosts").unlink(missing_ok=True)
+            internal("cleanup-hostname", ["--name", vm_name])
     elif command == "preflight":
         variables, operation = split_arguments(extra)
         if operation:
@@ -238,10 +303,15 @@ def main(arguments):
     elif command == "image":
         if len(extra) < 1 or extra[0] != "remove":
             raise ValueError("Use 'nixvm image remove [--name NAME]'")
-        internal("remove-image", extra[1:])
+        image_args = extra[1:]
+        if "--name" not in image_args:
+            image_args += ["--name", profile]
+        internal("remove-image", image_args)
     elif command == "reprovision":
         variables, operation = split_arguments(extra)
         internal("setup-host-nfs", variables)
+        internal("check-host-nfs", variables)
+        internal("define-network-filter", variables)
         tofu("apply", [*variables, "-replace=terraform_data.bootstrap", *operation])
     elif command in {"ssh", "ip", "start", "s", "stop", "rebuild", "rollback", "reboot",
                      "password", "forward", "usb-attach", "usb-detach", "gpu-check",

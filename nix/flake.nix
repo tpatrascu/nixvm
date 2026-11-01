@@ -6,8 +6,9 @@
       url = "github:nix-community/home-manager/release-26.05";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    chatgpt-linux.url = "github:bruglet/chatgpt-desktop-linux";
   };
-  outputs = { self, nixpkgs, home-manager }:
+  outputs = { self, nixpkgs, home-manager, chatgpt-linux }:
     let
       system = "x86_64-linux";
       machine = builtins.fromJSON (builtins.readFile (
@@ -24,6 +25,11 @@
           ./modules/system/nfs.nix
           ./modules/system/gpu.nix
           ./modules/system/yubikey.nix
+          chatgpt-linux.nixosModules.default
+          ({ machine, ... }: {
+            programs.codexDesktopLinux.enable = machine.apps.chatgpt or false;
+            environment.sessionVariables.CODEX_LINUX_DISABLE_USAGE_REPORTING = "1";
+          })
           home-manager.nixosModules.home-manager
           {
             home-manager.useGlobalPkgs = true;

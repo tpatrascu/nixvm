@@ -1,5 +1,4 @@
-# VM/libvirt name; also used as the guest hostname and host /etc/hosts alias.
-# name = "nixvm"
+# The filename stem (`nixvm`) becomes the VM name, guest hostname, and state workspace.
 vcpu       = 4
 memory_mib = 8192 # MiB
 disk_gib   = 80   # GiB
@@ -79,5 +78,7 @@ guest = {
 #   open_driver   = true # Turing or newer; check your specific GPU
 # }
 # streaming = { enabled = true, encoder = "nvenc", autologin = true }
-# Optional development toolchains default to disabled.
-# toolchains = { python = true, node = true, llvm = true, rust = true, jdk = false, garmin = false }
+# Development toolchains and applications are enabled by default; override any
+# entry to false to omit it. Platform-unavailable applications are skipped.
+# toolchains = { python = true, node = true, llvm = true, rust = true, jdk = true, garmin = true }
+# apps = { codex = true, chatgpt = true, claudeCode = true, opencode = true, vscode = true }

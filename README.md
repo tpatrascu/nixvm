@@ -66,7 +66,6 @@ copied too.
 ```sh
 cp infrastructure/nixvm.tfvars.example infrastructure/nixvm.tfvars
 # Edit: replace ssh_public_keys with an actual key and set repository paths.
-# Optionally set `name`; it is also the guest hostname and host /etc/hosts alias.
 ./nixvm init
 ./nixvm preflight
 ./nixvm plan
@@ -75,8 +74,20 @@ cp infrastructure/nixvm.tfvars.example infrastructure/nixvm.tfvars
 ./nixvm reboot
 ```
 
+The basename of the selected variable file is the VM name and guest hostname:
+`nixvm.tfvars` creates `nixvm`, while `workvm.tfvars` creates `workvm`. Use
+lowercase letters, digits, and hyphens, starting with a letter. For another VM,
+copy the example to a matching filename and pass it with
+`./nixvm up -var-file=workvm.tfvars`. NixVM creates a matching OpenTofu
+workspace and scopes the VM disk, network, build cache, SSH runtime files, NFS
+export, state, and SPICE launcher to that name. Its MAC is derived from the VM
+name unless you set `mac_address`. Use distinct network CIDRs for VMs that run
+at the same time. Existing VMs must be destroyed from their original workspace before being
+recreated in the named workspace; no state migration is performed.
+
 If a failed earlier apply left `nixvm` defined in libvirt but absent from
-`tofu state list`, confirm it is shut off and remove only that stale domain
+`TF_WORKSPACE=nixvm tofu -chdir=infrastructure state list`, confirm it is shut
+off and remove only that stale domain
 definition before applying the pool migration:
 
 ```sh
@@ -153,13 +164,13 @@ The allow list defaults to empty, so internal network access remains denied.
 OpenTofu reserves the test network gateway for a single probe port so the live
 test can demonstrate an allowed connection; the host listener exists only while
 the test is running.
-Apply changes with `tofu apply`.
+Apply changes with `./nixvm up` so the selected variable-file workspace is used.
 
 The VM's primary interface uses a separate, per-VM libvirt NAT network named
 `nixvm-<VM name>-nat`; it does not attach to libvirt's `default` network. Set
 `vm_network_cidr` to choose its IPv4 subnet (default `192.168.124.0/24`). Keep
 it distinct from `firewall_test_network_cidr` and any other host/libvirt
-subnets. The network is managed by OpenTofu and removed by `tofu destroy`.
+subnets. The network is managed by OpenTofu and removed by `./nixvm destroy`.
 
 OpenTofu also configures the firewall test subnet on that NAT bridge. Set
 `firewall_test_network_cidr` to choose its IPv4 subnet; the default is
@@ -167,7 +178,7 @@ OpenTofu also configures the firewall test subnet on that NAT bridge. Set
 absent from `internal_network_allow`, otherwise OpenTofu rejects the apply.
 This gives the guest and host a reachable test endpoint without adding a
 second VM interface. The subnet is removed with the NAT network by
-`tofu destroy`.
+`./nixvm destroy`.
 
 The `nixvm-firewall-test` suite runs after apply and checks that both configured
 subnets are present on the NAT network, and that the live libvirt filter XML
@@ -190,12 +201,13 @@ Provisioning accepts a new SSH host key into `.runtime/<name>/known_hosts` on
 first contact. Verify its fingerprint through the libvirt console if the host
 network is not trusted. A changed key is rejected; inspect it before removing an
 old entry following an intentional recreation. `./nixvm destroy` removes the
-VM's `known_hosts` file after a successful destroy so a later VM created with
-the same name can accept its new host key.
+VM's `known_hosts` file and its nixvm-managed `/etc/hosts` mapping after a
+successful destroy. Host NFS exports remain configured.
 
 ## Edit and rebuild
 
-Inside the VM:
+Inside the VM, the repository checkout directory matches the variable-file
+basename (`~/nixvm` for `nixvm.tfvars`, `~/workvm` for `workvm.tfvars`):
 
 ```sh
 cd ~/nixvm
@@ -246,14 +258,20 @@ Common commands:
 | `./nixvm stop --force` | Abruptly power off a stuck VM; unsaved guest writes may be lost |
 | `./nixvm reprovision` | Explicit bootstrap retry |
 | `./nixvm nfs setup` / `./nixvm nfs cleanup` | Configure host exports / remove managed exports after confirmation |
-| `./nixvm image remove` | Remove the default VM's generated image cache |
+| `./nixvm image remove` | Remove the selected VM's generated image cache |
 | `./nixvm image remove --name workvm` | Remove another VM's generated image cache |
 
 The wrapper uses `infrastructure/nixvm.tfvars` when present. Choose another
-variable file with `-var-file=PATH` or `NIXVM_VAR_FILE=PATH`. OpenTofu's direct
-commands remain available, but direct `tofu apply` skips the wrapper's live
-firewall policy tests and host NFS setup. The NAT network and firewall test
-subnet are managed by OpenTofu. `scripts/nixvm.py`
+variable file with `-var-file=PATH` or `NIXVM_VAR_FILE=PATH`; its basename
+selects the VM and OpenTofu workspace. State is stored in the matching local
+workspace under `infrastructure/terraform.tfstate.d/`. OpenTofu's direct
+commands remain available, but they do not select a profile automatically.
+Use `./nixvm` for normal operations; a direct `tofu apply` also skips the
+wrapper's host NFS setup and verification, network filter refresh, and live
+firewall policy tests. The `terraform_data.network_filter` and
+`terraform_data.host_nfs` resources track their current inputs in place; the
+wrapper runs the corresponding host operations before apply.
+The NAT network and firewall test subnet are managed by OpenTofu. `scripts/nixvm.py`
 contains lower-level callbacks and helpers; use `./nixvm` for normal host
 operations.
 
@@ -269,13 +287,14 @@ failed transfer stays in a sibling `.nixvm-staging` directory and can be retried
 an unknown destination without `.git` is rejected for manual inspection.
 Normal reapply does not transfer repositories or run a rebuild.
 
-All OpenTofu-managed resources can be destroyed with `tofu destroy`, including
+All OpenTofu-managed resources for the selected profile can be destroyed with
+`./nixvm destroy`, including
 the VM domain, disk volume, and dedicated storage pool. Destroying the disk
 permanently removes the guest filesystem and any edits or data not backed up
 elsewhere. Push both repositories and back up other needed data before
 destroying. The generated bootstrap image in `.build/<VM name>/` is kept, so
 the next `./nixvm up` can reuse it. Run `./nixvm image remove` to delete
-the default VM's cache; add `--name <VM name>` for a custom VM. This only removes
+the selected VM's cache; add `--name <VM name>` to remove another profile's cache. This only removes
 the host-side cache and does not affect an existing VM disk. Remove the cache
 before applying if you want to regenerate the bootstrap image with changed
 image inputs such as SSH public keys. Host `.runtime/` is also a local artifact,
@@ -289,15 +308,12 @@ smartcard services. `nix/modules/home/` holds user settings, mutable dotfile lin
 GNOME preferences, token clients, applications, and independent Python/Node/LLVM/Rust modules.
 Home Manager activates with `nixos-rebuild`; no separate activation is needed.
 
-The Home Manager application module installs Zed, Kitty, and Oh My Pi. OpenAI
-Codex CLI is enabled by default in the example configuration; set
-`apps.codex` to `false` in `nix/machines/current.json` to omit it, or set it to
-`true` to install it. The ChatGPT desktop app, which includes Codex, is also
-enabled by default; control it separately with `apps.codexDesktop`. Claude Code
-Claude Code, OpenCode, and VS Code are also enabled by default in the example.
-Set `apps.claudeCode`, `apps.opencode`, or `apps.vscode` to `false` in
-`nix/machines/current.json` to disable a tool. NixOS is not among the desktop app's formally supported Linux
-distributions. OMP uses
+The Home Manager application module installs Zed, Kitty, Oh My Pi, Codex CLI,
+Claude Code, OpenCode, and VS Code. ChatGPT desktop (`apps.chatgpt`) is enabled
+by default through the `apps` object in the selected OpenTofu variable file;
+set an app to `false` to omit it. ChatGPT uses a NixOS-compatible repackaging
+of OpenAI's signed Linux application because Nixpkgs `pkgs.chatgpt` targets
+macOS. Its optional anonymous launch metric is disabled. OMP uses
 the upstream Linux x86_64 release binary at version 18.12.6, pinned by SHA-256
 in `nix/packages/omp-binary.nix`, so rebuilding does not compile its source tree.
 GNOME uses the packaged Adw-gtk3 dark theme and the packaged Vanilla-DMZ white
@@ -307,16 +323,15 @@ with launcher icons pointing directly at their packaged icon assets. The support
 and enabled declaratively; Ubuntu Snap-specific extensions and Desktop Icons NG
 are not available in the pinned NixOS package set.
 
-Python, Node, LLVM, and Rust toolchains are enabled in the example. Toggle them
-with the `toolchains` object in the guest machine JSON. Python includes pip and
-uv; use `uv venv`/`python -m venv` for project packages. Node includes npm and
+Python, Node, LLVM, Rust, JDK, and Garmin toolchain support are enabled by
+default. Toggle them with the `toolchains` object in the selected variable
+file. Python includes pip and uv; use `uv venv`/`python -m venv` for project packages. Node includes npm and
 Corepack. LLVM includes Clang, clangd, LLDB, CMake, Ninja, and pkg-config. Rust
 includes Cargo, rustfmt, Clippy, and rust-analyzer. Versions follow the
 committed lock file.
 
-The optional `jdk` and `garmin` toolkits install the Nix JDK (`pkgs.jdk`). Set
-`toolchains.jdk` or `toolchains.garmin` to `true` in `infrastructure/nixvm.tfvars`
-to enable either one. Garmin's
+The `jdk` and `garmin` toolkit toggles both install the Nix JDK (`pkgs.jdk`).
+Garmin's
 Connect IQ SDK Manager and SDK are downloaded through Garmin's [SDK page](https://developer.garmin.com/connect-iq/sdk/)
 after accepting its developer agreement and signing in; Nix does not download
 those licensed files. After enabling the Garmin toolkit, download and install

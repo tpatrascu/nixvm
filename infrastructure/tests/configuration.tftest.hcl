@@ -38,6 +38,33 @@ run "default_vm" {
     condition     = output.guest_configuration.repoPath == "/home/gigid/nixvm"
     error_message = "The editable guest checkout must be on the guest disk."
   }
+  assert {
+    condition     = output.connection.mac == "52:54:00:dc:10:01"
+    error_message = "The existing nixvm profile must retain its current MAC address."
+  }
+}
+
+run "tfvars_named_profile" {
+  command = plan
+  variables {
+    name = "workvm"
+  }
+  assert {
+    condition     = output.connection.name == "workvm" && output.guest_configuration.hostname == "workvm"
+    error_message = "The selected variable-file basename must become the VM name and guest hostname."
+  }
+  assert {
+    condition     = output.guest_configuration.repoPath == "/home/gigid/workvm" && libvirt_volume.user_root.name == "workvm.qcow2"
+    error_message = "The guest checkout and disk names must be scoped to the VM profile."
+  }
+  assert {
+    condition     = output.vm_network.name == "nixvm-workvm-nat" && output.firewall_test_network.name == "workvm-firewall-test-subnet"
+    error_message = "Both VM networks must be scoped to the VM profile."
+  }
+  assert {
+    condition     = output.connection.mac != "52:54:00:dc:10:01" && startswith(output.connection.mac, "52:54:00:")
+    error_message = "Named profiles must receive a stable profile-specific QEMU MAC address."
+  }
 }
 
 run "multiple_ssh_keys" {

@@ -184,7 +184,8 @@ class NixvmFirewallTest(unittest.TestCase):
         })
         gateway = ipaddress.ip_address(network["gateway"])
         access = config.get("filter_access", self.access)
-        self.assertEqual(network["name"], "nixvm-firewall-test-subnet")
+        vm_name = config.get("vm_name", "nixvm")
+        self.assertEqual(network["name"], f"{vm_name}-firewall-test-subnet")
         gateway_allows = [rule for rule in access["internal"]["allow"]
                           if ipaddress.ip_address(rule["ip"]) == gateway]
         if config:
@@ -257,6 +258,7 @@ class NixvmFirewallTest(unittest.TestCase):
     def test_up_runs_live_firewall_tests_after_apply(self):
         events = []
         with patch.object(nixvm_wrapper, "split_arguments", return_value=([], [])), \
+             patch.object(nixvm_wrapper, "ensure_workspace"), \
              patch.object(nixvm_wrapper, "firewall_tests",
                           side_effect=lambda *_: events.append("firewall-tests")), \
              patch.object(nixvm_wrapper, "internal",
@@ -269,7 +271,9 @@ class NixvmFirewallTest(unittest.TestCase):
             nixvm_wrapper.main(["up"])
         self.assertEqual(events, [
             ("internal", "setup-host-nfs", []),
-            ("tofu", "apply", []),
+            ("internal", "check-host-nfs", []),
+            ("internal", "define-network-filter", []),
+            ("tofu", "apply", ["-auto-approve"]),
             "firewall-tests",
             ("internal", "setup-hostname"),
             "install-spice-shortcut",
@@ -293,13 +297,13 @@ class NixvmFirewallTest(unittest.TestCase):
                  patch.object(nixvm_wrapper.subprocess, "run") as run:
                 nixvm_wrapper.install_spice_shortcut("nixvm")
 
-            launcher = data_home / "applications/nixvm-spice.desktop"
-            shortcut = desktop / "nixvm-spice.desktop"
+            launcher = data_home / "applications/nixvm-spice-nixvm.desktop"
+            shortcut = desktop / "nixvm-spice-nixvm.desktop"
             self.assertEqual(launcher.read_text(encoding="utf-8"), shortcut.read_text(encoding="utf-8"))
             self.assertIn('Exec="/usr/bin/virt-viewer" --auto-resize=always -c qemu:///system --domain-name "nixvm"',
                           launcher.read_text())
             self.assertIn("TryExec=/usr/bin/virt-viewer\n", launcher.read_text())
-            self.assertIn("Name=NixVM SPICE\n", launcher.read_text())
+            self.assertIn("Name=NixVM SPICE (nixvm)\n", launcher.read_text())
             self.assertIn("Keywords=nixvm-spice;nixvm;spice;virt-viewer;console;", launcher.read_text())
             self.assertEqual(launcher.stat().st_mode & 0o777, 0o644)
             self.assertEqual(shortcut.stat().st_mode & 0o777, 0o755)
