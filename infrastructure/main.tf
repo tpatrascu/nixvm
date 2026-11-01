@@ -1,6 +1,11 @@
 locals {
   root      = abspath("${path.module}/..")
   build_dir = "${local.root}/.build/${var.name}"
+  image_cache_dir = "${local.root}/.build/shared"
+  network_index = var.name == "nixvm" ? 124 : 16 + parseint(substr(md5(var.name), 0, 2), 16) % 200
+  vm_network_cidr = coalesce(var.vm_network_cidr, "192.168.${local.network_index}.0/24")
+  firewall_test_network_cidr = coalesce(var.firewall_test_network_cidr,
+    var.name == "nixvm" ? "192.168.123.0/24" : "10.254.${local.network_index}.0/24")
   guest_config = merge(var.guest, {
     hostname       = var.name
     sshPublicKeys  = var.ssh_public_keys
@@ -47,16 +52,16 @@ locals {
     "52:54:00:${substr(md5(var.name), 0, 2)}:${substr(md5(var.name), 2, 2)}:${substr(md5(var.name), 4, 2)}"
   )
   vm_network = {
-    cidr    = var.vm_network_cidr
-    gateway = cidrhost(var.vm_network_cidr, 1)
-    prefix  = tonumber(split("/", var.vm_network_cidr)[1])
+    cidr    = local.vm_network_cidr
+    gateway = cidrhost(local.vm_network_cidr, 1)
+    prefix  = tonumber(split("/", local.vm_network_cidr)[1])
   }
   network_filter_name        = "${var.name}-access"
   firewall_test_network_name = "${var.name}-firewall-test-subnet"
   firewall_test_network = {
-    cidr            = var.firewall_test_network_cidr
-    gateway         = cidrhost(var.firewall_test_network_cidr, 1)
-    prefix          = tonumber(split("/", var.firewall_test_network_cidr)[1])
+    cidr            = local.firewall_test_network_cidr
+    gateway         = cidrhost(local.firewall_test_network_cidr, 1)
+    prefix          = tonumber(split("/", local.firewall_test_network_cidr)[1])
     allow_test_port = 49231
     deny_test_port  = 49232
   }
@@ -130,8 +135,8 @@ resource "libvirt_network" "vm_nat" {
       prefix  = local.vm_network.prefix
       dhcp = {
         ranges = [{
-          start = cidrhost(var.vm_network_cidr, 2)
-          end   = cidrhost(var.vm_network_cidr, -2)
+          start = cidrhost(local.vm_network_cidr, 2)
+          end   = cidrhost(local.vm_network_cidr, -2)
         }]
       }
     },
@@ -148,8 +153,8 @@ resource "libvirt_network" "vm_nat" {
   lifecycle {
     precondition {
       condition = (
-        !cidrcontains(var.firewall_test_network_cidr, cidrhost(var.vm_network_cidr, 0)) &&
-        !cidrcontains(var.vm_network_cidr, cidrhost(var.firewall_test_network_cidr, 0))
+        !cidrcontains(local.firewall_test_network_cidr, cidrhost(local.vm_network_cidr, 0)) &&
+        !cidrcontains(local.vm_network_cidr, cidrhost(local.firewall_test_network_cidr, 0))
       )
       error_message = "vm_network_cidr and firewall_test_network_cidr must not overlap."
     }
@@ -198,6 +203,7 @@ resource "terraform_data" "image" {
     environment = {
       NIXVM_ROOT       = local.root
       NIXVM_BUILD      = local.build_dir
+      NIXVM_IMAGE_CACHE = local.image_cache_dir
       NIXVM_CONFIG     = jsonencode(local.guest_config)
       NIXVM_CONNECTION = jsonencode(local.connection)
       NIXVM_REPOSITORY = abspath(pathexpand(var.repository_path))

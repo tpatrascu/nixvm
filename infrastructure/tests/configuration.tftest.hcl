@@ -51,7 +51,7 @@ run "tfvars_named_profile" {
   }
   assert {
     condition     = output.connection.name == "workvm" && output.guest_configuration.hostname == "workvm"
-    error_message = "The selected variable-file basename must become the VM name and guest hostname."
+    error_message = "The selected VM name must become the VM name and guest hostname."
   }
   assert {
     condition     = output.guest_configuration.repoPath == "/home/gigid/workvm" && libvirt_volume.user_root.name == "workvm.qcow2"

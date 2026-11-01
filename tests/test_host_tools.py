@@ -35,6 +35,17 @@ class RepositoryTransferTests(unittest.TestCase):
 
 
 class HostTests(unittest.TestCase):
+    def test_mitmproxy_ca_is_initialized_in_the_persistent_shared_volume(self):
+        with patch.object(nixvm, "run") as run:
+            nixvm.initialize_mitmproxy_ca("docker.io/mitmproxy/mitmproxy:latest")
+        run.assert_called_once_with([
+            "podman", "run", "--rm", "--volume",
+            "nixvm-shared-mitmproxy-data:/home/mitmproxy/.mitmproxy",
+            "--entrypoint", "mitmdump", "docker.io/mitmproxy/mitmproxy:latest",
+            "--set", "confdir=/home/mitmproxy/.mitmproxy",
+            "--no-server", "--rfile", "/dev/null",
+        ])
+
     def test_hosts_file_is_unchanged_when_hostname_already_has_current_ip(self):
         hosts = "192.168.124.13 nixvm developer-alias # maintained by user\n"
         updated, changed = nixvm.hosts_text_with_vm_name(

@@ -74,16 +74,18 @@ cp infrastructure/nixvm.tfvars.example infrastructure/nixvm.tfvars
 ./nixvm reboot
 ```
 
-The basename of the selected variable file is the VM name and guest hostname:
-`nixvm.tfvars` creates `nixvm`, while `workvm.tfvars` creates `workvm`. Use
-lowercase letters, digits, and hyphens, starting with a letter. For another VM,
-copy the example to a matching filename and pass it with
-`./nixvm up -var-file=workvm.tfvars`. NixVM creates a matching OpenTofu
-workspace and scopes the VM disk, network, build cache, SSH runtime files, NFS
-export, state, and SPICE launcher to that name. Its MAC is derived from the VM
-name unless you set `mac_address`. Use distinct network CIDRs for VMs that run
-at the same time. Existing VMs must be destroyed from their original workspace before being
-recreated in the named workspace; no state migration is performed.
+The VM name defaults to `nixvm`. Select another VM with `-n` or `--name`:
+`./nixvm -n nixvm2 up` uses `infrastructure/nixvm2.tfvars` when that file
+exists. The selector works on every command, for example
+`./nixvm ssh -n nixvm2` or `./nixvm -n nixvm2 plan`. You can still pass
+`-var-file=PATH` to choose another settings file. NixVM creates a matching
+OpenTofu workspace and scopes the VM disk, network, build cache, SSH runtime
+files, NFS export, state, and SPICE launcher to that name. Each VM gets its own
+NAT network; default CIDRs are derived from the VM name and can be overridden
+with `vm_network_cidr` and `firewall_test_network_cidr`. Its MAC is derived
+from the VM name unless you set `mac_address`. Existing VMs must be destroyed
+from their original workspace before being recreated in the named workspace;
+no state migration is performed.
 
 If a failed earlier apply left `nixvm` defined in libvirt but absent from
 `TF_WORKSPACE=nixvm tofu -chdir=infrastructure state list`, confirm it is shut
@@ -173,19 +175,19 @@ ranges when needed; if other rootless containers are running, stop them and
 rerun `up` so Podman can migrate to the new mappings safely. It pulls the
 configured image each time `up` runs;
 the default `docker.io/mitmproxy/mitmproxy:latest` tag tracks the latest stable
-release. The container uses Podman's rootless pasta network and publishes its
-proxy port directly on the VM gateway address at port 8080. The mitmweb traffic
+release. One host service is shared by all VMs. The container uses Podman's
+rootless pasta network and publishes proxy port 8080 on host interfaces so
+each VM can reach it through its own network gateway. The mitmweb traffic
 viewer is bound to host loopback at
 [http://127.0.0.1:8081](http://127.0.0.1:8081).
-Get the UI password for the selected VM with:
+Get the shared UI password with:
 
 ```sh
 ./nixvm mitmproxy password
 ```
 
-Select another VM by passing its variable file, for example
-`./nixvm mitmproxy password -var-file=workvm.tfvars`. The password is stored
-with mode `0600` in `~/.local/share/nixvm/<VM name>/mitmproxy/web_password`.
+The shared password is stored with mode `0600` in
+`~/.local/share/nixvm/shared/mitmproxy/web_password`.
 
 The guest sends web requests through the host proxy at the VM network
 gateway's port 8080. The mitmweb page on host port 8081 shows proxied requests
@@ -217,8 +219,8 @@ by the libvirt filter, including QUIC over UDP/443, so applications that ignore
 system proxy settings cannot connect directly on the standard web ports.
 Certificate-pinned or mutual-TLS applications may need to be left out of
 `inspect_domains`. On
-`nixvm destroy`, the user service and policy files are removed; the named
-Podman volume is retained so its CA can be reused if the VM is recreated.
+`nixvm destroy`, the shared proxy stays available to other VMs. Its Podman
+volume is retained so the CA can be reused.
 
 `internal_network_deny` defaults to the standard special-use, private,
 documentation, benchmarking, multicast, link-local, and reserved IPv4/IPv6
@@ -232,18 +234,21 @@ address's `ports` instead; for example, `{ ip = "10.0.0.25", ports = [443], all_
 OpenTofu reserves the test network gateway for a single probe port so the live
 test can demonstrate an allowed connection; the host listener exists only while
 the test is running.
-Apply changes with `./nixvm up` so the selected variable-file workspace is used.
+The host proxy has one shared hostname policy; the last `up` run updates it from
+that VM's `mitmproxy_policy` settings. Apply changes with `./nixvm up`.
 
 The VM's primary interface uses a separate, per-VM libvirt NAT network named
 `nixvm-<VM name>-nat`; it does not attach to libvirt's `default` network. Set
-`vm_network_cidr` to choose its IPv4 subnet (default `192.168.124.0/24`). Keep
-it distinct from `firewall_test_network_cidr` and any other host/libvirt
-subnets. The network is managed by OpenTofu and removed by `./nixvm destroy`.
+`vm_network_cidr` to choose its IPv4 subnet. The default is stable and
+VM-specific (`192.168.124.0/24` for `nixvm`). Keep it distinct from
+`firewall_test_network_cidr` and any other host/libvirt subnets. The network is
+managed by OpenTofu and removed by `./nixvm destroy`.
 
 OpenTofu also configures the firewall test subnet on that NAT bridge. Set
-`firewall_test_network_cidr` to choose its IPv4 subnet; the default is
-`192.168.123.0/24`. Its gateway must be covered by `internal_network_deny` and
-absent from `internal_network_allow`, otherwise OpenTofu rejects the apply.
+`firewall_test_network_cidr` to choose its IPv4 subnet. The default is
+VM-specific (`192.168.123.0/24` for `nixvm`). Its gateway must be covered by
+`internal_network_deny` and absent from `internal_network_allow`, otherwise
+OpenTofu rejects the apply.
 This gives the guest and host a reachable test endpoint without adding a
 second VM interface. The subnet is removed with the NAT network by
 `./nixvm destroy`.
@@ -274,8 +279,8 @@ successful destroy. Host NFS exports remain configured.
 
 ## Edit and rebuild
 
-Inside the VM, the repository checkout directory matches the variable-file
-basename (`~/nixvm` for `nixvm.tfvars`, `~/workvm` for `workvm.tfvars`):
+Inside the VM, the repository checkout directory matches the selected VM name
+(`~/nixvm` by default, or `~/workvm` when you pass `-n workvm`):
 
 ```sh
 cd ~/nixvm
@@ -326,12 +331,12 @@ Common commands:
 | `./nixvm reprovision` | Explicit bootstrap retry |
 | `./nixvm nfs setup` / `./nixvm nfs cleanup` | Configure host exports / remove managed exports after confirmation |
 | `./nixvm image remove` | Remove the selected VM's image and workstation build cache |
-| `./nixvm image remove --name workvm` | Remove another VM's image and workstation build cache |
+| `./nixvm -n workvm image remove` | Remove another VM's image and workstation build cache |
 
-The wrapper uses `infrastructure/nixvm.tfvars` when present. Choose another
-variable file with `-var-file=PATH` or `NIXVM_VAR_FILE=PATH`; its basename
-selects the VM and OpenTofu workspace. State is stored in the matching local
-workspace under `infrastructure/terraform.tfstate.d/`. OpenTofu's direct
+The wrapper uses the selected VM's matching `infrastructure/<name>.tfvars`
+when present, with `nixvm` as the default. Choose a different variable file
+with `-var-file=PATH` or `NIXVM_VAR_FILE=PATH`. State is stored in the matching
+local workspace under `infrastructure/terraform.tfstate.d/`. OpenTofu's direct
 commands remain available, but they do not select a profile automatically.
 Use `./nixvm` for normal operations; a direct `tofu apply` also skips the
 wrapper's host NFS setup and verification, network filter refresh, and live
@@ -359,14 +364,13 @@ All OpenTofu-managed resources for the selected profile can be destroyed with
 the VM domain, disk volume, and dedicated storage pool. Destroying the disk
 permanently removes the guest filesystem and any edits or data not backed up
 elsewhere. Push both repositories and back up other needed data before
-destroying. The bootstrap image and host-built workstation closure in
-`.build/<VM name>/` and their Nix store paths are kept for reuse;
+destroying. Each VM's resized bootstrap copy and host-built workstation link in
+`.build/<VM name>/` are kept for reuse. The shared bootstrap base is kept in
+`.build/shared/`, and all builds use the host's shared Nix store;
 `./nixvm destroy` does not delete or garbage-collect this host cache. Run
-`./nixvm image remove` to delete the selected VM's build cache; add
-`--name <VM name>` to remove another profile's cache. This only removes
-host-side files and does not affect an existing VM disk. Remove the cache
-before applying if you want to regenerate the bootstrap image with changed
-image inputs such as SSH public keys. Host `.runtime/` is also a local artifact,
+`./nixvm image remove` to delete the selected VM's build cache. This only
+removes host-side files and does not affect an existing VM disk. The shared
+bootstrap base is retained. Host `.runtime/` is also a local artifact,
 not a backup.
 Do not commit OpenTofu state.
 

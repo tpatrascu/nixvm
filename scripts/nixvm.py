@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import ipaddress
 import json
 import os
@@ -198,27 +199,41 @@ def build_image():
     settings = json.loads(os.environ["NIXVM_CONFIG"])
     build = Path(os.environ["NIXVM_BUILD"])
     build.mkdir(parents=True, exist_ok=True)
+    image_cache = Path(os.environ.get("NIXVM_IMAGE_CACHE", ROOT / ".build" / "shared"))
+    image_cache.mkdir(parents=True, exist_ok=True)
+    bootstrap_settings = {
+        key: settings[key] for key in (
+            "username", "uid", "gid", "timezone", "locale", "keyboard", "sshPublicKeys"
+        ) if key in settings
+    }
+    bootstrap_settings["hostname"] = "nixvm-bootstrap"
+    bootstrap_settings["mitmproxy"] = {"enabled": False, "proxyUrl": ""}
+    bootstrap_key = hashlib.sha256(json.dumps(bootstrap_settings, sort_keys=True).encode()).hexdigest()[:16]
+    base_image = image_cache / f"bootstrap-{bootstrap_key}.qcow2"
     image = build / "bootstrap.qcow2"
     snapshot = build / "nix-source"
     if snapshot.exists():
         shutil.rmtree(snapshot)
     shutil.copytree(ROOT / "nix", snapshot, ignore=shutil.ignore_patterns("current.json", "result*"))
-    (snapshot / "machines/current.json").write_text(json.dumps(settings, indent=2) + "\n")
-    proxy_ca = ROOT / ".runtime" / build.name / "mitmproxy-ca-cert.pem"
+    (snapshot / "machines/current.json").write_text(json.dumps(bootstrap_settings, indent=2) + "\n")
+    proxy_ca = ROOT / ".runtime" / "shared" / "mitmproxy-ca-cert.pem"
     if proxy_ca.is_file():
         shutil.copyfile(proxy_ca, snapshot / "machines" / "mitmproxy-ca.pem")
     nix = ["nix", "--extra-experimental-features", "nix-command flakes"]
-    if image.is_file():
-        print(f"Using cached bootstrap image: {image}")
-        run(["qemu-img", "resize", image, os.environ["NIXVM_DISK_GIB"] + "G"])
-    else:
-        run([*nix, "build", f"path:{snapshot}#bootstrap", "--out-link", build / "image-result"])
-        images = list((build / "image-result").rglob("*.qcow2"))
+    if not base_image.is_file():
+        result_link = image_cache / f"image-result-{os.getpid()}"
+        run([*nix, "build", f"path:{snapshot}#bootstrap", "--out-link", result_link])
+        images = list(result_link.rglob("*.qcow2"))
         if len(images) != 1:
             raise RuntimeError(f"Expected one QCOW2 image, found {len(images)}")
-        shutil.copyfile(images[0], image)
-        # An upload overwrites the QCOW2 header, including its virtual capacity.
-        run(["qemu-img", "resize", image, os.environ["NIXVM_DISK_GIB"] + "G"])
+        temporary_base = image_cache / f"{base_image.name}.{os.getpid()}.tmp"
+        shutil.copyfile(images[0], temporary_base)
+        temporary_base.replace(base_image)
+        result_link.unlink(missing_ok=True)
+    print(f"Using shared bootstrap base image: {base_image}")
+    shutil.copyfile(base_image, image)
+    # Each VM gets its own writable copy and virtual disk capacity.
+    run(["qemu-img", "resize", image, os.environ["NIXVM_DISK_GIB"] + "G"])
 
     build_workstation_cache(build, settings)
 
@@ -230,7 +245,7 @@ def build_workstation_cache(build, settings):
         shutil.rmtree(snapshot)
     shutil.copytree(ROOT / "nix", snapshot, ignore=shutil.ignore_patterns("current.json", "result*"))
     (snapshot / "machines/current.json").write_text(json.dumps(settings, indent=2) + "\n")
-    proxy_ca = ROOT / ".runtime" / build.name / "mitmproxy-ca-cert.pem"
+    proxy_ca = ROOT / ".runtime" / "shared" / "mitmproxy-ca-cert.pem"
     if proxy_ca.is_file():
         shutil.copyfile(proxy_ca, snapshot / "machines" / "mitmproxy-ca.pem")
     run(["nix", "--extra-experimental-features", "nix-command flakes",
@@ -634,18 +649,17 @@ def systemd_unit_value(value):
 
 
 def mitmproxy_quadlet(config, policy_dir, web_password):
-    name = config["name"]
-    safe_name = f"nixvm-{name}-mitmproxy"
+    safe_name = "nixvm-shared-mitmproxy"
     allow_hosts = mitmproxy_allow_hosts(config["inspect_domains"])
     return f"""[Unit]
-Description=NixVM HTTPS inspection proxy for {name}
+Description=NixVM shared HTTPS inspection proxy
 [Container]
 ContainerName={safe_name}
 Image={config['image']}
 Network=pasta
 Volume={systemd_unit_value(policy_dir)}:/etc/mitmproxy/nixvm:ro
 Volume={safe_name}-data:/home/mitmproxy/.mitmproxy
-PublishPort={config['gateway']}:8080:8080
+PublishPort=0.0.0.0:8080:8080
 PublishPort=127.0.0.1:8081:8081
 Environment=NIXVM_MITMPROXY_POLICY=/etc/mitmproxy/nixvm/policy.json
 Exec=mitmweb --mode regular@0.0.0.0:8080 --web-host 0.0.0.0 --web-port 8081 --set=web_open_browser=false --set=web_password={web_password} --set=confdir=/home/mitmproxy/.mitmproxy --set=show_ignored_hosts=true --allow-hosts="{allow_hosts}" -s /etc/mitmproxy/nixvm/mitmproxy_policy.py
@@ -656,6 +670,36 @@ Restart=always
 [Install]
 WantedBy=default.target
 """
+
+
+def remove_legacy_mitmproxy_services(quadlet_dir):
+    """Retire pre-shared per-VM services that occupied gateway port 8080."""
+    for unit_file in quadlet_dir.glob("nixvm-*-mitmproxy.container"):
+        unit_name = unit_file.stem
+        if unit_name == "nixvm-shared-mitmproxy":
+            continue
+        subprocess.run(["systemctl", "--user", "disable", "--now", f"{unit_name}.service"],
+                       check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["systemctl", "--user", "disable", "--now",
+                        f"{unit_name}-forwarder.service"], check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        unit_file.unlink(missing_ok=True)
+        (Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+         / "systemd" / "user" / f"{unit_name}-forwarder.service").unlink(missing_ok=True)
+        if shutil.which("podman"):
+            subprocess.run(["podman", "rm", "--force", unit_name], check=False,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def initialize_mitmproxy_ca(image, volume_name="nixvm-shared-mitmproxy-data"):
+    """Generate the persistent mitmproxy CA before exposing its public cert."""
+    run([
+        "podman", "run", "--rm", "--volume",
+        f"{volume_name}:/home/mitmproxy/.mitmproxy",
+        "--entrypoint", "mitmdump", image,
+        "--set", "confdir=/home/mitmproxy/.mitmproxy",
+        "--no-server", "--rfile", "/dev/null",
+    ])
 
 
 def wait_tcp_listener(address, port, timeout=120):
@@ -683,7 +727,7 @@ def setup_host_mitmproxy(extra=()):
     if linger != "yes":
         run(admin + ["loginctl", "enable-linger", user_name])
 
-    data_dir = Path.home() / ".local" / "share" / "nixvm" / config["name"] / "mitmproxy"
+    data_dir = Path.home() / ".local" / "share" / "nixvm" / "shared" / "mitmproxy"
     data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     data_dir.chmod(0o700)
     policy_dir = data_dir / "policy"
@@ -705,7 +749,8 @@ def setup_host_mitmproxy(extra=()):
 
     quadlet_dir = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "containers" / "systemd"
     quadlet_dir.mkdir(parents=True, exist_ok=True)
-    unit_name = f"nixvm-{config['name']}-mitmproxy"
+    remove_legacy_mitmproxy_services(quadlet_dir)
+    unit_name = "nixvm-shared-mitmproxy"
     unit_file = quadlet_dir / f"{unit_name}.container"
     user_unit_dir = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "systemd" / "user"
     user_unit_dir.mkdir(parents=True, exist_ok=True)
@@ -714,24 +759,21 @@ def setup_host_mitmproxy(extra=()):
         unit_file.write_text(unit_contents, encoding="utf-8")
         unit_file.chmod(0o600)
 
-    # Remove the legacy gateway relay now that pasta publishes the container
-    # port directly on the VM's host-side gateway address.
-    subprocess.run(["systemctl", "--user", "disable", "--now",
-                    f"{unit_name}-forwarder.service"], check=False)
-    legacy_forwarder = user_unit_dir / f"{unit_name}-forwarder.service"
-    legacy_forwarder.unlink(missing_ok=True)
-
     print(f"Pulling current mitmproxy image {config['image']}.")
     run(["podman", "pull", config["image"]])
+    # mitmproxy can defer CA creation while every configured TLS host is passed
+    # through. Initialize the shared volume explicitly so bootstrap can always
+    # distribute its public CA certificate, even with an empty inspect list.
+    container = "nixvm-shared-mitmproxy"
+    initialize_mitmproxy_ca(config["image"], f"{container}-data")
     run(["systemctl", "--user", "daemon-reload"])
     run(["systemctl", "--user", "restart", f"{unit_name}.service"])
     wait_tcp_listener(config["gateway"], 8080)
     wait_tcp_listener("127.0.0.1", 8081)
 
-    runtime_dir = ROOT / ".runtime" / config["name"]
+    runtime_dir = ROOT / ".runtime" / "shared"
     runtime_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     ca_certificate = runtime_dir / "mitmproxy-ca-cert.pem"
-    container = f"nixvm-{config['name']}-mitmproxy"
     run(["podman", "cp", f"{container}:/home/mitmproxy/.mitmproxy/mitmproxy-ca-cert.pem", ca_certificate])
     ca_certificate.chmod(0o644)
     print("mitmproxy is running. Traffic viewer: http://127.0.0.1:8081")
@@ -741,7 +783,7 @@ def setup_host_mitmproxy(extra=()):
 def cleanup_host_mitmproxy(name):
     if not re.fullmatch(r"[a-z][a-z0-9-]{0,30}", name):
         raise ValueError(f"Invalid VM name for mitmproxy cleanup: {name!r}")
-    unit_name = f"nixvm-{name}-mitmproxy"
+    unit_name = "nixvm-shared-mitmproxy"
     quadlet_dir = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "containers" / "systemd"
     unit_file = quadlet_dir / f"{unit_name}.container"
     subprocess.run(["systemctl", "--user", "disable", "--now",
@@ -755,10 +797,10 @@ def cleanup_host_mitmproxy(name):
     if shutil.which("podman"):
         subprocess.run(["podman", "rm", "--force", unit_name], check=False,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    shutil.rmtree(Path.home() / ".local" / "share" / "nixvm" / name / "mitmproxy",
+    shutil.rmtree(Path.home() / ".local" / "share" / "nixvm" / "shared" / "mitmproxy",
                   ignore_errors=True)
-    (ROOT / ".runtime" / name / "mitmproxy-ca-cert.pem").unlink(missing_ok=True)
-    print(f"Stopped the managed mitmproxy service for {name}; its Podman CA volume was retained.")
+    (ROOT / ".runtime" / "shared" / "mitmproxy-ca-cert.pem").unlink(missing_ok=True)
+    print("Stopped the shared managed mitmproxy service; its Podman CA volume was retained.")
 
 
 def run_firewall_tests(extra):
@@ -1036,7 +1078,7 @@ def bootstrap():
     copy_workstation_closure(c)
     flake = "path:" + config["repoPath"] + "/nix#nixvm"
     guest_ca = config["repoPath"].rstrip("/") + "/nix/machines/mitmproxy-ca.pem"
-    local_ca = ROOT / ".runtime" / c["name"] / "mitmproxy-ca-cert.pem"
+    local_ca = ROOT / ".runtime" / "shared" / "mitmproxy-ca-cert.pem"
     bundle = f"/tmp/nixvm-mitmproxy-ca-{os.getpid()}.pem" if local_ca.is_file() else None
     run_nixos_rebuild(c, flake, config,
                       ca_bundle=bundle if bundle else None,
@@ -1261,7 +1303,7 @@ def update_config(extra=()):
         staged_nix = Path(tmp) / "nix"
         shutil.copytree(ROOT / "nix", staged_nix,
                         ignore=shutil.ignore_patterns("current.json", "result*"))
-        ca_certificate = ROOT / ".runtime" / c["name"] / "mitmproxy-ca-cert.pem"
+        ca_certificate = ROOT / ".runtime" / "shared" / "mitmproxy-ca-cert.pem"
         if ca_certificate.is_file():
             shutil.copyfile(ca_certificate, staged_nix / "machines" / "mitmproxy-ca.pem")
         (staged_nix / "machines/current.json").write_text(
@@ -1286,7 +1328,7 @@ def update_config(extra=()):
 
 def sync_guest_mitmproxy_ca(c):
     """Keep the managed proxy CA in the guest checkout for ordinary rebuilds."""
-    certificate = ROOT / ".runtime" / c["name"] / "mitmproxy-ca-cert.pem"
+    certificate = ROOT / ".runtime" / "shared" / "mitmproxy-ca-cert.pem"
     if not certificate.is_file():
         return
     target = c["guest_config"]["repoPath"].rstrip("/") + "/nix/machines/mitmproxy-ca.pem"
@@ -1484,7 +1526,7 @@ def main():
                         "usb-attach", "usb-detach", "rebuild", "rollback", "password", "reboot", "start", "stop",
                         "reprovision", "import-public-keys", "gpu-check", "token-check", "update-config", "ip"])
     parser.add_argument("--name", default=os.environ.get("NIXVM_PROFILE", "nixvm"),
-                        help="VM name for remove-image (defaults to the selected variable-file basename)")
+                        help="VM name for remove-image (defaults to nixvm)")
     parser.add_argument("--device", help="YubiKey USB port name or serial; mandatory if selection is ambiguous")
     parser.add_argument("--timeout", type=int, default=120, help="Seconds to wait for start/stop transitions (default: 120)")
     parser.add_argument("--force", action="store_true", help="Abruptly destroy the VM instead of graceful shutdown (stop only)")

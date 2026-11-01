@@ -1,5 +1,5 @@
 variable "name" {
-  description = "VM name and hostname. The nixvm wrapper sets this from the selected variable-file basename."
+  description = "VM name and hostname. The nixvm wrapper sets this from -n/--name."
   type        = string
   default     = "nixvm"
   validation {
@@ -91,28 +91,28 @@ variable "uefi" {
   }
 }
 variable "vm_network_cidr" {
-  description = "IPv4 subnet for this VM's dedicated libvirt NAT network."
+  description = "Optional IPv4 subnet for this VM's dedicated libvirt NAT network. Defaults to a stable VM-specific subnet."
   type        = string
-  default     = "192.168.124.0/24"
+  default     = null
   validation {
-    condition = can(cidrnetmask(var.vm_network_cidr)) && try(
+    condition = var.vm_network_cidr == null || (can(cidrnetmask(var.vm_network_cidr)) && try(
       tonumber(split("/", var.vm_network_cidr)[1]) >= 16 &&
       tonumber(split("/", var.vm_network_cidr)[1]) <= 30,
       false
-    )
+    ))
     error_message = "vm_network_cidr must be a valid IPv4 CIDR with a prefix from /16 through /30."
   }
 }
 variable "firewall_test_network_cidr" {
-  description = "IPv4 test subnet configured on the VM's NAT bridge. Its gateway must remain in internal_network_deny."
+  description = "Optional IPv4 firewall test subnet. Defaults to a stable VM-specific subnet."
   type        = string
-  default     = "192.168.123.0/24"
+  default     = null
   validation {
-    condition = can(cidrnetmask(var.firewall_test_network_cidr)) && try(
+    condition = var.firewall_test_network_cidr == null || (can(cidrnetmask(var.firewall_test_network_cidr)) && try(
       tonumber(split("/", var.firewall_test_network_cidr)[1]) >= 16 &&
       tonumber(split("/", var.firewall_test_network_cidr)[1]) <= 30,
       false
-    )
+    ))
     error_message = "firewall_test_network_cidr must be a valid IPv4 CIDR with a prefix from /16 through /30."
   }
 }

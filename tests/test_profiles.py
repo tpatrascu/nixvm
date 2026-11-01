@@ -23,12 +23,10 @@ class ProfileSelectionTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def test_variable_file_stem_selects_profile(self):
-        profile_file = self.infra / "workvm.tfvars"
-        profile_file.touch()
-        with patch.object(nixvm_wrapper, "ROOT", self.root), \
-             patch.object(nixvm_wrapper, "INFRA", self.infra):
-            self.assertEqual(nixvm_wrapper.profile_name([f"-var-file={profile_file}"]), "workvm")
+    def test_vm_name_selector_is_removed_from_command_arguments(self):
+        name, command = nixvm_wrapper.extract_name(["up", "-n", "workvm", "-no-color"])
+        self.assertEqual(name, "workvm")
+        self.assertEqual(command, ["up", "-no-color"])
 
     def test_variable_arguments_force_name_from_selected_file(self):
         profile_file = self.infra / "workvm.tfvars"
@@ -38,16 +36,13 @@ class ProfileSelectionTests(unittest.TestCase):
              patch.dict(os.environ, {"NIXVM_VAR_FILE": ""}):
             variables, operation = nixvm_wrapper.split_arguments([
                 "-var-file", str(profile_file), "-lock-timeout=10s"
-            ])
+            ], "workvm")
         self.assertEqual(variables, [f"-var-file={profile_file}", "-var=name=workvm"])
         self.assertEqual(operation, ["-lock-timeout=10s"])
 
-    def test_invalid_variable_file_stem_is_rejected(self):
-        profile_file = self.infra / "Work VM.tfvars"
-        with patch.object(nixvm_wrapper, "ROOT", self.root), \
-             patch.object(nixvm_wrapper, "INFRA", self.infra):
-            with self.assertRaisesRegex(ValueError, "lowercase VM name"):
-                nixvm_wrapper.profile_name([f"-var-file={profile_file}"])
+    def test_invalid_vm_name_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "VM names must be lowercase"):
+            nixvm_wrapper.valid_vm_name("Work VM")
 
     def test_existing_profile_workspace_is_selected(self):
         with patch.dict(os.environ, {"TF_WORKSPACE": "default", "NIXVM_PROFILE": "default"}), \
@@ -65,7 +60,6 @@ class ProfileSelectionTests(unittest.TestCase):
 
     def test_up_auto_approves_tofu_apply(self):
         with patch.dict(os.environ, {}, clear=False), \
-             patch.object(nixvm_wrapper, "profile_name", return_value="nixvm"), \
              patch.object(nixvm_wrapper, "ensure_workspace"), \
              patch.object(nixvm_wrapper, "split_arguments", return_value=(
                  ["-var=name=nixvm"], ["-lock-timeout=30s"]
@@ -82,7 +76,6 @@ class ProfileSelectionTests(unittest.TestCase):
 
     def test_up_does_not_duplicate_explicit_auto_approve(self):
         with patch.dict(os.environ, {}, clear=False), \
-             patch.object(nixvm_wrapper, "profile_name", return_value="nixvm"), \
              patch.object(nixvm_wrapper, "ensure_workspace"), \
              patch.object(nixvm_wrapper, "split_arguments", return_value=(
                  ["-var=name=nixvm"], ["-auto-approve"]

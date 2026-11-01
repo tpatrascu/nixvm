@@ -16,7 +16,7 @@ INTERNAL = ROOT / "scripts" / "nixvm.py"
 
 
 def usage():
-    print("""Usage: nixvm <command> [options]
+    print("""Usage: nixvm [-n|--name VM] <command> [options]
 
 VM lifecycle:
   up | apply [tofu options]  Prepare host NFS/proxy, apply VM, activate proxy policy, test firewall
@@ -39,11 +39,11 @@ Host setup:
   nfs setup [var options]    Confirm and configure host NFS exports
   nfs cleanup [var options]  Confirm removal of this VM's managed exports
   mitmproxy password         Print the selected VM's mitmweb UI password
-  image remove [--name NAME] Remove generated image and workstation build cache
+  image remove              Remove this VM's image and workstation build cache
   firewall-test [var options] Check the managed firewall network and policy
 
-Variable files default to infrastructure/nixvm.tfvars when it exists. Pass
--var-file=PATH or set NIXVM_VAR_FILE to select another file.""")
+VM name defaults to nixvm. The matching infrastructure/<name>.tfvars file is
+used when it exists. Pass -var-file=PATH or set NIXVM_VAR_FILE to choose another.""")
 
 
 def run(command, *, env=None, capture=False):
@@ -51,27 +51,30 @@ def run(command, *, env=None, capture=False):
                           stdout=subprocess.PIPE if capture else None)
 
 
-def selected_var_file(arguments=()):
-    for index, argument in enumerate(arguments):
-        if argument == "-var-file" and index + 1 < len(arguments):
-            return resolve_var_file(arguments[index + 1])
-        if argument.startswith("-var-file="):
-            return resolve_var_file(argument.split("=", 1)[1])
-    configured = os.environ.get("NIXVM_VAR_FILE")
-    return resolve_var_file(configured) if configured else INFRA / "nixvm.tfvars"
-
-
-def profile_name(arguments=()):
-    name = selected_var_file(arguments).name
-    if name.endswith(".tfvars.json"):
-        name = name[:-len(".tfvars.json")]
-    elif name.endswith(".tfvars"):
-        name = name[:-len(".tfvars")]
-    else:
-        raise ValueError("Select a variable file ending in .tfvars or .tfvars.json")
+def valid_vm_name(name):
     if not re.fullmatch(r"[a-z][a-z0-9-]{0,30}", name):
-        raise ValueError("The variable-file basename must be a lowercase VM name (letters, digits, hyphens).")
+        raise ValueError("VM names must be lowercase letters, digits, and hyphens, starting with a letter.")
     return name
+
+
+def extract_name(arguments):
+    name = "nixvm"
+    remaining = []
+    index = 0
+    while index < len(arguments):
+        arg = arguments[index]
+        if arg in ("-n", "--name"):
+            if index + 1 >= len(arguments):
+                raise ValueError(f"{arg} requires a VM name")
+            name = arguments[index + 1]
+            index += 2
+        elif arg.startswith("--name="):
+            name = arg.split("=", 1)[1]
+            index += 1
+        else:
+            remaining.append(arg)
+            index += 1
+    return valid_vm_name(name), remaining
 
 
 def ensure_workspace(name):
@@ -89,7 +92,7 @@ def ensure_workspace(name):
     os.environ["NIXVM_PROFILE"] = name
 
 
-def split_arguments(arguments):
+def split_arguments(arguments, name="nixvm"):
     """Separate OpenTofu variable flags from operation-specific flags."""
     variables = []
     operation = []
@@ -122,10 +125,10 @@ def split_arguments(arguments):
 
     if not explicit_file:
         configured = os.environ.get("NIXVM_VAR_FILE")
-        default = resolve_var_file(configured) if configured else INFRA / "nixvm.tfvars"
+        default = resolve_var_file(configured) if configured else INFRA / f"{name}.tfvars"
         if default.is_file():
             variables.insert(0, f"-var-file={default}")
-    variables.append(f"-var=name={profile_name(arguments)}")
+    variables.append(f"-var=name={name}")
     return variables, operation
 
 
@@ -229,10 +232,14 @@ def firewall_tests(variables):
 
 
 def main(arguments):
-    if not arguments or arguments[0] in ("-h", "--help", "help"):
+    if not arguments:
         usage()
         return 0
 
+    name, arguments = extract_name(arguments)
+    if not arguments or arguments[0] in ("-h", "--help", "help"):
+        usage()
+        return 0
     command, *extra = arguments
     commands = {"up", "apply", "u", "init", "plan", "destroy", "preflight", "firewall-test",
                 "nfs", "mitmproxy", "image", "reprovision", "ssh", "ip", "start", "s", "stop", "rebuild",
@@ -240,18 +247,15 @@ def main(arguments):
                 "gpu-check", "token-check", "import-public-keys", "update-config", "spice"}
     if command not in commands:
         raise ValueError(f"Unknown command: {command}. Run 'nixvm help' for usage.")
-    profile_args = extra if command in {"up", "apply", "u", "init", "plan", "destroy",
-                                         "preflight", "firewall-test", "nfs", "reprovision",
-                                         "update-config", "mitmproxy"} else ()
-    profile = profile_name(profile_args)
+    profile = name
     os.environ["TF_WORKSPACE"] = profile
     os.environ["NIXVM_PROFILE"] = profile
-    if command in {"init", "image"}:
+    if command == "init":
         pass
     elif command != "mitmproxy":
         ensure_workspace(profile)
     if command in ("up", "apply", "u"):
-        variables, operation = split_arguments(extra)
+        variables, operation = split_arguments(extra, profile)
         internal("setup-host-nfs", variables)
         internal("check-host-nfs", variables)
         internal("define-network-filter", variables)
@@ -266,30 +270,29 @@ def main(arguments):
         internal("setup-hostname")
         install_spice_shortcut(current_vm_name() or profile)
     elif command == "init":
-        _, operation = split_arguments(extra)
+        _, operation = split_arguments(extra, profile)
         env = os.environ.copy()
         env.pop("TF_WORKSPACE", None)
         run(["tofu", f"-chdir={INFRA}", "init", *operation], env=env)
         ensure_workspace(profile)
     elif command == "plan":
-        variables, operation = split_arguments(extra)
+        variables, operation = split_arguments(extra, profile)
         tofu("plan", [*variables, *operation])
     elif command == "destroy":
-        variables, operation = split_arguments(extra)
+        variables, operation = split_arguments(extra, profile)
         vm_name = current_vm_name()
         tofu("destroy", [*variables, *operation])
         if vm_name:
             # Keep .build/<profile> and its Nix closure for reuse if recreated.
             (ROOT / ".runtime" / vm_name / "known_hosts").unlink(missing_ok=True)
-            internal("cleanup-host-mitmproxy", ["--name", vm_name])
             internal("cleanup-hostname", ["--name", vm_name])
     elif command == "preflight":
-        variables, operation = split_arguments(extra)
+        variables, operation = split_arguments(extra, profile)
         if operation:
             raise ValueError("nixvm preflight accepts only -var-file and -var options")
         internal("preflight", variables)
     elif command == "firewall-test":
-        variables, operation = split_arguments(extra)
+        variables, operation = split_arguments(extra, profile)
         if operation:
             raise ValueError("nixvm firewall-test accepts only -var-file and -var options")
         firewall_tests(variables)
@@ -297,7 +300,7 @@ def main(arguments):
         if not extra or extra[0] not in ("setup", "cleanup"):
             raise ValueError("Use 'nixvm nfs setup' or 'nixvm nfs cleanup'")
         action, *options = extra
-        variables, operation = split_arguments(options)
+        variables, operation = split_arguments(options, profile)
         if operation:
             raise ValueError("nixvm nfs accepts only -var-file and -var options")
         if action == "cleanup":
@@ -306,19 +309,16 @@ def main(arguments):
             variables.append("-var=host_nfs_exports=[]")
         internal("setup-host-nfs", variables)
     elif command == "image":
-        if len(extra) < 1 or extra[0] != "remove":
-            raise ValueError("Use 'nixvm image remove [--name NAME]'")
-        image_args = extra[1:]
-        if "--name" not in image_args:
-            image_args += ["--name", profile]
-        internal("remove-image", image_args)
+        if len(extra) != 1 or extra[0] != "remove":
+            raise ValueError("Use 'nixvm [-n NAME] image remove'")
+        internal("remove-image", ["--name", profile])
     elif command == "mitmproxy":
         if not extra or extra[0] != "password":
             raise ValueError("Use 'nixvm mitmproxy password [-var-file=PATH]'")
-        _, operation = split_arguments(extra[1:])
+        _, operation = split_arguments(extra[1:], profile)
         if operation:
             raise ValueError("nixvm mitmproxy password accepts only -var-file and -var options")
-        password_file = (Path.home() / ".local" / "share" / "nixvm" / profile
+        password_file = (Path.home() / ".local" / "share" / "nixvm" / "shared"
                          / "mitmproxy" / "web_password")
         if not password_file.is_file():
             raise FileNotFoundError(
@@ -326,7 +326,7 @@ def main(arguments):
             )
         print(password_file.read_text(encoding="utf-8").strip())
     elif command == "reprovision":
-        variables, operation = split_arguments(extra)
+        variables, operation = split_arguments(extra, profile)
         internal("setup-host-nfs", variables)
         internal("check-host-nfs", variables)
         internal("define-network-filter", variables)
@@ -335,7 +335,7 @@ def main(arguments):
         tofu("apply", [*variables, "-replace=terraform_data.bootstrap", *operation])
         internal("update-config", variables)
     elif command == "update-config":
-        variables, operation = split_arguments(extra)
+        variables, operation = split_arguments(extra, profile)
         if operation:
             raise ValueError("nixvm update-config accepts only -var-file and -var options")
         internal("update-config", variables)
