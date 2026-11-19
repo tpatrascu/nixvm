@@ -87,6 +87,12 @@ from the VM name unless you set `mac_address`. Existing VMs must be destroyed
 from their original workspace before being recreated in the named workspace;
 no state migration is performed.
 
+CPU pinning is optional. Set `vcpu_pinning` to one host logical CPU ID per
+guest vCPU, in order, for example `vcpu_pinning = [2, 4, 6, 8]`. The IDs must
+be distinct and nonnegative; use `lscpu -e=CPU,CORE,SOCKET` to inspect the
+host's logical CPU layout. Leave the list empty (the default) to let libvirt
+schedule the VM's vCPUs normally.
+
 If a failed earlier apply left `nixvm` defined in libvirt but absent from
 `TF_WORKSPACE=nixvm tofu -chdir=infrastructure state list`, confirm it is shut
 off and remove only that stale domain

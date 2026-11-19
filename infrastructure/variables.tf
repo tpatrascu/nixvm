@@ -23,6 +23,19 @@ variable "vcpu" {
     error_message = "vcpu must be a positive integer."
   }
 }
+variable "vcpu_pinning" {
+  description = "Host logical CPU IDs to pin guest vCPUs to, in guest vCPU order. Leave empty to disable pinning."
+  type        = list(number)
+  default     = []
+  validation {
+    condition = length(var.vcpu_pinning) == 0 || (
+      length(var.vcpu_pinning) == var.vcpu &&
+      alltrue([for cpu in var.vcpu_pinning : cpu >= 0 && floor(cpu) == cpu]) &&
+      length(distinct(var.vcpu_pinning)) == length(var.vcpu_pinning)
+    )
+    error_message = "vcpu_pinning must be empty or contain one distinct nonnegative host logical CPU ID for each vCPU."
+  }
+}
 variable "memory_mib" {
   type    = number
   default = 8192

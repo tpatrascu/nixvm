@@ -326,7 +326,13 @@ resource "libvirt_domain" "vm" {
   running     = true
   autostart   = false
   cpu         = { mode = "host-passthrough" }
-  features    = { acpi = true, apic = {} }
+  cpu_tune = length(var.vcpu_pinning) > 0 ? {
+    vcpu_pin = [for index, cpu in var.vcpu_pinning : {
+      vcpu    = index
+      cpu_set = tostring(cpu)
+    }]
+  } : null
+  features = { acpi = true, apic = {} }
   os = {
     type            = "hvm"
     type_arch       = "x86_64"

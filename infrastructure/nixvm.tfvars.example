@@ -2,6 +2,9 @@
 vcpu       = 4
 memory_mib = 8192 # MiB
 disk_gib   = 80   # GiB
+# Optional: pin each guest vCPU to a distinct host logical CPU, in vCPU order.
+# Find host logical CPU IDs with `lscpu -e=CPU,CORE,SOCKET`.
+# vcpu_pinning = [2, 4, 6, 8]
 
 ssh_public_keys = ["ssh-ed25519 REPLACE_WITH_YOUR_PUBLIC_KEY"]
 # Add additional host keys as separate list entries; the guest authorizes all of them.
