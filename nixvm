@@ -2,12 +2,17 @@
 """User-facing commands for the local NixOS VM workflow."""
 
 import json
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import subprocess
 import sys
+import urllib.error
+import urllib.request
+import webbrowser
 
 
 ROOT = Path(__file__).resolve().parent
@@ -39,8 +44,9 @@ VM lifecycle:
 Host setup:
   nfs setup [var options]    Confirm and configure host NFS exports
   nfs cleanup [var options]  Confirm removal of this VM's managed exports
-  mitmproxy password         Print the selected VM's mitmweb UI password
-  mitmproxy cleanup          Stop and remove the host mitmproxy setup
+  mitm password              Print the shared mitmweb UI password
+  mitm open | o              Open mitmweb and log in automatically
+  mitm cleanup               Stop and remove the host mitmproxy setup
   image remove              Remove this VM's image and workstation build cache
   cache clean [--delete-old] Collect garbage from the host Nix store
   firewall-test [var options] Check the managed firewall network and policy
@@ -52,6 +58,58 @@ used when it exists. Pass -var-file=PATH or set NIXVM_VAR_FILE to choose another
 def run(command, *, env=None, capture=False):
     return subprocess.run(command, cwd=ROOT, check=True, env=env, text=True,
                           stdout=subprocess.PIPE if capture else None)
+
+
+def open_mitmproxy_web(password):
+    web_url = "http://127.0.0.1:8081/"
+    result = {"authenticated": False, "error": None}
+
+    class LoginBootstrapHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path != f"/{bootstrap_token}":
+                self.send_error(404)
+                return
+            request = urllib.request.Request(
+                web_url, headers={"Authorization": f"Bearer {password}"}
+            )
+            try:
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                with opener.open(request, timeout=5) as response:
+                    cookies = response.headers.get_all("Set-Cookie", [])
+                    if response.status != 200 or not cookies:
+                        raise ValueError("mitmweb did not return an authentication cookie")
+            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError) as error:
+                result["error"] = str(error)
+                self.send_error(502, "Could not authenticate with mitmweb")
+                return
+
+            self.send_response(302)
+            for cookie in cookies:
+                self.send_header("Set-Cookie", cookie)
+            self.send_header("Location", web_url)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.end_headers()
+            result["authenticated"] = True
+
+        def log_message(self, format, *args):
+            return
+
+    server = HTTPServer(("127.0.0.1", 0), LoginBootstrapHandler)
+    server.timeout = 45
+    bootstrap_token = secrets.token_urlsafe(24)
+    bootstrap_url = f"http://127.0.0.1:{server.server_address[1]}/{bootstrap_token}"
+    try:
+        if not webbrowser.open(bootstrap_url, new=2):
+            raise ValueError("Could not find a browser to open the mitmweb interface")
+        server.handle_request()
+    finally:
+        server.server_close()
+
+    if result["error"]:
+        raise ValueError(f"Could not log in to mitmweb: {result['error']}")
+    if not result["authenticated"]:
+        raise ValueError("The browser did not reach the mitmweb login helper")
 
 
 def valid_vm_name(name):
@@ -245,7 +303,7 @@ def main(arguments):
         return 0
     command, *extra = arguments
     commands = {"up", "apply", "u", "init", "plan", "destroy", "preflight", "firewall-test",
-                "nfs", "mitmproxy", "image", "cache", "reprovision", "ssh", "ip", "start", "s", "stop", "rebuild",
+                "nfs", "mitm", "image", "cache", "reprovision", "ssh", "ip", "start", "s", "stop", "rebuild",
                 "rollback", "reboot", "password", "forward", "usb-attach", "usb-detach",
                 "gpu-check", "token-check", "import-public-keys", "update-config", "copy-cas", "spice"}
     if command not in commands:
@@ -255,7 +313,7 @@ def main(arguments):
     os.environ["NIXVM_PROFILE"] = profile
     if command == "init":
         pass
-    elif command not in {"mitmproxy", "cache"}:
+    elif command not in {"mitm", "cache"}:
         ensure_workspace(profile)
     if command in ("up", "apply", "u"):
         variables, operation = split_arguments(extra, profile)
@@ -330,24 +388,31 @@ def main(arguments):
         if len(extra) == 2:
             command_args.append("--delete-old")
         run(command_args)
-    elif command == "mitmproxy":
-        if not extra or extra[0] not in ("password", "cleanup"):
-            raise ValueError("Use 'nixvm mitmproxy password [-var-file=PATH]' or 'nixvm mitmproxy cleanup'")
-        if extra[0] == "cleanup":
+    elif command == "mitm":
+        if not extra or extra[0] not in ("password", "open", "o", "cleanup"):
+            raise ValueError("Use 'nixvm mitm password', 'nixvm mitm open' (or 'o'), or 'nixvm mitm cleanup'")
+        action = "open" if extra[0] == "o" else extra[0]
+        if action == "cleanup":
             if len(extra) != 1:
-                raise ValueError("nixvm mitmproxy cleanup accepts no options")
+                raise ValueError("nixvm mitm cleanup accepts no options")
             internal("cleanup-host-mitmproxy", ["--name", profile])
             return 0
-        _, operation = split_arguments(extra[1:], profile)
+        if action == "open" and len(extra) != 1:
+            raise ValueError("nixvm mitm open accepts no options")
+        _, operation = split_arguments(extra[1:], profile) if action == "password" else ([], [])
         if operation:
-            raise ValueError("nixvm mitmproxy password accepts only -var-file and -var options")
+            raise ValueError("nixvm mitm password accepts only -var-file and -var options")
         password_file = (Path.home() / ".local" / "share" / "nixvm" / "shared"
                          / "mitmproxy" / "web_password")
         if not password_file.is_file():
             raise FileNotFoundError(
-                f"mitmproxy password not found at {password_file}; run 'nixvm up' first"
+                f"mitmweb password not found at {password_file}; enable mitmproxy and run 'nixvm up' first"
             )
-        print(password_file.read_text(encoding="utf-8").strip())
+        password = password_file.read_text(encoding="utf-8").strip()
+        if action == "password":
+            print(password)
+        else:
+            open_mitmproxy_web(password)
     elif command == "reprovision":
         variables, operation = split_arguments(extra, profile)
         internal("setup-host-nfs", variables)

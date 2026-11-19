@@ -203,10 +203,18 @@ rootless pasta network and publishes proxy port 8080 on host interfaces so
 each VM can reach it through its own network gateway. The mitmweb traffic
 viewer is bound to host loopback at
 [http://127.0.0.1:8081](http://127.0.0.1:8081).
-Get the shared UI password with:
+Open the UI and log in automatically with:
 
 ```sh
-./nixvm mitmproxy password
+./nixvm mitm open
+```
+
+This transfers the password directly to the local mitmweb service to establish
+its authentication cookie; the password is not placed in the browser URL. To
+print the shared UI password manually, run:
+
+```sh
+./nixvm mitm password
 ```
 
 The shared password is stored with mode `0600` in
@@ -265,7 +273,7 @@ To stop and remove the host-side mitmproxy service, its update timer, and its
 generated policy, password, and public CA copy, run:
 
 ```sh
-./nixvm mitmproxy cleanup
+./nixvm mitm cleanup
 ```
 
 The Podman volume containing the proxy CA is retained so a later `nixvm up`
@@ -395,7 +403,10 @@ Common commands:
 | `./nixvm stop --force` | Abruptly power off a stuck VM; unsaved guest writes may be lost |
 | `./nixvm reprovision` | Explicit bootstrap retry |
 | `./nixvm nfs setup` / `./nixvm nfs cleanup` | Configure host exports / remove managed exports after confirmation |
-| `./nixvm mitmproxy cleanup` | Stop and remove the host mitmproxy service and generated setup files; retain its CA volume |
+| `./nixvm mitm open` | Open the host mitmweb UI and log in automatically |
+| `./nixvm mitm o` | Alias for `./nixvm mitm open` |
+| `./nixvm mitm password` | Print the shared mitmweb UI password |
+| `./nixvm mitm cleanup` | Stop and remove the host mitmproxy service and generated setup files; retain its CA volume |
 | `./nixvm image remove` | Remove the selected VM's image and workstation build cache |
 | `./nixvm -n workvm image remove` | Remove another VM's image and workstation build cache |
 | `./nixvm cache clean` | Collect unreachable paths from the host Nix store; keep profile generations |
