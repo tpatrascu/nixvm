@@ -37,15 +37,17 @@ class NixvmFirewallTest(unittest.TestCase):
         self.access = {
             "host": {
                 "ips": ["192.168.124.1"],
-                "ports": [53, 2049],
+                "tcp_ports": [53, 2049],
+                "udp_ports": [53],
                 "all_ports": False,
             },
             "internal": {
                 "deny_cidrs": ["10.0.0.0/8", "192.168.0.0/16", "fc00::/7"],
+                "blocked_ports": [80, 443, 8443, 8080, 8081, 8082],
                 "allow": [
-                    {"ip": "10.0.0.25", "ports": [443], "all_ports": False},
-                    {"ip": "10.0.0.26", "ports": [], "all_ports": True},
-                    {"ip": "fc00::25", "ports": [22], "all_ports": False},
+                    {"ip": "10.0.0.25", "tcp_ports": [443], "udp_ports": [53], "all_ports": False},
+                    {"ip": "10.0.0.26", "tcp_ports": [], "udp_ports": [], "all_ports": True},
+                    {"ip": "fc00::25", "tcp_ports": [22], "udp_ports": [], "all_ports": False},
                 ],
             },
         }
@@ -72,7 +74,7 @@ class NixvmFirewallTest(unittest.TestCase):
                          if rule[0].tag == "mac" and rule[0].get("protocolid") == "arp")
         self.assertEqual(arp_allow.get("direction"), "inout")
 
-    def test_host_ports_are_allowed_per_ip_then_other_host_traffic_is_dropped(self):
+    def test_host_tcp_and_udp_ports_are_allowed_independently_then_other_traffic_dropped(self):
         accepts = [rule for rule in self.rules(action="accept", priority=100)
                    if rule[0].tag in {"tcp", "udp"}]
         destinations = {
@@ -82,7 +84,7 @@ class NixvmFirewallTest(unittest.TestCase):
         }
         self.assertEqual(destinations, {
             ("53", "tcp"), ("53", "udp"),
-            ("2049", "tcp"), ("2049", "udp"),
+            ("2049", "tcp"),
         })
         host_drop = next(
             rule for rule in self.rules(action="drop", priority=800, element="all")
@@ -93,9 +95,10 @@ class NixvmFirewallTest(unittest.TestCase):
 
     def test_gateway_dns_is_allowed_even_when_host_access_ports_are_empty(self):
         access = json.loads(json.dumps(self.access))
-        access["host"]["ports"] = []
+        access["host"]["tcp_ports"] = []
+        access["host"]["udp_ports"] = []
         access["internal"]["allow"].append({
-            "ip": "192.168.124.1", "ports": [53], "protocols": ["tcp", "udp"],
+            "ip": "192.168.124.1", "tcp_ports": [53], "udp_ports": [53],
             "all_ports": False, "managed_allow": True,
         })
         policy = nixvm.build_network_filter("nixvm-access", access)
@@ -121,14 +124,14 @@ class NixvmFirewallTest(unittest.TestCase):
             for rule in policy.findall("rule")
         ), "internal-network CIDR protection must remain active")
 
-    def test_internal_allow_rules_are_scoped_to_each_ip_and_tcp_udp_port(self):
+    def test_internal_allow_rules_control_tcp_and_udp_ports_independently(self):
         ipv4 = [
             rule[0]
             for rule in self.rules(action="accept", priority=100)
             if rule[0].tag in {"tcp", "udp"} and rule[0].get("dstipaddr") == "10.0.0.25"
         ]
         self.assertEqual({(item.get("dstportstart"), item.tag) for item in ipv4},
-                         {("443", "tcp"), ("443", "udp")})
+                         {("443", "tcp"), ("53", "udp")})
         ipv6 = [
             rule[0]
             for rule in self.rules(action="accept", priority=100)
@@ -136,7 +139,14 @@ class NixvmFirewallTest(unittest.TestCase):
             and rule[0].get("dstipaddr") == "fc00::25"
         ]
         self.assertEqual({(item.get("dstportstart"), item.get("protocol")) for item in ipv6},
-                         {("22", "tcp"), ("22", "udp")})
+                         {("22", "tcp")})
+        blocked_port_exceptions = [
+            rule[0]
+            for rule in self.rules(action="accept", priority=85)
+            if rule[0].get("dstipaddr") == "10.0.0.25"
+        ]
+        self.assertEqual({(item.get("dstportstart"), item.tag) for item in blocked_port_exceptions},
+                         {("443", "tcp")})
 
     def test_all_ports_rule_has_no_protocol_or_port_restriction(self):
         rule = next(
@@ -222,7 +232,8 @@ class NixvmFirewallTest(unittest.TestCase):
         if config:
             self.assertEqual(gateway_allows, [{
                 "ip": gateway.compressed,
-                "ports": [network["allow_test_port"]],
+                "tcp_ports": [network["allow_test_port"]],
+                "udp_ports": [network["allow_test_port"]],
                 "all_ports": False,
             }], "only the temporary connectivity-test port may reach the test gateway")
         else:
@@ -236,14 +247,15 @@ class NixvmFirewallTest(unittest.TestCase):
         self.assertTrue(any(gateway in cidr for cidr in denied),
                         f"test network gateway {gateway} is not in an internal deny CIDR")
 
-    def test_connectivity_probe_exception_allows_only_its_configured_port(self):
+    def test_connectivity_probe_exception_allows_only_its_configured_tcp_port(self):
         gateway = "192.168.123.1"
         allow_port = 49231
         access = {
-            "host": {"ips": [], "ports": [], "all_ports": False},
+            "host": {"ips": [], "tcp_ports": [], "udp_ports": [], "all_ports": False},
             "internal": {
                 "deny_cidrs": ["192.168.0.0/16"],
-                "allow": [{"ip": gateway, "ports": [allow_port], "all_ports": False}],
+                "allow": [{"ip": gateway, "tcp_ports": [allow_port],
+                           "udp_ports": [], "all_ports": False}],
             },
         }
         rules = nixvm.build_network_filter("nixvm-test-access", access).findall("rule")
@@ -251,8 +263,7 @@ class NixvmFirewallTest(unittest.TestCase):
                    if rule.get("action") == "accept" and rule[0].tag in {"tcp", "udp"}
                    and rule[0].get("dstipaddr") == gateway]
         self.assertEqual({(rule.get("dstportstart"), rule.tag)
-                          for rule in allowed}, {(str(allow_port), "tcp"),
-                                                 (str(allow_port), "udp")})
+                          for rule in allowed}, {(str(allow_port), "tcp")})
         self.assertTrue(any(rule.get("action") == "drop"
                             and rule.find("all") is not None
                             and rule.find("all").get("dstipaddr") == "192.168.0.0"
@@ -292,10 +303,11 @@ class NixvmFirewallTest(unittest.TestCase):
 
     def test_internal_allow_ip_must_be_in_a_denied_cidr(self):
         access = {
-            "host": {"ips": [], "ports": [], "all_ports": False},
+            "host": {"ips": [], "tcp_ports": [], "udp_ports": [], "all_ports": False},
             "internal": {
                 "deny_cidrs": ["10.0.0.0/8"],
-                "allow": [{"ip": "192.168.1.25", "ports": [443], "all_ports": False}],
+                "allow": [{"ip": "192.168.1.25", "tcp_ports": [443],
+                           "udp_ports": [], "all_ports": False}],
             },
         }
         with self.assertRaisesRegex(ValueError, "outside internal_network_deny"):
@@ -303,11 +315,11 @@ class NixvmFirewallTest(unittest.TestCase):
 
     def test_managed_external_nfs_allow_can_be_outside_denied_cidrs(self):
         access = {
-            "host": {"ips": [], "ports": [], "all_ports": False},
+            "host": {"ips": [], "tcp_ports": [], "udp_ports": [], "all_ports": False},
             "internal": {
                 "deny_cidrs": ["10.0.0.0/8"],
                 "allow": [{
-                    "ip": "198.51.100.25", "ports": [2049], "protocols": ["tcp"],
+                    "ip": "198.51.100.25", "tcp_ports": [2049], "udp_ports": [],
                     "all_ports": False, "managed_allow": True,
                 }],
             },
@@ -322,10 +334,11 @@ class NixvmFirewallTest(unittest.TestCase):
 
     def test_host_and_internal_allow_lists_cannot_overlap(self):
         access = {
-            "host": {"ips": ["10.0.0.25"], "ports": [53], "all_ports": False},
+            "host": {"ips": ["10.0.0.25"], "tcp_ports": [53], "udp_ports": [], "all_ports": False},
             "internal": {
                 "deny_cidrs": ["10.0.0.0/8"],
-                "allow": [{"ip": "10.0.0.25", "ports": [443], "all_ports": False}],
+                "allow": [{"ip": "10.0.0.25", "tcp_ports": [443],
+                           "udp_ports": [], "all_ports": False}],
             },
         }
         with self.assertRaisesRegex(ValueError, "only in host_access"):

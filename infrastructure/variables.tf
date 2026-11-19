@@ -129,15 +129,17 @@ variable "mac_address" {
   }
 }
 variable "host_access" {
-  description = "Guest-initiated access to host IPs. Ports apply to TCP and UDP; port 8080 to the managed VM gateway proxy is always allowed."
+  description = "Guest-initiated access to host IPs, with separate TCP and UDP destination ports. Port 8080 to the managed VM gateway proxy is always allowed."
   type = object({
     ips       = list(string)
-    ports     = list(number)
+    tcp_ports = list(number)
+    udp_ports = list(number)
     all_ports = bool
   })
   default = {
     ips       = []
-    ports     = [53]
+    tcp_ports = [53]
+    udp_ports = [53]
     all_ports = false
   }
   validation {
@@ -147,18 +149,24 @@ variable "host_access" {
     error_message = "host_access.ips must contain individual IPv4 or IPv6 addresses."
   }
   validation {
-    condition     = alltrue([for port in var.host_access.ports : port >= 1 && port <= 65535 && floor(port) == port])
-    error_message = "host_access.ports must contain integer port numbers from 1 to 65535."
+    condition = alltrue(concat(
+      [for port in var.host_access.tcp_ports : port >= 1 && port <= 65535 && floor(port) == port],
+      [for port in var.host_access.udp_ports : port >= 1 && port <= 65535 && floor(port) == port]
+    ))
+    error_message = "host_access TCP and UDP ports must be integers from 1 to 65535."
   }
   validation {
-    condition     = !var.host_access.all_ports || length(var.host_access.ports) == 0
-    error_message = "Set host_access.ports to an empty list when host_access.all_ports is true."
+    condition = !var.host_access.all_ports || (
+      length(var.host_access.tcp_ports) == 0 && length(var.host_access.udp_ports) == 0
+    )
+    error_message = "Set host_access.tcp_ports and host_access.udp_ports to empty lists when all_ports is true."
   }
   validation {
     condition = alltrue([
-      for port in var.host_access.ports : !contains([80, 443, 8443, 8080, 8081, 8082], port)
+      for port in concat(var.host_access.tcp_ports, var.host_access.udp_ports) :
+      !var.mitmproxy_enabled || !contains(var.mitm_proxy_blocked_http_ports, port)
     ])
-    error_message = "host_access.ports may not include blocked web ports; the proxy's TCP/8080 exception is managed separately."
+    error_message = "host_access TCP/UDP ports cannot include ports blocked for direct HTTP access while mitmproxy is enabled."
   }
 }
 variable "host_firewall" {
@@ -175,13 +183,34 @@ variable "mitmproxy_enabled" {
   type        = bool
   default     = false
 }
+variable "mitm_proxy_blocked_http_ports" {
+  description = "Ports for direct http access to be blocked"
+  type        = list(number)
+  default     = [80, 443, 8443, 8080, 8081, 8082, 9000, 9001, 9090]
+  validation {
+    condition = alltrue([
+      for port in var.mitm_proxy_blocked_http_ports :
+      port >= 1 && port <= 65535 && floor(port) == port
+    ])
+    error_message = "mitm_proxy_blocked_http_ports must contain integer port numbers from 1 to 65535."
+  }
+  validation {
+    condition     = length(distinct(var.mitm_proxy_blocked_http_ports)) == length(var.mitm_proxy_blocked_http_ports)
+    error_message = "mitm_proxy_blocked_http_ports must not contain duplicate ports."
+  }
+}
 variable "mitmproxy_policy" {
-  description = "Host Podman mitmproxy image and HTTPS hostname policy. Empty inspect_domains means TLS is passed through without decryption."
+  description = "Host Podman mitmproxy image, HTTPS hostname policy, and exact internal host exceptions. Empty inspect_domains means TLS is passed through without decryption."
   type = object({
     image           = optional(string, "docker.io/mitmproxy/mitmproxy:latest")
     inspect_domains = optional(list(string), [])
     blocked_domains = optional(list(string), [])
     allowed_domains = optional(list(string), [])
+    allowed_internal_hosts = optional(list(object({
+      hostname = string
+      ips      = list(string)
+      ports    = optional(list(number), [443])
+    })), [])
   })
   default = {}
   validation {
@@ -197,6 +226,21 @@ variable "mitmproxy_policy" {
       )]
     ))
     error_message = "mitmproxy domain entries must be hostnames, glob:<pattern>, or regex:<pattern>; regex patterns must be valid and contain no spaces or quotes."
+  }
+  validation {
+    condition = alltrue(concat(
+      [for rule in var.mitmproxy_policy.allowed_internal_hosts : (
+        can(regex("^([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\\.)*[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$", rule.hostname)) &&
+        length(rule.ips) > 0 &&
+        alltrue([for ip in rule.ips : can(cidrhost("${ip}/32", 0)) || can(cidrhost("${ip}/128", 0))]) &&
+        length(rule.ports) > 0 &&
+        alltrue([for port in rule.ports : port >= 1 && port <= 65535 && floor(port) == port])
+      )],
+      [length(distinct([
+        for rule in var.mitmproxy_policy.allowed_internal_hosts : lower(trimsuffix(rule.hostname, "."))
+      ])) == length(var.mitmproxy_policy.allowed_internal_hosts)]
+    ))
+    error_message = "Each allowed_internal_hosts entry must use a unique exact hostname, at least one IP literal, and one or more valid ports."
   }
 }
 variable "internal_network_deny" {
@@ -219,10 +263,11 @@ variable "internal_network_deny" {
   }
 }
 variable "internal_network_allow" {
-  description = "Per-IP internal network allow rules. Ports apply to TCP and UDP; explicit ports may override the managed web-port blocks."
+  description = "Per-IP internal network allow rules with separate TCP and UDP ports; explicit ports may override the managed web-port blocks."
   type = list(object({
     ip        = string
-    ports     = list(number)
+    tcp_ports = list(number)
+    udp_ports = list(number)
     all_ports = bool
   }))
   default = []
@@ -235,16 +280,19 @@ variable "internal_network_allow" {
   validation {
     condition = alltrue(flatten([
       for rule in var.internal_network_allow : [
-        for port in rule.ports : port >= 1 && port <= 65535 && floor(port) == port
+        for port in concat(rule.tcp_ports, rule.udp_ports) :
+        port >= 1 && port <= 65535 && floor(port) == port
       ]
     ]))
-    error_message = "Each internal_network_allow rule's ports must be integers from 1 to 65535."
+    error_message = "Each internal_network_allow rule's TCP and UDP ports must be integers from 1 to 65535."
   }
   validation {
     condition = alltrue([
-      for rule in var.internal_network_allow : !rule.all_ports || length(rule.ports) == 0
+      for rule in var.internal_network_allow : !rule.all_ports || (
+        length(rule.tcp_ports) == 0 && length(rule.udp_ports) == 0
+      )
     ])
-    error_message = "Set an allow rule's ports to an empty list when all_ports is true."
+    error_message = "Set tcp_ports and udp_ports to empty lists when an allow rule's all_ports is true."
   }
   validation {
     condition = length(distinct([
@@ -320,6 +368,7 @@ variable "toolchains" {
     rust   = optional(bool, false)
     jdk    = optional(bool, false)
     garmin = optional(bool, false)
+    tcc    = optional(bool, false)
   })
   default = {}
 }
@@ -382,6 +431,15 @@ variable "default_browser" {
   validation {
     condition     = contains(["firefox", "chromium"], var.default_browser)
     error_message = "default_browser must be either \"firefox\" or \"chromium\"."
+  }
+}
+variable "default_coding_agent" {
+  description = "Default coding agent to pin in the GNOME dock. Selecting one also enables it in apps.coding_agents."
+  type        = string
+  default     = "none"
+  validation {
+    condition     = contains(["none", "omp", "codex", "chatgpt", "claudeCode", "opencode"], var.default_coding_agent)
+    error_message = "default_coding_agent must be \"none\", \"omp\", \"codex\", \"chatgpt\", \"claudeCode\", or \"opencode\"."
   }
 }
 variable "additional_nix_pkgs" {

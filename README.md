@@ -146,22 +146,24 @@ interface. It blocks guest-initiated traffic to the standard special-use,
 private, documentation, benchmarking, multicast, link-local, and reserved
 IPv4/IPv6 ranges unless explicitly allowed by the host configuration. With
 mitmproxy enabled, it also blocks guest egress to TCP and UDP destination ports
-80, 443, 8443, 8080, 8081, and 8082. The only web-proxy exception is TCP/8080
-to the host's managed mitmproxy listener on the VM gateway. With mitmproxy
-disabled, direct web egress is allowed. Host-initiated connections to the VM,
-including SSH, are not restricted.
+in `mitm_proxy_blocked_http_ports`, which defaults to `[80, 443, 8443, 8080,
+8081, 8082]`. The only web-proxy exception is TCP/8080 to the host's managed
+mitmproxy listener on the VM gateway. With mitmproxy disabled, direct web egress
+is allowed. Host-initiated connections to the VM, including SSH, are not
+restricted.
 
 Configure `host_access`, `internal_network_deny`, and `internal_network_allow` in
-`infrastructure/nixvm.tfvars`. `host_access` lists exact host IPs and allowed
-ports. DNS to the VM's libvirt gateway is always allowed by the VM policy.
+`infrastructure/nixvm.tfvars`. `host_access` lists exact host IPs and separate
+`tcp_ports` and `udp_ports` lists. DNS to the VM's libvirt gateway is always
+allowed by the VM policy.
 Enabled host services (gateway DNS, mitmproxy, and configured host NFS) also
 receive automatic exceptions in the internal-network filter, so they do not
 need duplicate `internal_network_allow` or `host_access` entries. The internal
 network deny list and per-IP allow rules are separate
 variables, so changing the allow rules preserves the default deny CIDRs. Each
-allow rule specifies one IP and its own allowed ports, over both TCP and UDP.
-For example, add `2049` under
-`host_access.ports` to let the VM reach a host's NFSv4 service. The
+internal allow rule specifies one IP and its own TCP and UDP destination ports.
+For example, add `2049` to `host_access.tcp_ports` to let the VM reach a host's
+NFSv4 service. The
 default `host_access` denies other guest-initiated access to the gateway;
 DNS and enabled service ports receive separate automatic exceptions.
 Set `host_firewall = "ufw"` to have `nixvm up` add persistent UFW allows from
@@ -170,11 +172,15 @@ this VM's subnet for gateway DNS (TCP and UDP 53), enabled mitmproxy (TCP
 the VM subnet and service destination. Set `host_firewall = "disabled"` to
 leave UFW unchanged; this is the default. The `ufw` choice requires UFW to be
 installed and does not enable UFW itself.
-Blocked web ports cannot be added to `host_access.ports`. An explicit port in
+Blocked web ports cannot be added to `host_access.tcp_ports` or
+`host_access.udp_ports`. An explicit TCP or UDP port in
 `internal_network_allow` overrides the global web-port block for that IP;
 `all_ports` still leaves those ports blocked. Add any other host IPs the VM
 could reach to `host_access.ips` so their access is limited to the configured
-ports.
+TCP and UDP ports.
+Set `mitm_proxy_blocked_http_ports` to customize the TCP and UDP ports blocked
+for direct web access while mitmproxy is enabled. The default list is
+`[80, 443, 8443, 8080, 8081, 8082]`.
 
 ### Host-side HTTPS proxy
 
@@ -188,9 +194,11 @@ lingering for the current host user, and creates a Quadlet user service for the
 official mitmproxy container. It provisions the rootless Podman subordinate ID
 ranges when needed; if other rootless containers are running, stop them and
 rerun `up` so Podman can migrate to the new mappings safely. It pulls the
-configured image each time `up` runs;
-the default `docker.io/mitmproxy/mitmproxy:latest` tag tracks the latest stable
-release. One host service is shared by all VMs. The container uses Podman's
+configured image each time `up` runs and enables a persistent systemd user
+timer that checks this container for registry updates daily. When the image
+changes, Podman restarts the proxy service with the updated image. The default
+`docker.io/mitmproxy/mitmproxy:latest` tag tracks the latest stable release.
+One host service is shared by all VMs. The container uses Podman's
 rootless pasta network and publishes proxy port 8080 on host interfaces so
 each VM can reach it through its own network gateway. The mitmweb traffic
 viewer is bound to host loopback at
@@ -216,6 +224,9 @@ mitmproxy_policy = {
   inspect_domains = ["api.example.com", "glob:*.inspect.example.net"]
   blocked_domains = ["telemetry.example.net", "glob:*.ads.example.org"]
   allowed_domains = ["api.telemetry.example.net", "regex:trusted[0-9]+\\.example\\.com"]
+  allowed_internal_hosts = [
+    { hostname = "git.internal.example", ips = ["192.168.50.10"], ports = [443] },
+  ]
 }
 ```
 
@@ -225,7 +236,12 @@ ranges), or with `regex:` to match the whole hostname using a Python/RE2
 compatible regular expression. Glob and regex patterns match the normalized
 hostname as written; use `glob:*.example.com` to match subdomains. Entries in
 `allowed_domains` override matching `blocked_domains`; the internal CIDR deny
-policy still applies. `inspect_domains` selects HTTPS hosts whose TLS is
+policy still applies unless a hostname has an `allowed_internal_hosts` entry.
+Those entries match one exact hostname and require DNS to resolve only to one
+of the listed IPs on one of the listed ports (443 by default). They authorize
+the proxy's upstream connection only; the VM's direct LAN firewall deny stays
+in force. Add the hostname to `allowed_domains` too if a `blocked_domains`
+pattern matches it. `inspect_domains` selects HTTPS hosts whose TLS is
 decrypted; an empty list decrypts none. It accepts the same hostname, glob, and
 regex forms. The VM trusts the proxy's generated CA, which `nixvm up` copies
 into the guest configuration.
@@ -245,8 +261,8 @@ Certificate-pinned or mutual-TLS applications may need to be left out of
 `nixvm destroy`, the shared proxy stays available to other VMs. Its Podman
 volume is retained so the CA can be reused.
 
-To stop and remove the host-side mitmproxy service and its generated policy,
-password, and public CA copy, run:
+To stop and remove the host-side mitmproxy service, its update timer, and its
+generated policy, password, and public CA copy, run:
 
 ```sh
 ./nixvm mitmproxy cleanup
@@ -259,11 +275,13 @@ can reuse it.
 documentation, benchmarking, multicast, link-local, and reserved IPv4/IPv6
 ranges. If you override this list, include any defaults you still want denied
 along with organization-specific CIDRs. Each `internal_network_allow` entry
-allows selected ports to one IP within the denied ranges. The allow list
-defaults to empty, so internal network access remains denied. `all_ports = true`
+allows selected TCP and UDP ports independently to one IP within the denied
+ranges. The allow list defaults to empty, so internal network access remains
+denied. `all_ports = true`
 allows other ports to that IP while the managed web-port blocks remain in force.
-To permit a blocked port to an internal address, list it explicitly in that
-address's `ports` instead; for example, `{ ip = "10.0.0.25", ports = [443], all_ports = false }` permits HTTPS only to that IP.
+To permit a blocked port to an internal address, list it in that protocol's
+port list; for example, `{ ip = "10.0.0.25", tcp_ports = [443], udp_ports = [], all_ports = false }`
+permits TCP HTTPS only to that IP.
 OpenTofu reserves the test network gateway for a single probe port so the live
 test can demonstrate an allowed connection; the host listener exists only while
 the test is running.
@@ -343,6 +361,19 @@ does not overwrite the guest checkout. Use `./nixvm update-config` to stage
 other host NixOS changes the same way. Use `./nixvm rebuild` to build from the
 guest checkout instead.
 
+Host-specific CA certificates are opt-in. Run `./nixvm copy-cas` to copy
+administrator-installed public CA certificates from the host's local trust
+anchor directories into the guest and activate them in NixOS trust. The command
+recognizes Debian/Ubuntu's `/usr/local/share/ca-certificates`, Fedora/RHEL's
+`/etc/pki/ca-trust/source/anchors`, Arch's
+`/etc/ca-certificates/trust-source/anchors`, and openSUSE's
+`/etc/pki/trust/anchors`. Set `NIXVM_HOST_CA_DIRS` to a path-separated list of
+additional anchor directories for other host layouts. It imports certificate
+files (`.crt`, `.pem`, `.cer`, `.der`), not the host's generated public root
+bundle or private keys. The selected certificates are snapshotted under
+`.runtime/shared/host-ca`; later `update-config` and bootstrap rebuilds reuse
+that snapshot. Run `copy-cas` again to refresh or remove imported certificates.
+
 Common commands:
 
 | Command | Action |
@@ -356,6 +387,7 @@ Common commands:
 | `./nixvm ip` | Print the VM's current IPv4 address |
 | `./nixvm rebuild` / `./nixvm rollback` | Activate the guest checkout / previous generation |
 | `./nixvm update-config` | Stage and activate the host's NixOS config in the guest |
+| `./nixvm copy-cas` | Explicitly copy host custom CA certificates and activate guest trust |
 | `./nixvm password` / `./nixvm reboot` | Change the guest password / reboot |
 | `./nixvm start --wait-ssh` / `./nixvm s` | Start the VM and wait for SSH readiness |
 | `./nixvm stop` | Gracefully stop the guest and wait up to 120 seconds |
@@ -366,6 +398,11 @@ Common commands:
 | `./nixvm mitmproxy cleanup` | Stop and remove the host mitmproxy service and generated setup files; retain its CA volume |
 | `./nixvm image remove` | Remove the selected VM's image and workstation build cache |
 | `./nixvm -n workvm image remove` | Remove another VM's image and workstation build cache |
+| `./nixvm cache clean` | Collect unreachable paths from the host Nix store; keep profile generations |
+| `./nixvm cache clean --delete-old` | Delete old host profile generations, then collect garbage |
+
+The cache commands use `nix-collect-garbage` from the invoking user's `PATH`
+and run it with `sudo`, so the Nix profile must be loaded in that shell.
 
 The wrapper uses the selected VM's matching `infrastructure/<name>.tfvars`
 when present, with `nixvm` as the default. Choose a different variable file
@@ -421,10 +458,11 @@ My Pi, Codex CLI, ChatGPT desktop, Claude Code, and OpenCode). Optional app
 toggles default off, except Firefox, which defaults on for YubiKey-backed
 browsing. The selected defaults also enable Kitty. Chromium and Ghostty are
 disabled by default. Configure
-`default_editor`, `default_terminal`, `default_shell`, and `default_browser` to
-choose the corresponding defaults; selecting an editor, terminal, or browser
-enables it and pins its icon to the GNOME dock. Defaults are Neovim, Kitty,
-Zsh, and Firefox. Set `additional_nix_pkgs` to Nixpkgs attribute paths to add
+`default_editor`, `default_terminal`, `default_shell`, `default_browser`, and
+`default_coding_agent` to choose the corresponding defaults; selecting an
+editor, terminal, browser, or coding agent enables it and pins its icon to the
+GNOME dock. Defaults are Neovim, Kitty, Zsh, Firefox, and no coding agent. Set
+`additional_nix_pkgs` to Nixpkgs attribute paths to add
 packages to the guest, for example `"ripgrep"` or `"python3Packages.pip"`.
 Firefox and Chromium use DuckDuckGo as their default search engine.
 The default editor is Neovim; set `default_editor` to `"zed"` or `"vscode"`
@@ -442,12 +480,12 @@ supported host GNOME extensions are installed
 and enabled declaratively; Ubuntu Snap-specific extensions and Desktop Icons NG
 are not available in the pinned NixOS package set.
 
-Python, Node, LLVM, Rust, JDK, and Garmin toolchains are disabled by default.
+Python, Node, LLVM, Rust, JDK, Garmin, and TCC toolchains are disabled by default.
 Enable them with the `toolchains` object in the selected variable file. Python
 includes pip and uv; use `uv venv`/`python -m venv` for project packages. Node includes npm and
 Corepack. LLVM includes Clang, clangd, LLDB, CMake, Ninja, and pkg-config. Rust
-includes Cargo, rustfmt, Clippy, and rust-analyzer. Versions follow the
-committed lock file.
+includes Cargo, rustfmt, Clippy, and rust-analyzer. TCC installs the Tiny C
+Compiler. Versions follow the committed lock file.
 
 The `jdk` and `garmin` toolkit toggles both install the Nix JDK (`pkgs.jdk`).
 Garmin's

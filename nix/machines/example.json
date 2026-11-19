@@ -15,7 +15,7 @@
     ".config/zed/tasks.json": ".config/zed/tasks.json",
     ".config/zed/debug.json": ".config/zed/debug.json"
   },
-  "toolchains": {"python": false, "node": false, "llvm": false, "rust": false, "jdk": false, "garmin": false},
+  "toolchains": {"python": false, "node": false, "llvm": false, "rust": false, "jdk": false, "garmin": false, "tcc": false},
   "apps": {
     "editors": {"zed": false, "vscode": false},
     "terminals": {"kitty": true, "ghostty": false},
@@ -26,6 +26,7 @@
   "defaultTerminal": "kitty",
   "defaultShell": "zsh",
   "defaultBrowser": "firefox",
+  "defaultCodingAgent": "none",
   "additionalNixPkgs": [],
   "nfsMounts": [],
   "hostNfsExports": [],

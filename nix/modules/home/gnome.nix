@@ -13,6 +13,23 @@ let
     then "com.mitchellh.ghostty.desktop" else "kitty.desktop";
   editorDesktop = if defaultEditor == "zed" then [ "dev.zed.Zed.desktop" ]
     else if defaultEditor == "vscode" then [ "code.desktop" ] else [ ];
+  defaultCodingAgent = machine.defaultCodingAgent or "none";
+  codingAgentCommands = {
+    omp = "omp";
+    codex = "codex";
+    claudeCode = "claude";
+    opencode = "opencode";
+  };
+  codingAgentNames = {
+    omp = "Oh My Pi";
+    codex = "Codex CLI";
+    chatgpt = "ChatGPT";
+    claudeCode = "Claude Code";
+    opencode = "OpenCode";
+  };
+  codingAgentDesktop = if defaultCodingAgent == "none" then [ ]
+    else if defaultCodingAgent == "chatgpt" then [ "codex-desktop.desktop" ]
+    else [ "nixvm-coding-agent.desktop" ];
   mitmproxyEnabled =
     (machine.mitmproxy.enabled or false)
     && builtins.pathExists ../../machines/mitmproxy-ca.pem;
@@ -44,6 +61,17 @@ in {
       pkgs.gnomeExtensions.tiling-assistant
     ];
   };
+
+  xdg.desktopEntries = lib.optionalAttrs
+    (builtins.hasAttr defaultCodingAgent codingAgentCommands) {
+      nixvm-coding-agent = {
+        name = codingAgentNames.${defaultCodingAgent};
+        genericName = "Coding Agent";
+        exec = codingAgentCommands.${defaultCodingAgent};
+        terminal = true;
+        categories = [ "Development" ];
+      };
+    };
 
   programs.firefox = lib.mkIf firefoxEnabled {
     nativeMessagingHosts = [ pkgs.gnome-browser-connector ];
@@ -116,6 +144,7 @@ in {
     "org/gnome/shell" = {
       favorite-apps = [ browserDesktop terminalDesktop ]
         ++ editorDesktop
+        ++ codingAgentDesktop
         ++ [ "org.gnome.Nautilus.desktop" ];
     };
     "org/gnome/desktop/peripherals/mouse".speed = -0.5726495726495726;

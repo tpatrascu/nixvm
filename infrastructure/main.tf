@@ -19,24 +19,31 @@ locals {
       firefox  = var.apps.browsers.firefox || var.default_browser == "firefox"
       chromium = var.apps.browsers.chromium || var.default_browser == "chromium"
     })
-    coding_agents = var.apps.coding_agents
+    coding_agents = merge(var.apps.coding_agents, {
+      omp        = var.apps.coding_agents.omp || var.default_coding_agent == "omp"
+      codex      = var.apps.coding_agents.codex || var.default_coding_agent == "codex"
+      chatgpt    = var.apps.coding_agents.chatgpt || var.default_coding_agent == "chatgpt"
+      claudeCode = var.apps.coding_agents.claudeCode || var.default_coding_agent == "claudeCode"
+      opencode   = var.apps.coding_agents.opencode || var.default_coding_agent == "opencode"
+    })
   }
   guest_config = merge(var.guest, {
-    hostname          = var.name
-    sshPublicKeys     = var.ssh_public_keys
-    repoPath          = "/home/${var.guest.username}/${var.name}"
-    dotfilesPath      = "/home/${var.guest.username}/.dotfiles"
-    dotfilesLinks     = var.dotfiles_links
-    apps              = local.guest_apps
-    defaultEditor     = var.default_editor
-    defaultTerminal   = var.default_terminal
-    defaultShell      = var.default_shell
-    defaultBrowser    = var.default_browser
-    additionalNixPkgs = var.additional_nix_pkgs
-    toolchains        = var.toolchains
-    nfsMounts         = var.nfs_mounts
-    hostNfsExports    = var.host_nfs_exports
-    hostAddress       = coalesce(var.streaming.host_address, local.vm_network.gateway)
+    hostname           = var.name
+    sshPublicKeys      = var.ssh_public_keys
+    repoPath           = "/home/${var.guest.username}/${var.name}"
+    dotfilesPath       = "/home/${var.guest.username}/.dotfiles"
+    dotfilesLinks      = var.dotfiles_links
+    apps               = local.guest_apps
+    defaultEditor      = var.default_editor
+    defaultTerminal    = var.default_terminal
+    defaultShell       = var.default_shell
+    defaultBrowser     = var.default_browser
+    defaultCodingAgent = var.default_coding_agent
+    additionalNixPkgs  = var.additional_nix_pkgs
+    toolchains         = var.toolchains
+    nfsMounts          = var.nfs_mounts
+    hostNfsExports     = var.host_nfs_exports
+    hostAddress        = coalesce(var.streaming.host_address, local.vm_network.gateway)
     mitmproxy = {
       enabled  = var.mitmproxy_enabled
       proxyUrl = "http://${local.vm_network.gateway}:8080"
@@ -89,13 +96,14 @@ locals {
     host = {
       ips = distinct(concat([local.vm_network.gateway], var.host_access.ips,
       length(var.host_nfs_exports) > 0 ? [local.guest_config.hostAddress] : []))
-      ports = var.host_access.all_ports ? [] : distinct(concat(var.host_access.ports,
+      tcp_ports = var.host_access.all_ports ? [] : distinct(concat(var.host_access.tcp_ports,
       length(var.host_nfs_exports) > 0 ? [2049] : []))
+      udp_ports = var.host_access.all_ports ? [] : var.host_access.udp_ports
       all_ports = var.host_access.all_ports
     }
     internal = {
       deny_cidrs    = var.internal_network_deny
-      blocked_ports = var.mitmproxy_enabled ? [80, 443, 8443, 8080, 8081, 8082] : []
+      blocked_ports = var.mitmproxy_enabled ? var.mitm_proxy_blocked_http_ports : []
       # A short-lived host listener on the firewall test subnet gives the
       # guest connectivity probes one narrowly-scoped expected success case.
       # NFSv4 uses TCP/2049; allow each configured IP-literal remote NFS
@@ -107,52 +115,54 @@ locals {
             can(cidrhost("${mount.server}/32", 0)) || can(cidrhost("${mount.server}/128", 0))
             )]) : {
             ip            = ip
-            ports         = [2049]
-            protocols     = ["tcp"]
+            tcp_ports     = [2049]
+            udp_ports     = []
             all_ports     = false
             managed_allow = true
           }
         ],
         [{
           ip            = local.vm_network.gateway
-          ports         = [53]
-          protocols     = ["tcp", "udp"]
+          tcp_ports     = [53]
+          udp_ports     = [53]
           all_ports     = false
           managed_allow = true
         }],
         var.mitmproxy_enabled ? [{
           ip            = local.vm_network.gateway
-          ports         = [8080]
-          protocols     = ["tcp"]
+          tcp_ports     = [8080]
+          udp_ports     = []
           all_ports     = false
           managed_allow = true
         }] : [],
         length(var.host_nfs_exports) > 0 ? [{
           ip            = local.guest_config.hostAddress
-          ports         = [2049]
-          protocols     = ["tcp"]
+          tcp_ports     = [2049]
+          udp_ports     = []
           all_ports     = false
           managed_allow = true
         }] : [],
         [{
           ip        = local.firewall_test_network.gateway
-          ports     = [local.firewall_test_network.allow_test_port]
+          tcp_ports = [local.firewall_test_network.allow_test_port]
+          udp_ports = [local.firewall_test_network.allow_test_port]
           all_ports = false
         }]
       )
     }
   }
   mitmproxy_config = {
-    enabled         = var.mitmproxy_enabled
-    name            = var.name
-    uri             = var.libvirt_uri
-    network         = local.vm_network_name
-    gateway         = local.vm_network.gateway
-    image           = var.mitmproxy_policy.image
-    inspect_domains = var.mitmproxy_policy.inspect_domains
-    blocked_domains = var.mitmproxy_policy.blocked_domains
-    allowed_domains = var.mitmproxy_policy.allowed_domains
-    deny_cidrs      = var.internal_network_deny
+    enabled                = var.mitmproxy_enabled
+    name                   = var.name
+    uri                    = var.libvirt_uri
+    network                = local.vm_network_name
+    gateway                = local.vm_network.gateway
+    image                  = var.mitmproxy_policy.image
+    inspect_domains        = var.mitmproxy_policy.inspect_domains
+    blocked_domains        = var.mitmproxy_policy.blocked_domains
+    allowed_domains        = var.mitmproxy_policy.allowed_domains
+    allowed_internal_hosts = var.mitmproxy_policy.allowed_internal_hosts
+    deny_cidrs             = var.internal_network_deny
   }
   host_firewall_config = {
     name              = var.name

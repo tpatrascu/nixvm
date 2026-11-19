@@ -7,6 +7,12 @@ let
   mitmproxyEnabled =
     (machine.mitmproxy.enabled or false)
     && builtins.pathExists ../../machines/mitmproxy-ca.pem;
+  hostCaDirectory = ../../machines/host-ca;
+  hostCaCertificates = map (name: hostCaDirectory + "/${name}")
+    (builtins.filter
+      (name: builtins.match "^host-ca-[0-9a-f]+\\.pem$" name != null)
+      (builtins.attrNames (builtins.readDir hostCaDirectory)));
+  caTrustEnabled = mitmproxyEnabled || hostCaCertificates != [ ];
   proxyUrl = machine.mitmproxy.proxyUrl;
   noProxy = "localhost,127.0.0.1,::1";
   caBundle = config.security.pki.caBundle;
@@ -29,7 +35,8 @@ let
     GIT_SSL_CAINFO = caBundle;
     GRPC_DEFAULT_SSL_ROOTS_FILE_PATH = caBundle;
   };
-  systemProxyEnvironment = proxyEnvironment // certificateEnvironment;
+  systemEnvironment = (lib.optionalAttrs mitmproxyEnabled proxyEnvironment)
+    // (lib.optionalAttrs caTrustEnabled certificateEnvironment);
 in {
   imports = [ (modulesPath + "/profiles/qemu-guest.nix") ];
   system.stateVersion = "26.05";
@@ -52,16 +59,15 @@ in {
     allProxy = proxyUrl;
     inherit noProxy;
   };
-  environment.sessionVariables = lib.mkIf mitmproxyEnabled
-    (proxyEnvironment // certificateEnvironment);
+  environment.sessionVariables = lib.mkIf caTrustEnabled systemEnvironment;
   # systemd services do not inherit a user's login environment. Set the same
   # defaults on PID 1 so system services and timers use the managed proxy too.
-  systemd.settings.Manager.DefaultEnvironment = lib.mkIf mitmproxyEnabled
+  systemd.settings.Manager.DefaultEnvironment = lib.mkIf caTrustEnabled
     (lib.concatStringsSep " " (lib.mapAttrsToList
-      (name: value: "${name}=${value}") systemProxyEnvironment));
-  nix.settings."ssl-cert-file" = lib.mkIf mitmproxyEnabled caBundle;
-  security.pki.certificateFiles = lib.optionals mitmproxyEnabled
-    [ ../../machines/mitmproxy-ca.pem ];
+      (name: value: "${name}=${value}") systemEnvironment));
+  nix.settings."ssl-cert-file" = lib.mkIf caTrustEnabled caBundle;
+  security.pki.certificateFiles = hostCaCertificates
+    ++ lib.optionals mitmproxyEnabled [ ../../machines/mitmproxy-ca.pem ];
   networking.firewall.enable = true;
   time.timeZone = machine.timezone;
   i18n.defaultLocale = machine.locale;
@@ -114,5 +120,6 @@ in {
   environment.systemPackages = with pkgs; [
     git rsync vim neovim curl
     htop atop btop sysstat iotop iptraf-ng nettools
+    podman
   ];
 }

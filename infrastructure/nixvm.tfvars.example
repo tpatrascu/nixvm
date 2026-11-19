@@ -11,14 +11,16 @@ repository_path = ".." # Relative to infrastructure/
 dotfiles_path   = "~/.dotfiles"
 
 # Guest-initiated host access. The dedicated VM NAT gateway is included
-# automatically; these IPs add other host addresses. Ports permit TCP and UDP;
+# automatically; these IPs add other host addresses. Configure TCP and UDP
+# ports separately.
 # the managed mitmproxy is separately allowed on gateway TCP/8080.
 # Host firewall integration: "disabled" leaves host rules unchanged; "ufw"
 # adds persistent rules for gateway DNS, enabled mitmproxy, and host NFS exports.
 # host_firewall = "ufw"
 # host_access = {
 #   ips       = []
-#   ports     = [53, 2049]
+#   tcp_ports = [53, 2049]
+#   udp_ports = [53]
 #   all_ports = false
 # }
 
@@ -27,11 +29,17 @@ dotfiles_path   = "~/.dotfiles"
 # mitmproxy release. Domains include their subdomains. An empty inspect list
 # passes HTTPS through without TLS decryption.
 # mitmproxy_enabled = true # default: false; false enables direct web egress
+# mitm_proxy_blocked_http_ports = [80, 443, 8443, 8080, 8081, 8082]
 # mitmproxy_policy = {
 #   image           = "docker.io/mitmproxy/mitmproxy:latest"
 #   inspect_domains = ["api.example.com", "updates.example.net"]
 #   blocked_domains = ["telemetry.example.org"]
 #   allowed_domains = ["glob:trusted-*.example.org", "regex:api[0-9]+\\.example\\.net"]
+#   # Proxy-only exception for an internal TLS service. Direct guest access
+#   # remains blocked by internal_network_deny.
+#   allowed_internal_hosts = [
+#     { hostname = "git.internal.example", ips = ["192.168.50.10"], ports = [443] },
+#   ]
 # }
 
 # The firewall test subnet is managed on the VM's NAT bridge and removed by
@@ -45,8 +53,8 @@ dotfiles_path   = "~/.dotfiles"
 # internal_network_deny = ["10.0.0.0/8", "10.10.0.0/16"]
 # Per-IP access rules are independent and preserve the default deny list.
 # internal_network_allow = [
-#   { ip = "10.0.0.25", ports = [443], all_ports = false },
-#   { ip = "10.0.0.26", ports = [], all_ports = true }, # still blocks managed web ports
+#   { ip = "10.0.0.25", tcp_ports = [443], udp_ports = [], all_ports = false },
+#   { ip = "10.0.0.26", tcp_ports = [], udp_ports = [], all_ports = true }, # still blocks managed web ports
 # ]
 
 # Manually configured NFS exports on other servers mounted in the guest.
@@ -96,7 +104,7 @@ guest = {
 
 # Development toolchains and applications are disabled by default; opt into
 # only the ones this VM needs. Platform-unavailable applications are skipped.
-# toolchains = { python = true, node = true, llvm = true, rust = true, jdk = true, garmin = true }
+# toolchains = { python = true, node = true, llvm = true, rust = true, jdk = true, garmin = true, tcc = true }
 # Additional Nixpkgs package attribute paths, including nested paths.
 # additional_nix_pkgs = ["ripgrep", "fd", "python3Packages.pip"]
 # apps = {
@@ -109,3 +117,4 @@ guest = {
 # default_terminal = "kitty" # or "ghostty"; selecting it enables and pins it
 # default_shell    = "zsh" # or "bash"
 # default_browser  = "firefox" # or "chromium"; selecting it enables and pins it
+# default_coding_agent = "none" # or "omp", "codex", "chatgpt", "claudeCode", "opencode"; enables and pins the selected agent

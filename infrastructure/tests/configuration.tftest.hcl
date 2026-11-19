@@ -81,6 +81,30 @@ run "multiple_ssh_keys" {
   }
 }
 
+run "custom_direct_http_blocked_ports" {
+  command = plan
+  variables {
+    mitmproxy_enabled             = true
+    mitm_proxy_blocked_http_ports = [80, 443, 9443]
+  }
+  assert {
+    condition     = length(local.network_filter_access.internal.blocked_ports) == 3 && contains(local.network_filter_access.internal.blocked_ports, 80) && contains(local.network_filter_access.internal.blocked_ports, 443) && contains(local.network_filter_access.internal.blocked_ports, 9443)
+    error_message = "The internal firewall must use the configured direct HTTP blocked-port list."
+  }
+}
+
+run "proxy_disabled_has_no_direct_http_port_blocks" {
+  command = plan
+  variables {
+    mitmproxy_enabled             = false
+    mitm_proxy_blocked_http_ports = [80, 443]
+  }
+  assert {
+    condition     = length(local.network_filter_access.internal.blocked_ports) == 0
+    error_message = "Direct HTTP port blocking must be disabled when mitmproxy is disabled."
+  }
+}
+
 run "reject_duplicate_ssh_keys" {
   command = plan
   variables {

@@ -37,6 +37,38 @@ class RepositoryTransferTests(unittest.TestCase):
 
 
 class HostTests(unittest.TestCase):
+    def test_guest_host_ca_cleanup_is_safe_with_zsh_unmatched_globs(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(nixvm, "host_ca_cache_dir", return_value=Path(directory)), \
+             patch.object(nixvm, "remote") as remote:
+            nixvm.sync_guest_host_ca({"guest_config": {"repoPath": "/home/user/nixvm"}})
+        command = remote.call_args.args[1]
+        self.assertIn("find /home/user/nixvm/nix/machines/host-ca", command)
+        self.assertIn("-name 'host-ca-*.pem' -delete", command)
+        self.assertNotIn("rm -f", command)
+
+    def test_host_ca_source_directories_follow_distribution(self):
+        expected = {
+            "debian": "/usr/local/share/ca-certificates",
+            "fedora": "/etc/pki/ca-trust/source/anchors",
+            "arch": "/etc/ca-certificates/trust-source/anchors",
+            "opensuse-tumbleweed": "/etc/pki/trust/anchors",
+        }
+        for distro, directory in expected.items():
+            with self.subTest(distro=distro):
+                paths = nixvm.host_ca_source_directories(
+                    {"ID": distro, "ID_LIKE": ""}
+                )
+                self.assertIn(Path(directory), paths)
+
+    def test_host_ca_source_directories_accept_custom_paths(self):
+        with patch.dict(os.environ, {"NIXVM_HOST_CA_DIRS": "/custom/one:/custom/two"}):
+            paths = nixvm.host_ca_source_directories({"ID": "nixos", "ID_LIKE": ""})
+        self.assertEqual(paths[-2:], [Path("/custom/one"), Path("/custom/two")])
+
+    def test_ca_parser_ignores_non_certificate_content(self):
+        self.assertEqual(nixvm.certificate_pem_blocks(b"private key or text", ".pem"), [])
+
     def test_ufw_rule_reconciliation_keeps_exact_matches(self):
         status = "\n".join([
             "Status: active",
@@ -79,15 +111,27 @@ class HostTests(unittest.TestCase):
             policy_file = Path(directory) / "policy.json"
             policy_file.write_text(json.dumps({
                 "blocked_domains": ["glob:*.example.com", "regex:telemetry[0-9]+\\.example\\.net"],
-                "allowed_domains": ["regex:api[0-9]+\\.example\\.com", "trusted.example.net"],
-                "deny_cidrs": [],
+                "allowed_domains": [
+                    "regex:api[0-9]+\\.example\\.com", "trusted.example.net", "git.example.com",
+                ],
+                "deny_cidrs": ["192.168.0.0/16"],
+                "allowed_internal_hosts": [{
+                    "hostname": "git.example.com",
+                    "ips": ["192.168.50.10"],
+                    "ports": [443],
+                }],
             }), encoding="utf-8")
             mitmproxy_stub = types.ModuleType("mitmproxy")
             mitmproxy_stub.ctx = types.SimpleNamespace(
                 log=types.SimpleNamespace(warn=lambda _message: None)
             )
             mitmproxy_stub.http = types.SimpleNamespace(
-                HTTPFlow=object, Response=types.SimpleNamespace(make=lambda *_args, **_kwargs: None)
+                HTTPFlow=object,
+                Response=types.SimpleNamespace(
+                    make=lambda status, content, _headers: types.SimpleNamespace(
+                        status_code=status, content=content
+                    )
+                ),
             )
             addon_path = Path(__file__).parents[1] / "scripts" / "mitmproxy_policy.py"
             spec = importlib.util.spec_from_file_location("nixvm_test_mitmproxy_policy", addon_path)
@@ -100,6 +144,98 @@ class HostTests(unittest.TestCase):
         self.assertFalse(policy.domain_is_blocked("api42.example.com"))
         self.assertTrue(policy.domain_is_blocked("telemetry9.example.net"))
         self.assertFalse(policy.domain_is_blocked("cdn.trusted.example.net"))
+        flow_data = types.SimpleNamespace(server=types.SimpleNamespace(
+            id="git-server", address=("git.example.com", 443), tls=True, sni=None, error=None,
+        ))
+        with patch("socket.getaddrinfo", return_value=[
+            (2, 1, 6, "", ("192.168.50.10", 443)),
+        ]):
+            policy.server_connect(flow_data)
+        self.assertEqual(flow_data.server.address, ("192.168.50.10", 443))
+        self.assertEqual(flow_data.server.sni, "git.example.com")
+
+        wrong_port, error = policy.resolve_and_pin("git.example.com", 8443)
+        self.assertIsNone(wrong_port)
+        self.assertIn("not allowed", error)
+        with patch("socket.getaddrinfo", return_value=[
+            (2, 1, 6, "", ("192.168.50.11", 443)),
+        ]):
+            wrong_address, error = policy.resolve_and_pin("git.example.com", 443)
+        self.assertIsNone(wrong_address)
+        self.assertIn("not allowed", error)
+        with patch("socket.getaddrinfo", return_value=[
+            (2, 1, 6, "", ("192.168.50.10", 443)),
+        ]):
+            child_host, error = policy.resolve_and_pin("child.git.example.com", 443)
+        self.assertIsNone(child_host)
+        self.assertIn("denied internal address", error)
+
+        allowed_tls = types.SimpleNamespace(
+            client_hello=types.SimpleNamespace(sni="git.example.com"),
+            context=types.SimpleNamespace(
+                client=types.SimpleNamespace(error=None),
+                server=types.SimpleNamespace(id="git-server", address=("192.168.50.10", 443)),
+            ),
+        )
+        denied_tls = types.SimpleNamespace(
+            client_hello=types.SimpleNamespace(sni="console.internal"),
+            context=types.SimpleNamespace(
+                client=types.SimpleNamespace(error=None),
+                server=types.SimpleNamespace(id="console-server", address=("192.168.50.10", 443)),
+            ),
+        )
+        with patch("socket.getaddrinfo", return_value=[
+            (2, 1, 6, "", ("192.168.50.10", 443)),
+        ]):
+            policy.tls_clienthello(allowed_tls)
+            policy.tls_clienthello(denied_tls)
+        self.assertIsNone(allowed_tls.context.client.error)
+        self.assertIn("denied internal address", denied_tls.context.client.error)
+
+        allowed_request = types.SimpleNamespace(
+            request=types.SimpleNamespace(host="git.example.com", port=443),
+            client_conn=types.SimpleNamespace(sni="git.example.com"),
+            server_conn=types.SimpleNamespace(
+                id="git-server", address=("192.168.50.10", 443)
+            ),
+            response=None,
+        )
+        policy.request(allowed_request)
+        self.assertIsNone(allowed_request.response)
+
+        pinned_ip_request = types.SimpleNamespace(
+            request=types.SimpleNamespace(host="192.168.50.10", port=443),
+            client_conn=types.SimpleNamespace(sni="git.example.com"),
+            server_conn=types.SimpleNamespace(
+                id="git-server", address=("192.168.50.10", 443)
+            ),
+            response=None,
+        )
+        policy.request(pinned_ip_request)
+        self.assertIsNone(pinned_ip_request.response)
+
+        no_sni_request = types.SimpleNamespace(
+            request=types.SimpleNamespace(host="192.168.50.10", port=443),
+            client_conn=types.SimpleNamespace(sni=None),
+            server_conn=types.SimpleNamespace(
+                id="git-server", address=("192.168.50.10", 443)
+            ),
+            response=None,
+        )
+        policy.request(no_sni_request)
+        self.assertEqual(no_sni_request.response.status_code, 403)
+
+        spoofed_request = types.SimpleNamespace(
+            request=types.SimpleNamespace(host="console.internal", port=443),
+            client_conn=types.SimpleNamespace(sni="console.internal"),
+            server_conn=types.SimpleNamespace(id="console-server", address=("192.168.50.10", 443)),
+            response=None,
+        )
+        with patch("socket.getaddrinfo", return_value=[
+            (2, 1, 6, "", ("192.168.50.10", 443)),
+        ]):
+            policy.request(spoofed_request)
+        self.assertEqual(spoofed_request.response.status_code, 403)
 
     def test_inspection_hosts_accept_glob_and_regex_patterns(self):
         patterns = nixvm.mitmproxy_allow_hosts([

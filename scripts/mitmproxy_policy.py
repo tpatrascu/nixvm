@@ -22,6 +22,16 @@ class NixvmPolicy:
         self.denied_networks = tuple(
             ipaddress.ip_network(cidr) for cidr in policy.get("deny_cidrs", [])
         )
+        self.allowed_internal_hosts = {}
+        self.server_authorizations = {}
+        for entry in policy.get("allowed_internal_hosts", []):
+            hostname = self.normalize_domain(entry["hostname"])
+            if hostname in self.allowed_internal_hosts:
+                raise ValueError(f"duplicate internal hostname rule: {hostname}")
+            self.allowed_internal_hosts[hostname] = {
+                "ips": frozenset(ipaddress.ip_address(address).compressed for address in entry["ips"]),
+                "ports": frozenset(int(port) for port in entry.get("ports", [443])),
+            }
 
     @staticmethod
     def normalize_domain(domain: str) -> str:
@@ -60,7 +70,29 @@ class NixvmPolicy:
             return False
         return self.domain_matches(host, self.blocked_domains)
 
+    def address_is_denied(self, address: str) -> bool:
+        parsed = ipaddress.ip_address(address.split("%", 1)[0])
+        return any(
+            parsed.version == network.version and parsed in network
+            for network in self.denied_networks
+        )
+
+    def internal_rule_allows(self, host: str, port: int, address: str) -> bool:
+        rule = self.allowed_internal_hosts.get(self.normalize_domain(host))
+        if not rule or port not in rule["ports"]:
+            return False
+        try:
+            normalized_address = ipaddress.ip_address(address.split("%", 1)[0]).compressed
+        except ValueError:
+            return False
+        return normalized_address in rule["ips"]
+
     def resolve_and_pin(self, host: str, port: int):
+        hostname = self.normalize_domain(host)
+        internal_rule = self.allowed_internal_hosts.get(hostname)
+        if internal_rule and port not in internal_rule["ports"]:
+            return None, f"port {port} is not allowed for internal destination {hostname}"
+
         try:
             literal = ipaddress.ip_address(host)
             candidates = [literal.compressed]
@@ -82,8 +114,10 @@ class NixvmPolicy:
                 parsed = ipaddress.ip_address(address.split("%", 1)[0])
             except ValueError:
                 return None, "resolver returned an invalid destination address"
-            if any(parsed.version == network.version and parsed in network
-                   for network in self.denied_networks):
+            denied = self.address_is_denied(parsed.compressed)
+            if internal_rule and parsed.compressed not in internal_rule["ips"]:
+                return None, f"destination address {parsed} is not allowed for internal hostname {hostname}"
+            if denied and not internal_rule:
                 return None, f"destination resolves to denied internal address {parsed}"
             addresses.append(parsed.compressed)
 
@@ -113,12 +147,51 @@ class NixvmPolicy:
 
         # Pin the upstream socket to an address that passed the CIDR check.
         # Keep the original hostname as SNI for inspected HTTPS connections.
+        self.server_authorizations[data.server.id] = {
+            "hostname": self.normalize_domain(host),
+            "ip": resolved,
+            "port": port,
+        }
         data.server.address = (resolved, port)
         if data.server.tls:
             try:
                 ipaddress.ip_address(host)
             except ValueError:
                 data.server.sni = host
+
+    def tls_clienthello(self, data):
+        """Bind TLS SNI to the authorized CONNECT destination before pass-through."""
+        sni = data.client_hello.sni
+        authorization = self.server_authorizations.get(data.context.server.id)
+        reason = None
+        if sni and self.domain_is_blocked(sni):
+            reason = f"blocked by nixvm hostname policy: {self.normalize_domain(sni)}"
+        elif authorization and self.address_is_denied(authorization["ip"]):
+            normalized_sni = self.normalize_domain(sni) if sni else None
+            if normalized_sni != authorization["hostname"]:
+                reason = (
+                    f"TLS SNI {normalized_sni or '<missing>'} does not match authorized "
+                    f"internal hostname {authorization['hostname']}"
+                )
+        elif not authorization and data.context.server.address:
+            destination, port = data.context.server.address
+            resolved, error = self.resolve_and_pin(destination, port)
+            if error:
+                reason = error
+            elif self.address_is_denied(resolved) and not (
+                sni and self.internal_rule_allows(sni, port, resolved)
+            ):
+                reason = f"TLS SNI {sni or '<missing>'} is not authorized for internal destination {resolved}"
+
+        if reason:
+            data.context.client.error = reason
+            ctx.log.warn(f"Blocked proxy TLS connection: {reason}")
+
+    def server_disconnected(self, data):
+        self.server_authorizations.pop(data.server.id, None)
+
+    def server_connect_error(self, data):
+        self.server_authorizations.pop(data.server.id, None)
 
     def http_connect(self, flow: http.HTTPFlow):
         host = flow.request.host
@@ -129,9 +202,56 @@ class NixvmPolicy:
             )
 
     def request(self, flow: http.HTTPFlow):
-        if self.domain_is_blocked(flow.request.host):
+        host = self.normalize_domain(flow.request.host)
+        reason = None
+        if self.domain_is_blocked(host):
+            reason = f"blocked by nixvm hostname policy: {host}"
+        else:
+            sni = getattr(flow.client_conn, "sni", None)
+            authorization = self.server_authorizations.get(flow.server_conn.id)
+            if authorization and self.address_is_denied(authorization["ip"]):
+                try:
+                    host_ip = ipaddress.ip_address(host).compressed
+                except ValueError:
+                    host_ip = None
+                host_matches = (
+                    host == authorization["hostname"] or host_ip == authorization["ip"]
+                )
+                if not host_matches:
+                    reason = (
+                        f"HTTP hostname {host} does not match authorized internal endpoint "
+                        f"{authorization['hostname']}"
+                    )
+                elif not sni or self.normalize_domain(sni) != authorization["hostname"]:
+                    reason = (
+                        f"TLS SNI {self.normalize_domain(sni) if sni else '<missing>'} "
+                        "does not match authorized "
+                        f"internal hostname {authorization['hostname']}"
+                    )
+            else:
+                resolved, resolve_error = self.resolve_and_pin(host, flow.request.port)
+                if resolve_error:
+                    reason = resolve_error
+                elif sni and self.normalize_domain(sni) != host:
+                    reason = f"HTTP hostname {host} does not match TLS SNI {self.normalize_domain(sni)}"
+                else:
+                    address = flow.server_conn.address
+                    actual = address[0] if address else resolved
+                    try:
+                        actual_ip = ipaddress.ip_address(actual.split("%", 1)[0]).compressed
+                    except ValueError:
+                        actual_ip = resolved
+                    if self.address_is_denied(actual_ip) and not self.internal_rule_allows(
+                        host, flow.request.port, actual_ip
+                    ):
+                        reason = (
+                            f"HTTP hostname {host} is not allowed for internal destination "
+                            f"{actual_ip}:{flow.request.port}"
+                        )
+        if reason:
+            ctx.log.warn(f"Blocked proxy request: {reason}")
             flow.response = http.Response.make(
-                403, b"Blocked by nixvm hostname policy.\n",
+                403, b"Blocked by nixvm destination policy.\n",
                 {"content-type": "text/plain; charset=utf-8"},
             )
 

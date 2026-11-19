@@ -3,6 +3,11 @@ let
   mitmproxyEnabled =
     (machine.mitmproxy.enabled or false)
     && builtins.pathExists ../../machines/mitmproxy-ca.pem;
+  hostCaDirectory = ../../machines/host-ca;
+  hostCaCertificates = builtins.filter
+    (name: builtins.match "^host-ca-[0-9a-f]+\\.pem$" name != null)
+    (builtins.attrNames (builtins.readDir hostCaDirectory));
+  caTrustEnabled = mitmproxyEnabled || hostCaCertificates != [ ];
   proxyUrl = machine.mitmproxy.proxyUrl;
   noProxy = "localhost,127.0.0.1,::1";
   caBundle = "/etc/ssl/certs/ca-certificates.crt";
@@ -30,7 +35,7 @@ in {
     ./gnome.nix ./apps.nix ./dotfiles.nix ./yubikey.nix
     ./toolchains/python.nix ./toolchains/node.nix
     ./toolchains/llvm.nix ./toolchains/rust.nix
-    ./toolchains/jdk.nix ./toolchains/garmin.nix
+    ./toolchains/jdk.nix ./toolchains/garmin.nix ./toolchains/tcc.nix
   ];
   home.username = machine.username;
   home.homeDirectory = "/home/${machine.username}";
@@ -38,7 +43,7 @@ in {
   programs.home-manager.enable = true;
   programs.git.enable = true;
   programs.direnv = { enable = true; nix-direnv.enable = true; };
-  home.packages = [ pkgs.ripgrep pkgs.fd pkgs.jq pkgs.gnumake pkgs.kubectl ];
+  home.packages = [ pkgs.ripgrep pkgs.fd pkgs.jq pkgs.gnumake pkgs.kubectl pkgs.tokei ];
   home.sessionVariables = {
     EDITOR = if (machine.defaultEditor or "nvim") == "zed" then "zed --wait"
       else if (machine.defaultEditor or "nvim") == "vscode" then "code --wait"
@@ -49,9 +54,10 @@ in {
     PKCS11_MODULE = "${pkgs.opensc}/lib/opensc-pkcs11.so";
     PCSCLITE_CSOCK_NAME = "/run/user/${toString machine.uid}/nixvm/pcsc.sock";
     NIXVM_REPOSITORY = machine.repoPath;
-  } // lib.optionalAttrs mitmproxyEnabled (proxyEnvironment // certificateEnvironment);
-  systemd.user.sessionVariables = lib.mkIf mitmproxyEnabled
-    (proxyEnvironment // certificateEnvironment);
+  } // lib.optionalAttrs mitmproxyEnabled proxyEnvironment
+    // lib.optionalAttrs caTrustEnabled certificateEnvironment;
+  systemd.user.sessionVariables = lib.mkIf caTrustEnabled
+    ((lib.optionalAttrs mitmproxyEnabled proxyEnvironment) // certificateEnvironment);
   programs.zsh = lib.mkIf ((machine.defaultShell or "zsh") == "zsh") {
     enable = true;
     oh-my-zsh = { enable = true; plugins = [ "git" "kubectl" ]; theme = ""; };

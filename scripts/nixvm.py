@@ -16,6 +16,7 @@ import secrets
 import shlex
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -225,6 +226,7 @@ def build_image():
         shutil.rmtree(snapshot)
     shutil.copytree(ROOT / "nix", snapshot, ignore=shutil.ignore_patterns("current.json", "result*"))
     (snapshot / "machines/current.json").write_text(json.dumps(bootstrap_settings, indent=2) + "\n")
+    stage_host_ca_certificates(snapshot)
     proxy_ca = ROOT / ".runtime" / "shared" / "mitmproxy-ca-cert.pem"
     if proxy_ca.is_file():
         shutil.copyfile(proxy_ca, snapshot / "machines" / "mitmproxy-ca.pem")
@@ -254,6 +256,7 @@ def build_workstation_cache(build, settings):
         shutil.rmtree(snapshot)
     shutil.copytree(ROOT / "nix", snapshot, ignore=shutil.ignore_patterns("current.json", "result*"))
     (snapshot / "machines/current.json").write_text(json.dumps(settings, indent=2) + "\n")
+    stage_host_ca_certificates(snapshot)
     proxy_ca = ROOT / ".runtime" / "shared" / "mitmproxy-ca-cert.pem"
     if proxy_ca.is_file():
         shutil.copyfile(proxy_ca, snapshot / "machines" / "mitmproxy-ca.pem")
@@ -290,7 +293,12 @@ def add_network_access_rules(root, access):
         rules = access["allow"]
     else:
         rules = [
-            {"ip": address, "ports": access["ports"], "all_ports": access["all_ports"]}
+            {
+                "ip": address,
+                "tcp_ports": access["tcp_ports"],
+                "udp_ports": access["udp_ports"],
+                "all_ports": access["all_ports"],
+            }
             for address in access["ips"]
         ]
     for rule_config in rules:
@@ -304,8 +312,8 @@ def add_network_access_rules(root, access):
                                     priority=100,
                                     dstipaddr=ip.compressed)
             continue
-        for port in rule_config["ports"]:
-            for transport in rule_config.get("protocols") or ("tcp", "udp"):
+        for transport in ("tcp", "udp"):
+            for port in rule_config[f"{transport}_ports"]:
                 add_network_filter_rule(
                     root, "accept", element=transport if ip.version == 4 else "ipv6", priority=100,
                     dstipaddr=ip.compressed,
@@ -378,8 +386,8 @@ def build_network_filter(name, access, filter_uuid=None):
         ip = ipaddress.ip_address(rule_config["ip"])
         if rule_config["all_ports"]:
             continue
-        for port in set(rule_config["ports"]).intersection(blocked_ports):
-            for transport in rule_config.get("protocols") or ("tcp", "udp"):
+        for transport in ("tcp", "udp"):
+            for port in set(rule_config[f"{transport}_ports"]).intersection(blocked_ports):
                 add_network_filter_rule(
                     root, "accept", element=transport if ip.version == 4 else "ipv6",
                     priority=85, dstipaddr=ip.compressed,
@@ -677,25 +685,56 @@ def systemd_unit_value(value):
 
 def mitmproxy_quadlet(config, policy_dir, web_password):
     safe_name = "nixvm-shared-mitmproxy"
-    allow_hosts = mitmproxy_allow_hosts(config["inspect_domains"])
+    # Quadlet parses this as a systemd unit value; preserve regex backslashes
+    # through that layer so it does not reject the entire Exec= command.
+    allow_hosts = mitmproxy_allow_hosts(config["inspect_domains"]).replace("\\", "\\\\")
+    upstream_ca = Path(policy_dir) / "upstream-ca-bundle.pem"
+    upstream_ca_arg = (
+        " --set=ssl_verify_upstream_trusted_ca=/etc/mitmproxy/nixvm/upstream-ca-bundle.pem"
+        if upstream_ca.is_file() else ""
+    )
     return f"""[Unit]
 Description=NixVM shared HTTPS inspection proxy
 [Container]
 ContainerName={safe_name}
 Image={config['image']}
+AutoUpdate=registry
+Label=io.nixvm.service=nixvm-shared-mitmproxy
 Network=pasta
 Volume={systemd_unit_value(policy_dir)}:/etc/mitmproxy/nixvm:ro
 Volume={safe_name}-data:/home/mitmproxy/.mitmproxy
 PublishPort=0.0.0.0:8080:8080
 PublishPort=127.0.0.1:8081:8081
 Environment=NIXVM_MITMPROXY_POLICY=/etc/mitmproxy/nixvm/policy.json
-Exec=mitmweb --mode regular@0.0.0.0:8080 --web-host 0.0.0.0 --web-port 8081 --set=web_open_browser=false --set=web_password={web_password} --set=confdir=/home/mitmproxy/.mitmproxy --set=show_ignored_hosts=true --allow-hosts="{allow_hosts}" -s /etc/mitmproxy/nixvm/mitmproxy_policy.py
+Entrypoint=mitmweb
+Exec=--mode regular@0.0.0.0:8080 --web-host 0.0.0.0 --web-port 8081 --set=web_open_browser=false --set=web_password={web_password} --set=confdir=/home/mitmproxy/.mitmproxy --set=show_ignored_hosts=true{upstream_ca_arg} --allow-hosts="{allow_hosts}" -s /etc/mitmproxy/nixvm/mitmproxy_policy.py
 
 [Service]
 Restart=always
 
 [Install]
 WantedBy=default.target
+"""
+
+
+def mitmproxy_update_units(podman_path):
+    return """[Unit]
+Description=Update NixVM mitmproxy container image
+
+[Service]
+Type=oneshot
+ExecStart={podman} auto-update --filter label=io.nixvm.service=nixvm-shared-mitmproxy
+""".format(podman=podman_path), """[Unit]
+Description=Daily update check for NixVM mitmproxy
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=1h
+Unit=nixvm-mitmproxy-update.service
+
+[Install]
+WantedBy=timers.target
 """
 
 
@@ -763,6 +802,21 @@ def setup_host_mitmproxy(extra=()):
     policy_dir = data_dir / "policy"
     policy_dir.mkdir(parents=True, exist_ok=True, mode=0o755)
     policy_dir.chmod(0o755)
+    upstream_ca_bundle = policy_dir / "upstream-ca-bundle.pem"
+    custom_ca_files = sorted(host_ca_cache_dir().glob("host-ca-*.pem"))
+    if custom_ca_files:
+        system_ca_bundle = ssl.get_default_verify_paths().cafile
+        if not system_ca_bundle or not Path(system_ca_bundle).is_file():
+            raise RuntimeError("Could not locate the host's default CA bundle for mitmproxy upstream verification.")
+        with upstream_ca_bundle.open("wb") as bundle:
+            bundle.write(Path(system_ca_bundle).read_bytes())
+            bundle.write(b"\n")
+            for certificate in custom_ca_files:
+                bundle.write(certificate.read_bytes())
+                bundle.write(b"\n")
+        upstream_ca_bundle.chmod(0o644)
+    else:
+        upstream_ca_bundle.unlink(missing_ok=True)
     password_file = data_dir / "web_password"
     if not password_file.exists():
         password_file.write_text(secrets.token_urlsafe(32) + "\n", encoding="utf-8")
@@ -773,6 +827,7 @@ def setup_host_mitmproxy(extra=()):
     policy = {
         "blocked_domains": config["blocked_domains"],
         "allowed_domains": config["allowed_domains"],
+        "allowed_internal_hosts": config["allowed_internal_hosts"],
         "deny_cidrs": config["deny_cidrs"],
     }
     (policy_dir / "policy.json").write_text(json.dumps(policy, indent=2) + "\n", encoding="utf-8")
@@ -790,6 +845,14 @@ def setup_host_mitmproxy(extra=()):
         unit_file.write_text(unit_contents, encoding="utf-8")
         unit_file.chmod(0o600)
 
+    update_service, update_timer = mitmproxy_update_units(shutil.which("podman"))
+    update_service_file = user_unit_dir / "nixvm-mitmproxy-update.service"
+    update_timer_file = user_unit_dir / "nixvm-mitmproxy-update.timer"
+    for path, contents in ((update_service_file, update_service), (update_timer_file, update_timer)):
+        if not path.exists() or path.read_text(encoding="utf-8") != contents:
+            path.write_text(contents, encoding="utf-8")
+            path.chmod(0o600)
+
     print(f"Pulling current mitmproxy image {config['image']}.")
     run(["podman", "pull", config["image"]])
     # mitmproxy can defer CA creation while every configured TLS host is passed
@@ -798,6 +861,7 @@ def setup_host_mitmproxy(extra=()):
     container = "nixvm-shared-mitmproxy"
     initialize_mitmproxy_ca(config["image"], f"{container}-data")
     run(["systemctl", "--user", "daemon-reload"])
+    run(["systemctl", "--user", "enable", "--now", "nixvm-mitmproxy-update.timer"])
     run(["systemctl", "--user", "restart", f"{unit_name}.service"])
     wait_tcp_listener(config["gateway"], 8080)
     wait_tcp_listener("127.0.0.1", 8081)
@@ -817,6 +881,13 @@ def cleanup_host_mitmproxy(name):
     unit_name = "nixvm-shared-mitmproxy"
     quadlet_dir = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "containers" / "systemd"
     unit_file = quadlet_dir / f"{unit_name}.container"
+    user_unit_dir = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "systemd" / "user"
+    update_timer_file = user_unit_dir / "nixvm-mitmproxy-update.timer"
+    update_service_file = user_unit_dir / "nixvm-mitmproxy-update.service"
+    subprocess.run(["systemctl", "--user", "disable", "--now",
+                    "nixvm-mitmproxy-update.timer"], check=False)
+    subprocess.run(["systemctl", "--user", "stop",
+                    "nixvm-mitmproxy-update.service"], check=False)
     subprocess.run(["systemctl", "--user", "disable", "--now",
                     f"{unit_name}-forwarder.service"], check=False)
     if unit_file.exists():
@@ -824,6 +895,8 @@ def cleanup_host_mitmproxy(name):
         unit_file.unlink()
     (Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
      / "systemd" / "user" / f"{unit_name}-forwarder.service").unlink(missing_ok=True)
+    update_timer_file.unlink(missing_ok=True)
+    update_service_file.unlink(missing_ok=True)
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
     if shutil.which("podman"):
         subprocess.run(["podman", "rm", "--force", unit_name], check=False,
@@ -1005,6 +1078,123 @@ def host_os_release():
         parts = shlex.split(value)
         values[key] = parts[0] if parts else ""
     return values
+
+
+def host_ca_source_directories(values=None, root=Path("/")):
+    """Return distro-managed directories for administrator-added CA anchors."""
+    values = values or host_os_release()
+    distro_ids = {values.get("ID", "").lower(), *values.get("ID_LIKE", "").lower().split()}
+    paths = ["/usr/local/share/ca-certificates"]
+    if distro_ids & {"debian", "ubuntu", "linuxmint", "pop", "raspbian"}:
+        pass
+    elif distro_ids & {"fedora", "rhel", "centos", "rocky", "almalinux", "ol"}:
+        paths.append("/etc/pki/ca-trust/source/anchors")
+    elif distro_ids & {"arch", "archarm", "manjaro", "endeavouros"}:
+        paths.append("/etc/ca-certificates/trust-source/anchors")
+    elif distro_ids & {"suse", "opensuse", "opensuse-leap", "opensuse-tumbleweed"}:
+        paths.append("/etc/pki/trust/anchors")
+
+    # Allow hosts with a custom trust layout (including NixOS configurations)
+    # to add administrator-managed source directories without importing the
+    # host's generated full CA bundle.
+    paths.extend(filter(None, os.environ.get("NIXVM_HOST_CA_DIRS", "").split(os.pathsep)))
+    result = []
+    for path in paths:
+        candidate = (root / path.lstrip("/")) if root != Path("/") else Path(path)
+        if candidate not in result:
+            result.append(candidate)
+    return result
+
+
+def certificate_pem_blocks(contents, suffix):
+    """Extract public X.509 certificates from PEM chains or DER certificate files."""
+    blocks = re.findall(
+        rb"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
+        contents, flags=re.DOTALL,
+    )
+    certificates = []
+    for block in blocks:
+        try:
+            der = ssl.PEM_cert_to_DER_cert(block.decode("ascii"))
+        except (UnicodeDecodeError, ValueError, ssl.SSLError):
+            continue
+        certificates.append((der, ssl.DER_cert_to_PEM_cert(der).encode("ascii")))
+    if certificates or suffix.lower() not in {".cer", ".crt", ".der"}:
+        return certificates
+    # A few distributions accept DER encoded .cer/.crt files in trust stores.
+    if contents.startswith(b"\x30"):
+        try:
+            pem = ssl.DER_cert_to_PEM_cert(contents).encode("ascii")
+            return [(contents, pem)]
+        except (ValueError, ssl.SSLError):
+            pass
+    return []
+
+
+def collect_host_ca_certificates(source_directories=None):
+    """Collect custom public CA certificates, deduplicated by DER fingerprint."""
+    source_directories = source_directories or host_ca_source_directories()
+    certificates = {}
+    suffixes = {".crt", ".pem", ".cer", ".der"}
+    for directory in source_directories:
+        if not directory.is_dir():
+            continue
+        for path in sorted(directory.rglob("*")):
+            if not path.is_file() or path.suffix.lower() not in suffixes:
+                continue
+            try:
+                contents = path.read_bytes()
+            except OSError as error:
+                raise RuntimeError(f"Could not read host CA certificate {path}: {error}") from error
+            for der, pem in certificate_pem_blocks(contents, path.suffix):
+                fingerprint = hashlib.sha256(der).hexdigest()
+                certificates.setdefault(fingerprint, pem)
+    return certificates
+
+
+def host_ca_cache_dir():
+    return ROOT / ".runtime" / "shared" / "host-ca"
+
+
+def refresh_host_ca_cache():
+    """Snapshot the host's selected custom CA anchors for an explicit copy-cas."""
+    certificates = collect_host_ca_certificates()
+    cache = host_ca_cache_dir()
+    if cache.exists():
+        shutil.rmtree(cache)
+    cache.mkdir(parents=True, exist_ok=True, mode=0o700)
+    for fingerprint, pem in sorted(certificates.items()):
+        (cache / f"host-ca-{fingerprint}.pem").write_bytes(pem)
+    print(f"Collected {len(certificates)} custom host CA certificate(s).")
+    return sorted(cache.glob("host-ca-*.pem"))
+
+
+def stage_host_ca_certificates(nix_root):
+    """Copy the last explicit host CA snapshot into a temporary Nix source tree."""
+    destination = Path(nix_root) / "machines" / "host-ca"
+    destination.mkdir(parents=True, exist_ok=True)
+    for old in destination.glob("host-ca-*.pem"):
+        old.unlink()
+    staged = []
+    for certificate in sorted(host_ca_cache_dir().glob("host-ca-*.pem")):
+        target = destination / certificate.name
+        shutil.copyfile(certificate, target)
+        target.chmod(0o644)
+        staged.append(target)
+    return staged
+
+
+def sync_guest_host_ca(c):
+    """Mirror the last explicit host CA snapshot into the guest checkout."""
+    target = c["guest_config"]["repoPath"].rstrip("/") + "/nix/machines/host-ca"
+    remote(c, f"mkdir -p {shlex.quote(target)} && find {shlex.quote(target)} "
+              "-maxdepth 1 -type f -name 'host-ca-*.pem' -delete")
+    certificates = sorted(host_ca_cache_dir().glob("host-ca-*.pem"))
+    if certificates:
+        ssh = ssh_args(c)
+        run(["rsync", "-a", "--protect-args", "-e", shlex.join(ssh[:-1]),
+             *[str(path) for path in certificates], f"{ssh[-1]}:{target}/"])
+    return [target + "/" + path.name for path in certificates]
 
 
 def host_nfs_distro(values):
@@ -1220,6 +1410,7 @@ def copy_checkout(c, source, destination, *, settings=None):
         shutil.copytree(source, staged, symlinks=True)
         if settings is not None:
             (staged / "nix/machines/current.json").write_text(json.dumps(settings, indent=2) + "\n")
+            stage_host_ca_certificates(staged / "nix")
         target = destination + ".nixvm-staging"
         remote(c, f"mkdir -p {shlex.quote(str(Path(destination).parent))} {shlex.quote(target)}")
         # rsync argv is generated without involving an interpolated shell on the host.
@@ -1239,6 +1430,7 @@ def bootstrap():
     config = c["guest_config"]
     copy_checkout(c, os.environ["NIXVM_DOTFILES"], config["dotfilesPath"])
     copy_checkout(c, os.environ["NIXVM_REPOSITORY"], config["repoPath"], settings=config)
+    guest_host_cas = sync_guest_host_ca(c)
     sync_guest_mitmproxy_ca(c)
     # Refresh the host cache for the exact settings being provisioned, including
     # explicit reprovisions where the VM config may have changed since the
@@ -1248,10 +1440,13 @@ def bootstrap():
     flake = "path:" + config["repoPath"] + "/nix#nixvm"
     guest_ca = config["repoPath"].rstrip("/") + "/nix/machines/mitmproxy-ca.pem"
     local_ca = ROOT / ".runtime" / "shared" / "mitmproxy-ca-cert.pem"
-    bundle = f"/tmp/nixvm-mitmproxy-ca-{os.getpid()}.pem" if local_ca.is_file() else None
+    proxy_ca = local_ca.is_file() and config.get("mitmproxy", {}).get("enabled")
+    bundle = (f"/tmp/nixvm-ca-{os.getpid()}.pem"
+              if proxy_ca or guest_host_cas else None)
     run_nixos_rebuild(c, flake, config,
-                      ca_bundle=bundle if bundle else None,
-                      ca_certificate=guest_ca if bundle else None)
+                      ca_bundle=bundle,
+                      ca_certificate=guest_ca if proxy_ca else None,
+                      additional_ca_certificates=guest_host_cas)
     reboot_guest(c)
     print("Provisioned and rebooted into the graphical system. SSH and GNOME are ready.")
 
@@ -1282,59 +1477,70 @@ def copy_workstation_closure(c):
         raise subprocess.CalledProcessError(export_status, exporter.args)
 
 
-def run_nixos_rebuild(c, flake, settings, *, ca_bundle=None, ca_certificate=None):
+def run_nixos_rebuild(c, flake, settings, *, ca_bundle=None, ca_certificate=None,
+                      additional_ca_certificates=()):
     """Build with the managed proxy even when the active system predates it."""
     rebuild = "sudo nixos-rebuild switch --flake " + shlex.quote(flake)
     proxy = settings.get("mitmproxy", {})
-    if not (proxy.get("enabled") and proxy.get("proxyUrl")):
+    proxy_enabled = proxy.get("enabled") and proxy.get("proxyUrl")
+    if not (proxy_enabled or ca_bundle or additional_ca_certificates):
         return remote(c, rebuild)
-
-    proxy_url = proxy["proxyUrl"]
+    runtime_environment = {}
+    if proxy_enabled:
+        proxy_url = proxy["proxyUrl"]
+        runtime_environment.update({
+            "http_proxy": proxy_url,
+            "https_proxy": proxy_url,
+            "all_proxy": proxy_url,
+            "no_proxy": "localhost,127.0.0.1,::1",
+            "HTTP_PROXY": proxy_url,
+            "HTTPS_PROXY": proxy_url,
+            "ALL_PROXY": proxy_url,
+            "NO_PROXY": "localhost,127.0.0.1,::1",
+        })
     ca_file = ca_bundle or "/etc/ssl/certs/ca-certificates.crt"
-    runtime_environment = {
-        "http_proxy": proxy_url,
-        "https_proxy": proxy_url,
-        "all_proxy": proxy_url,
-        "no_proxy": "localhost,127.0.0.1,::1",
-        "HTTP_PROXY": proxy_url,
-        "HTTPS_PROXY": proxy_url,
-        "ALL_PROXY": proxy_url,
-        "NO_PROXY": "localhost,127.0.0.1,::1",
-        "SSL_CERT_FILE": ca_file,
-        "REQUESTS_CA_BUNDLE": ca_file,
-        "CURL_CA_BUNDLE": ca_file,
-        "NODE_EXTRA_CA_CERTS": ca_file,
-        "NIX_SSL_CERT_FILE": ca_file,
-        "GIT_SSL_CAINFO": ca_file,
-        "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH": ca_file,
-    }
-    set_environment = "sudo systemctl set-environment " + shlex.join(
+    if proxy_enabled or ca_bundle:
+        runtime_environment.update({
+            "SSL_CERT_FILE": ca_file,
+            "REQUESTS_CA_BUNDLE": ca_file,
+            "CURL_CA_BUNDLE": ca_file,
+            "NODE_EXTRA_CA_CERTS": ca_file,
+            "NIX_SSL_CERT_FILE": ca_file,
+            "GIT_SSL_CAINFO": ca_file,
+            "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH": ca_file,
+        })
+    set_environment = ("sudo systemctl set-environment " + shlex.join(
         [f"{key}={value}" for key, value in runtime_environment.items()]
-    )
-    unset_environment = "sudo systemctl unset-environment " + shlex.join(
+    )) if runtime_environment else None
+    unset_environment = ("sudo systemctl unset-environment " + shlex.join(
         list(runtime_environment)
-    )
+    )) if runtime_environment else None
     if ca_bundle:
-        unset_environment += "; sudo rm -f -- " + shlex.quote(ca_bundle)
+        unset_environment = ((unset_environment + "; ") if unset_environment else "") + \
+            "sudo rm -f -- " + shlex.quote(ca_bundle)
     rebuild = "sudo env NIX_REMOTE=local " + shlex.join(
         [f"{key}={value}" for key, value in runtime_environment.items()]
     ) + " nixos-rebuild switch --flake " + shlex.quote(flake)
     command = ["set -e"]
-    if ca_bundle and ca_certificate:
+    if ca_bundle:
+        certificates = ([ca_certificate] if ca_certificate else []) + list(additional_ca_certificates)
+        quoted_certificates = " ".join(shlex.quote(path) for path in certificates)
+        append_certificates = f" {quoted_certificates}" if quoted_certificates else ""
         command.append(
             "sudo sh -c " + shlex.quote(
                 "cat /etc/ssl/certs/ca-certificates.crt "
-                + shlex.quote(ca_certificate)
+                + append_certificates
                 + " > " + shlex.quote(ca_bundle)
                 + " && chmod 0644 " + shlex.quote(ca_bundle)
             )
         )
-    command.extend([
-        set_environment,
-        f"trap {shlex.quote(unset_environment)} EXIT",
-        "sudo systemctl restart nix-daemon.service",
-        rebuild,
-    ])
+    if set_environment:
+        command.append(set_environment)
+    if unset_environment:
+        command.append(f"trap {shlex.quote(unset_environment)} EXIT")
+    if runtime_environment:
+        command.append("sudo systemctl restart nix-daemon.service")
+    command.append(rebuild)
     return remote(c, "sh -c " + shlex.quote("\n".join(command)))
 
 
@@ -1470,11 +1676,13 @@ def update_config(extra=()):
     settings = tofu_guest_config(extra)
     c["guest_config"] = settings
     sync_guest_mitmproxy_ca(c)
+    guest_host_cas = sync_guest_host_ca(c)
     remote_stage = f"/tmp/nixvm-config-{os.getpid()}-{time.time_ns()}"
     with tempfile.TemporaryDirectory(prefix="nixvm-config-") as tmp:
         staged_nix = Path(tmp) / "nix"
         shutil.copytree(ROOT / "nix", staged_nix,
                         ignore=shutil.ignore_patterns("current.json", "result*"))
+        staged_host_cas = stage_host_ca_certificates(staged_nix)
         ca_certificate = ROOT / ".runtime" / "shared" / "mitmproxy-ca-cert.pem"
         if ca_certificate.is_file():
             shutil.copyfile(ca_certificate, staged_nix / "machines" / "mitmproxy-ca.pem")
@@ -1489,10 +1697,13 @@ def update_config(extra=()):
                  str(staged_nix) + "/", f"{ssh[-1]}:{remote_stage}/nix/"])
             flake = f"path:{remote_stage}/nix#nixvm"
             guest_ca = f"{remote_stage}/nix/machines/mitmproxy-ca.pem"
-            bundle = f"/tmp/nixvm-mitmproxy-ca-{os.getpid()}.pem" if ca_certificate.is_file() else None
+            proxy_ca = ca_certificate.is_file() and settings.get("mitmproxy", {}).get("enabled")
+            bundle = (f"/tmp/nixvm-ca-{os.getpid()}.pem"
+                      if proxy_ca or staged_host_cas else None)
             run_nixos_rebuild(c, flake, settings,
                               ca_bundle=bundle,
-                              ca_certificate=guest_ca if bundle else None)
+                              ca_certificate=guest_ca if proxy_ca else None,
+                              additional_ca_certificates=guest_host_cas)
         finally:
             remote(c, f"rm -rf -- {shlex.quote(remote_stage)}")
     print("Activated the host NixOS configuration in the guest.")
@@ -1508,6 +1719,12 @@ def sync_guest_mitmproxy_ca(c):
     ssh = ssh_args(c)
     run(["rsync", "-a", "--protect-args", "-e", shlex.join(ssh[:-1]),
          str(certificate), f"{ssh[-1]}:{target}"])
+
+
+def copy_host_cas(extra=()):
+    """Explicitly snapshot selected host CA anchors and activate them in the guest."""
+    refresh_host_ca_cache()
+    update_config(extra)
 
 
 def preflight(c):
@@ -1696,7 +1913,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=["build-image", "remove-image", "define-network-filter", "firewall-test", "check-host-nfs", "setup-host-nfs", "setup-host-firewall", "setup-host-mitmproxy", "cleanup-host-mitmproxy", "setup-hostname", "cleanup-hostname", "bootstrap", "preflight", "ssh", "spice", "forward", "ensure-vm-nat",
                         "usb-attach", "usb-detach", "rebuild", "rollback", "password", "reboot", "start", "stop",
-                        "reprovision", "import-public-keys", "gpu-check", "token-check", "update-config", "ip"])
+                        "reprovision", "import-public-keys", "gpu-check", "token-check", "update-config", "copy-host-cas", "ip"])
     parser.add_argument("--name", default=os.environ.get("NIXVM_PROFILE", "nixvm"),
                         help="VM name for remove-image (defaults to nixvm)")
     parser.add_argument("--device", help="YubiKey USB port name or serial; mandatory if selection is ambiguous")
@@ -1780,6 +1997,8 @@ def main():
         remote(c, "nixvm-gpu-check")
     elif args.command == "update-config":
         update_config(extra)
+    elif args.command == "copy-host-cas":
+        copy_host_cas(extra)
     elif args.command == "token-check":
         print("Checking PIV through the selected PC/SC socket; protocol mismatch errors require compatible pcsc-lite versions.")
         remote(c, "nixvm-piv --list-slots")

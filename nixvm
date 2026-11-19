@@ -32,6 +32,7 @@ VM lifecycle:
   ip                         Print the VM's current IPv4 address
   rebuild | rollback         Rebuild or roll back the guest system
   update-config              Activate this host checkout's NixOS config in the guest
+  copy-cas                   Copy host custom CA certificates into the guest trust store
   reboot | password          Reboot the guest or change its password
   reprovision [tofu options] Retry OpenTofu bootstrap
 
@@ -41,6 +42,7 @@ Host setup:
   mitmproxy password         Print the selected VM's mitmweb UI password
   mitmproxy cleanup          Stop and remove the host mitmproxy setup
   image remove              Remove this VM's image and workstation build cache
+  cache clean [--delete-old] Collect garbage from the host Nix store
   firewall-test [var options] Check the managed firewall network and policy
 
 VM name defaults to nixvm. The matching infrastructure/<name>.tfvars file is
@@ -243,9 +245,9 @@ def main(arguments):
         return 0
     command, *extra = arguments
     commands = {"up", "apply", "u", "init", "plan", "destroy", "preflight", "firewall-test",
-                "nfs", "mitmproxy", "image", "reprovision", "ssh", "ip", "start", "s", "stop", "rebuild",
+                "nfs", "mitmproxy", "image", "cache", "reprovision", "ssh", "ip", "start", "s", "stop", "rebuild",
                 "rollback", "reboot", "password", "forward", "usb-attach", "usb-detach",
-                "gpu-check", "token-check", "import-public-keys", "update-config", "spice"}
+                "gpu-check", "token-check", "import-public-keys", "update-config", "copy-cas", "spice"}
     if command not in commands:
         raise ValueError(f"Unknown command: {command}. Run 'nixvm help' for usage.")
     profile = name
@@ -253,7 +255,7 @@ def main(arguments):
     os.environ["NIXVM_PROFILE"] = profile
     if command == "init":
         pass
-    elif command != "mitmproxy":
+    elif command not in {"mitmproxy", "cache"}:
         ensure_workspace(profile)
     if command in ("up", "apply", "u"):
         variables, operation = split_arguments(extra, profile)
@@ -314,6 +316,20 @@ def main(arguments):
         if len(extra) != 1 or extra[0] != "remove":
             raise ValueError("Use 'nixvm [-n NAME] image remove'")
         internal("remove-image", ["--name", profile])
+    elif command == "cache":
+        if not extra or extra[0] != "clean" or len(extra) > 2:
+            raise ValueError("Use 'nixvm cache clean [--delete-old]'")
+        if len(extra) == 2 and extra[1] != "--delete-old":
+            raise ValueError("The only supported option for 'nixvm cache clean' is --delete-old")
+        collector = shutil.which("nix-collect-garbage")
+        if collector is None:
+            raise ValueError(
+                "nix-collect-garbage was not found in your PATH; make sure the Nix profile is loaded"
+            )
+        command_args = ["sudo", collector]
+        if len(extra) == 2:
+            command_args.append("--delete-old")
+        run(command_args)
     elif command == "mitmproxy":
         if not extra or extra[0] not in ("password", "cleanup"):
             raise ValueError("Use 'nixvm mitmproxy password [-var-file=PATH]' or 'nixvm mitmproxy cleanup'")
@@ -347,6 +363,11 @@ def main(arguments):
         if operation:
             raise ValueError("nixvm update-config accepts only -var-file and -var options")
         internal("update-config", variables)
+    elif command == "copy-cas":
+        variables, operation = split_arguments(extra, profile)
+        if operation:
+            raise ValueError("nixvm copy-cas accepts only -var-file and -var options")
+        internal("copy-host-cas", variables)
     elif command in {"ssh", "ip", "start", "s", "stop", "rebuild", "rollback", "reboot",
                      "password", "forward", "usb-attach", "usb-detach", "gpu-check",
                      "token-check", "import-public-keys", "spice"}:
