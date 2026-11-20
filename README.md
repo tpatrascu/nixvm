@@ -55,17 +55,18 @@ with mode `0660`; the pool directory is mode `0770`. Check host IDs with
 `disk_permissions.gid` accordingly. The VM uses one managed disk in the
 dedicated pool. Reprovisioning does not replace it automatically.
 
-Both this directory and `~/.dotfiles` should be Git working trees. Provisioning
-copies each directory as-is, including `.git`, ignored files, and uncommitted
-changes. Git worktrees have a host-specific `.git` pointer, so use a regular
-clone instead. Review the contents before provisioning; secrets and caches are
-copied too.
+This directory and the configured dotfiles source should be Git working trees.
+If the default `~/.dotfiles` path is missing, `nixvm up` creates it as an empty
+Git repository. Provisioning copies each directory as-is, including `.git`,
+ignored files, and uncommitted changes. Git worktrees have a host-specific
+`.git` pointer, so use a regular clone instead. Review the contents before
+provisioning; secrets and caches are copied too.
 
 ## Create the VM
 
 ```sh
 cp infrastructure/nixvm.tfvars.example infrastructure/nixvm.tfvars
-# Edit: replace ssh_public_keys with an actual key and set repository paths.
+# Edit repository and dotfiles paths as needed.
 ./nixvm init
 ./nixvm preflight
 ./nixvm plan
@@ -106,13 +107,13 @@ virsh -c qemu:///system undefine nixvm --keep-nvram
 This removes only the stale domain definition; it leaves the managed VM disk
 and NVRAM files in place for OpenTofu to reuse.
 
-The example is intentionally not usable until its placeholder public key is
-replaced. `ssh_public_keys` accepts multiple SSH public keys; add each key as a
-separate list entry to retain access from more than one host or authenticator.
-Set `ssh_identity_file` in `nixvm.tfvars` to force a specific local private key
-for Terraform provisioning; the SSH command then uses `IdentitiesOnly` and does
-not fall back to other keys in the agent. If unset, OpenSSH may use the host
-agent. The private key stays outside the guest and OpenTofu state.
+`nixvm up` creates or reuses a profile-specific Ed25519 key at
+`~/.ssh/nixvm/<profile>_ed25519`, replaces the example placeholder in the
+selected tfvars file with its public key, and uses that identity for SSH. Run
+`./nixvm keygen` to create the key ahead of time. `ssh_public_keys` accepts
+additional host keys as separate list entries.
+Set `ssh_identity_file` in `nixvm.tfvars` to select a different private key for
+SSH; the private key stays outside the guest and OpenTofu state.
 Passwords are set interactively after provisioning and survive rebuilds. The
 development user has passwordless sudo; root SSH and SSH password login are off.
 

@@ -25,6 +25,7 @@ def usage():
 
 VM lifecycle:
   up | apply [tofu options]  Prepare host services/firewall, apply VM, activate config, test firewall
+  keygen                     Generate the host SSH key used by `up`
   u [tofu options]           Apply infrastructure, then activate host NixOS config
   init [tofu options]        Initialize OpenTofu
   plan [tofu options]        Run tofu plan
@@ -193,6 +194,134 @@ def split_arguments(arguments, name="nixvm"):
     return variables, operation
 
 
+def ensure_ssh_key(name):
+    """Create or reuse the profile's dedicated host keypair."""
+    ssh_keygen = shutil.which("ssh-keygen")
+    if ssh_keygen is None:
+        raise ValueError("ssh-keygen was not found in PATH; install OpenSSH and rerun nixvm up")
+
+    key_directory = Path.home() / ".ssh" / "nixvm"
+    key_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    key_directory.chmod(0o700)
+    identity = key_directory / f"{name}_ed25519"
+    public_file = Path(f"{identity}.pub")
+
+    if identity.exists() != public_file.exists():
+        raise ValueError(
+            f"Incomplete nixvm SSH keypair at {identity}; restore both files or move the remaining file aside"
+        )
+    if not identity.exists():
+        subprocess.run([
+            ssh_keygen, "-q", "-t", "ed25519", "-N", "", "-C", f"nixvm:{name}", "-f", str(identity)
+        ], check=True)
+        print(f"Generated SSH key for {name}: {identity}")
+
+    public_key = public_file.read_text(encoding="utf-8").strip()
+    if "\n" in public_key or not public_key.startswith("ssh-ed25519 "):
+        raise ValueError(f"Invalid SSH public key in {public_file}")
+    derived = subprocess.run(
+        [ssh_keygen, "-y", "-P", "", "-f", str(identity)],
+        check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    if derived.returncode:
+        raise ValueError(f"Could not read the unencrypted private key at {identity}")
+    if derived.stdout.split()[:2] != public_key.split()[:2]:
+        raise ValueError(f"SSH public and private keys do not match: {identity} and {public_file}")
+    return identity.resolve(), public_key
+
+
+def configured_ssh_settings(variables, public_key):
+    """Resolve SSH variables through OpenTofu so profile and CLI overrides survive."""
+    expression = (
+        "jsonencode({keys = var.ssh_public_keys, identity = var.ssh_identity_file, "
+        "dotfiles = abspath(pathexpand(var.dotfiles_path))})\n"
+    )
+    command = ["tofu", f"-chdir={INFRA}", "console", *variables]
+    result = subprocess.run(command, cwd=ROOT, input=expression, check=False, text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if result.returncode and "ssh_public_keys" in result.stderr and "required variable" in result.stderr.lower():
+        # A profile without a tfvars file can rely on the generated key alone.
+        result = subprocess.run(
+            [*command, f"-var=ssh_public_keys={json.dumps([public_key])}"],
+            cwd=ROOT, input=expression, check=False, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+    if result.returncode:
+        detail = result.stderr.strip()
+        raise RuntimeError(
+            "Could not resolve SSH settings for nixvm up" + (f":\n{detail}" if detail else "")
+        )
+    try:
+        settings = json.loads(result.stdout.strip())
+        if isinstance(settings, str):
+            settings = json.loads(settings)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("OpenTofu returned invalid SSH settings for nixvm up") from error
+    if not isinstance(settings, dict) or not isinstance(settings.get("keys"), list):
+        raise RuntimeError("OpenTofu returned invalid SSH settings for nixvm up")
+    return settings
+
+
+def ensure_dotfiles_checkout(path):
+    """Create the default empty dotfiles checkout when it is missing."""
+    path = Path(path).expanduser()
+    default_path = (Path.home() / ".dotfiles").resolve()
+    if not path.exists():
+        if path.resolve() != default_path:
+            raise FileNotFoundError(f"Configured dotfiles_path does not exist: {path}")
+        subprocess.run(["git", "init", "--quiet", str(path)], cwd=ROOT, check=True)
+        print(f"Created empty dotfiles Git repository at {path}")
+    elif not (path / ".git").exists():
+        raise ValueError(f"Configured dotfiles_path is not a Git working tree: {path}")
+
+
+def persist_generated_public_key(variables, name, public_key):
+    """Replace the example key in the selected tfvars file, if present."""
+    if any(argument.startswith("-var=ssh_public_keys=") for argument in variables):
+        return
+
+    variable_files = [
+        argument.split("=", 1)[1]
+        for argument in variables if argument.startswith("-var-file=")
+    ]
+    if variable_files:
+        var_file = Path(variable_files[-1])
+    else:
+        configured = os.environ.get("NIXVM_VAR_FILE")
+        var_file = resolve_var_file(configured) if configured else INFRA / f"{name}.tfvars"
+
+    if not var_file.is_file():
+        return
+    contents = var_file.read_text(encoding="utf-8")
+    placeholder = '"ssh-ed25519 REPLACE_WITH_YOUR_PUBLIC_KEY"'
+    if placeholder not in contents:
+        return
+    var_file.write_text(contents.replace(placeholder, json.dumps(public_key), 1), encoding="utf-8")
+    print(f"Added generated public key to {var_file}")
+
+
+def up_ssh_variables(variables, name):
+    """Add the generated host key to this apply and save its identity path."""
+    identity, public_key = ensure_ssh_key(name)
+    persist_generated_public_key(variables, name, public_key)
+    settings = configured_ssh_settings(variables, public_key)
+    ensure_dotfiles_checkout(settings["dotfiles"])
+    keys = [
+        key for key in settings["keys"]
+        if isinstance(key, str) and "REPLACE_WITH_YOUR_PUBLIC_KEY" not in key
+    ]
+    if public_key not in keys:
+        keys.append(public_key)
+
+    configured_identity = settings.get("identity", "")
+    identity_path = Path(configured_identity).expanduser() if configured_identity else identity
+    return [
+        *variables,
+        f"-var=ssh_public_keys={json.dumps(keys)}",
+        f"-var=ssh_identity_file={identity_path}",
+    ]
+
+
 def resolve_var_file(value):
     path = Path(value).expanduser()
     if not path.is_absolute():
@@ -203,6 +332,16 @@ def resolve_var_file(value):
 
 def tofu(command, arguments):
     run(["tofu", f"-chdir={INFRA}", command, *arguments])
+
+
+def show_tofu_state():
+    """Display the state after an apply, including partial state after failure."""
+    result = subprocess.run(
+        ["tofu", f"-chdir={INFRA}", "show", "-no-color"],
+        cwd=ROOT, check=False,
+    )
+    if result.returncode:
+        print(f"tofu show exited with status {result.returncode}", file=sys.stderr)
 
 
 def current_vm_name():
@@ -302,7 +441,7 @@ def main(arguments):
         usage()
         return 0
     command, *extra = arguments
-    commands = {"up", "apply", "u", "init", "plan", "destroy", "preflight", "firewall-test",
+    commands = {"up", "apply", "u", "init", "plan", "destroy", "preflight", "firewall-test", "keygen",
                 "nfs", "mitm", "image", "cache", "reprovision", "ssh", "ip", "start", "s", "stop", "rebuild",
                 "rollback", "reboot", "password", "forward", "usb-attach", "usb-detach",
                 "gpu-check", "token-check", "import-public-keys", "update-config", "copy-cas", "spice"}
@@ -313,10 +452,16 @@ def main(arguments):
     os.environ["NIXVM_PROFILE"] = profile
     if command == "init":
         pass
-    elif command not in {"mitm", "cache"}:
+    elif command not in {"mitm", "cache", "keygen"}:
         ensure_workspace(profile)
-    if command in ("up", "apply", "u"):
+    if command == "keygen":
+        if extra:
+            raise ValueError("nixvm keygen accepts no options")
+        identity, _ = ensure_ssh_key(profile)
+        print(f"SSH identity for {profile}: {identity}")
+    elif command in ("up", "apply", "u"):
         variables, operation = split_arguments(extra, profile)
+        variables = up_ssh_variables(variables, profile)
         internal("setup-host-nfs", variables)
         internal("check-host-nfs", variables)
         internal("define-network-filter", variables)
@@ -326,7 +471,10 @@ def main(arguments):
         apply_args = [*variables, *operation]
         if "-auto-approve" not in apply_args:
             apply_args.append("-auto-approve")
-        tofu("apply", apply_args)
+        try:
+            tofu("apply", apply_args)
+        finally:
+            show_tofu_state()
         internal("update-config", variables)
         firewall_tests(variables)
         internal("setup-hostname")
@@ -416,13 +564,17 @@ def main(arguments):
             open_mitmproxy_web(password)
     elif command == "reprovision":
         variables, operation = split_arguments(extra, profile)
+        variables = up_ssh_variables(variables, profile)
         internal("setup-host-nfs", variables)
         internal("check-host-nfs", variables)
         internal("define-network-filter", variables)
         internal("ensure-vm-nat", variables)
         internal("setup-host-firewall", variables)
         internal("setup-host-mitmproxy", variables)
-        tofu("apply", [*variables, "-replace=terraform_data.bootstrap", *operation])
+        try:
+            tofu("apply", [*variables, "-replace=terraform_data.bootstrap", *operation])
+        finally:
+            show_tofu_state()
         internal("update-config", variables)
     elif command == "update-config":
         variables, operation = split_arguments(extra, profile)

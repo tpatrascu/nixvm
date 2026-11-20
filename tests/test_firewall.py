@@ -453,7 +453,9 @@ class NixvmFirewallTest(unittest.TestCase):
     def test_up_runs_live_firewall_tests_after_apply(self):
         events = []
         with patch.object(nixvm_wrapper, "split_arguments", return_value=([], [])), \
+             patch.object(nixvm_wrapper, "up_ssh_variables", return_value=[]), \
              patch.object(nixvm_wrapper, "ensure_workspace"), \
+             patch.object(nixvm_wrapper, "show_tofu_state"), \
              patch.object(nixvm_wrapper, "firewall_tests",
                           side_effect=lambda *_: events.append("firewall-tests")), \
              patch.object(nixvm_wrapper, "internal",

@@ -82,6 +82,10 @@ def ssh_args(c, *, tty=False):
             "-o", "ConnectTimeout=5", "-o", "BatchMode=yes"]
     identity = os.environ.get("NIXVM_SSH_IDENTITY") or c.get("identity")
     if identity:
+        # Older up runs passed a quoted scalar to OpenTofu, which stored the
+        # quote characters in the connection output. Accept that state format.
+        if len(identity) >= 2 and identity[0] == identity[-1] == '"':
+            identity = identity[1:-1]
         args += ["-i", str(Path(identity).expanduser()), "-o", "IdentitiesOnly=yes"]
     if tty:
         args += ["-t"]
@@ -398,13 +402,18 @@ def add_host_address_blocks(access):
 def existing_network_filter_uuid(uri, name):
     result = subprocess.run(
         ["virsh", "--connect", uri, "nwfilter-dumpxml", name],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env={**os.environ, "LC_ALL": "C"},
     )
     if result.returncode:
-        message = (result.stdout + result.stderr).lower()
+        detail = result.stderr.strip() or result.stdout.strip()
+        message = detail.lower()
         if "failed to get nwfilter" in message or "no nwfilter" in message:
             return None
-        raise subprocess.CalledProcessError(result.returncode, result.args, result.stdout, result.stderr)
+        raise RuntimeError(
+            f"Could not look up libvirt network filter {name!r} on {uri} "
+            f"(virsh exit status {result.returncode})."
+            + (f"\n{detail}" if detail else "")
+        )
 
     try:
         existing = ET.fromstring(result.stdout)
