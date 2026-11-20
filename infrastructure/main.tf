@@ -94,6 +94,7 @@ locals {
   }
   network_filter_access = {
     host = {
+      dhcp_server = local.vm_network.gateway
       ips = distinct(concat([local.vm_network.gateway], var.host_access.ips,
       length(var.host_nfs_exports) > 0 ? [local.guest_config.hostAddress] : []))
       tcp_ports = var.host_access.all_ports ? [] : distinct(concat(var.host_access.tcp_ports,

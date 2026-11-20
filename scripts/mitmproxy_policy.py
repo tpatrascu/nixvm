@@ -6,6 +6,7 @@ import fnmatch
 import ipaddress
 import json
 import os
+from pathlib import Path
 import re
 import socket
 
@@ -77,6 +78,37 @@ class NixvmPolicy:
             for network in self.denied_networks
         )
 
+    @staticmethod
+    def host_interface_addresses():
+        """Read current host addresses from the shared Linux network namespace."""
+        addresses = set()
+        try:
+            ipv4_routes = Path("/proc/net/fib_trie").read_text(encoding="ascii").splitlines()
+        except OSError as error:
+            return None, f"could not inspect local IPv4 addresses: {error}"
+
+        for index, line in enumerate(ipv4_routes):
+            if line.strip() != "/32 host LOCAL":
+                continue
+            for candidate in reversed(ipv4_routes[max(0, index - 2):index]):
+                match = re.search(r"\|--\s+(\d+(?:\.\d+){3})\s*$", candidate)
+                if match:
+                    addresses.add(ipaddress.IPv4Address(match.group(1)).compressed)
+                    break
+
+        try:
+            ipv6_interfaces = Path("/proc/net/if_inet6").read_text(encoding="ascii")
+        except FileNotFoundError:
+            ipv6_interfaces = ""
+        except OSError as error:
+            return None, f"could not inspect local IPv6 addresses: {error}"
+
+        for line in ipv6_interfaces.splitlines():
+            fields = line.split()
+            if fields and re.fullmatch(r"[0-9a-fA-F]{32}", fields[0]):
+                addresses.add(ipaddress.IPv6Address(bytes.fromhex(fields[0])).compressed)
+        return addresses, None
+
     def internal_rule_allows(self, host: str, port: int, address: str) -> bool:
         rule = self.allowed_internal_hosts.get(self.normalize_domain(host))
         if not rule or port not in rule["ports"]:
@@ -92,6 +124,10 @@ class NixvmPolicy:
         internal_rule = self.allowed_internal_hosts.get(hostname)
         if internal_rule and port not in internal_rule["ports"]:
             return None, f"port {port} is not allowed for internal destination {hostname}"
+
+        local_addresses, error = self.host_interface_addresses()
+        if error:
+            return None, error
 
         try:
             literal = ipaddress.ip_address(host)
@@ -114,6 +150,8 @@ class NixvmPolicy:
                 parsed = ipaddress.ip_address(address.split("%", 1)[0])
             except ValueError:
                 return None, "resolver returned an invalid destination address"
+            if parsed.compressed in local_addresses:
+                return None, f"destination address {parsed} is assigned to this host"
             denied = self.address_is_denied(parsed.compressed)
             if internal_rule and parsed.compressed not in internal_rule["ips"]:
                 return None, f"destination address {parsed} is not allowed for internal hostname {hostname}"

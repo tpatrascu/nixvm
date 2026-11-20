@@ -150,7 +150,12 @@ project does not use either. Configure them explicitly if your dotfiles do.
 OpenTofu defines a host-side libvirt network filter and attaches it to the VM's
 interface. It blocks guest-initiated traffic to the standard special-use,
 private, documentation, benchmarking, multicast, link-local, and reserved
-IPv4/IPv6 ranges unless explicitly allowed by the host configuration. With
+IPv4/IPv6 ranges unless explicitly allowed by the host configuration. It also
+blocks new connections to the host's current interface addresses, including
+globally scoped IPv6 addresses; explicit entries in `host_access.ips` and
+`internal_network_allow` are the exceptions.
+DHCPv4 client traffic is limited to the VM's libvirt gateway and the isolated
+bridge's limited broadcast. Other DHCP client/server ports are blocked. With
 mitmproxy enabled, it also blocks guest egress to TCP and UDP destination ports
 in `mitm_proxy_blocked_http_ports`, which defaults to `[80, 443, 8443, 8080,
 8081, 8082]`. The only web-proxy exception is TCP/8080 to the host's managed
@@ -204,10 +209,12 @@ configured image each time `up` runs and enables a persistent systemd user
 timer that checks this container for registry updates daily. When the image
 changes, Podman restarts the proxy service with the updated image. The default
 `docker.io/mitmproxy/mitmproxy:latest` tag tracks the latest stable release.
-One host service is shared by all VMs. The container uses Podman's
-rootless pasta network and publishes proxy port 8080 on host interfaces so
-each VM can reach it through its own network gateway. The mitmweb traffic
-viewer is bound to host loopback at
+One host service is shared by all VMs. The container shares the host network
+namespace so it follows live route and DNS changes when a laptop moves between
+Wi-Fi and wired networks, including when the service starts before a network is
+available. The proxy listens on host interfaces at port 8080; each VM reaches it
+through its own network gateway, with UFW rules scoped to that VM's subnet and
+gateway address. The mitmweb traffic viewer is bound only to host loopback at
 [http://127.0.0.1:8081](http://127.0.0.1:8081).
 Open the UI and log in automatically with:
 
@@ -260,9 +267,13 @@ decrypted; an empty list decrypts none. It accepts the same hostname, glob, and
 regex forms. The VM trusts the proxy's generated CA, which `nixvm up` copies
 into the guest configuration.
 The mitmproxy add-on also denies connections whose destination resolves into
-any CIDR in `internal_network_deny`, matching the guest-side filter. The host
-CA private key stays in the Podman volume; only its public certificate is
-copied to the guest. The mitmweb UI shows live flows and keeps them in memory.
+any CIDR in `internal_network_deny`, matching the guest-side filter, and denies
+addresses currently assigned to the host even when they are globally scoped.
+Only the named IP and port pairs in `allowed_internal_hosts` can override the
+CIDR deny; host-assigned addresses remain denied. This is proxy-request policy;
+the container shares the host network namespace. The host CA private key stays
+in the Podman volume; only its public certificate is copied to the guest. The
+mitmweb UI shows live flows and keeps them in memory.
 
 `nixvm up` installs the CA and configures lowercase and uppercase proxy
 environment variables for login sessions and system services, GNOME's desktop

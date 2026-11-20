@@ -36,6 +36,7 @@ class NixvmFirewallTest(unittest.TestCase):
     def setUp(self):
         self.access = {
             "host": {
+                "dhcp_server": "192.168.124.1",
                 "ips": ["192.168.124.1"],
                 "tcp_ports": [53, 2049],
                 "udp_ports": [53],
@@ -203,19 +204,77 @@ class NixvmFirewallTest(unittest.TestCase):
         denies = self.rules(action="drop", priority=900, element="all")
         self.assertTrue(denies)
 
-    def test_dhcp_client_requests_are_allowed_before_broadcast_denies(self):
+    def test_dhcp_client_requests_are_limited_to_gateway_and_broadcast(self):
         rules = self.filter.findall("rule")
         dhcp = [rule for rule in rules
                 if rule.get("action") == "accept" and rule.get("priority") == "75"
                 and rule.find("udp") is not None]
-        self.assertEqual(len(dhcp), 1)
-        self.assertEqual(dhcp[0].find("udp").attrib, {
+        self.assertEqual({rule[0].get("dstipaddr") for rule in dhcp},
+                         {"192.168.124.1", "255.255.255.255"})
+        self.assertTrue(all({key: value for key, value in rule.find("udp").attrib.items()
+                             if key != "dstipaddr"} == {
             "srcportstart": "68", "srcportend": "68",
             "dstportstart": "67", "dstportend": "67",
-        })
-        self.assertLess(rules.index(dhcp[0]), min(
-            rules.index(rule) for rule in self.rules(action="drop", priority=900)
+        } for rule in dhcp))
+        dhcp_port_drops = [rule for rule in rules
+                           if rule.get("action") == "drop" and rule.get("priority") == "80"
+                           and rule.find("udp") is not None]
+        self.assertTrue(any(rule.find("udp").get("dstportstart") == "67"
+                            for rule in dhcp_port_drops))
+        self.assertTrue(any(rule.find("udp").get("srcportstart") == "68"
+                            for rule in dhcp_port_drops))
+        self.assertLess(max(rules.index(rule) for rule in dhcp),
+                        min(rules.index(rule) for rule in dhcp_port_drops))
+
+    def test_public_host_addresses_are_dropped_before_host_access_rules(self):
+        access = json.loads(json.dumps(self.access))
+        access["host"]["blocked_ips"] = ["2a02:2f04::1234"]
+        policy = nixvm.build_network_filter("nixvm-access", access)
+        rules = policy.findall("rule")
+        host_drop = next(rule for rule in rules
+                         if rule.get("action") == "drop" and rule.get("priority") == "80"
+                         and rule.find("ipv6") is not None
+                         and rule.find("ipv6").get("dstipaddr") == "2a02:2f04::1234")
+        self.assertEqual(host_drop.get("statematch"), "false")
+        self.assertLess(rules.index(host_drop), min(
+            rules.index(rule) for rule in rules
+            if rule.get("action") == "accept" and rule.get("priority") == "100"
         ))
+
+    def test_host_addresses_are_blocked_except_explicit_host_access_ips(self):
+        access = json.loads(json.dumps(self.access))
+        access["host"]["ips"].append("192.0.2.20")
+        access["internal"]["allow"].append({
+            "ip": "192.0.2.21", "tcp_ports": [49231], "udp_ports": [],
+            "all_ports": False, "managed_allow": True,
+        })
+        with patch.object(nixvm, "host_interface_addresses",
+                          return_value={"192.168.124.1", "192.0.2.20", "192.0.2.21",
+                                        "2001:db8::20"}):
+            nixvm.add_host_address_blocks(access)
+        self.assertEqual(access["host"]["blocked_ips"], ["2001:db8::20"])
+
+    def test_host_interface_address_discovery_includes_live_global_ipv6(self):
+        ipv4_table = """Main:
+           |-- 192.0.2.15
+              /32 host LOCAL
+        Local:
+           |-- 192.0.2.15
+              /32 host LOCAL
+"""
+        ipv6_table = "2a022f049406d900605d31a7d6920f87 02 40 00 01 enx0\n"
+        original_read_text = Path.read_text
+
+        def fake_read_text(path, encoding=None):
+            if path == Path("/proc/net/fib_trie"):
+                return ipv4_table
+            if path == Path("/proc/net/if_inet6"):
+                return ipv6_table
+            return original_read_text(path, encoding=encoding)
+
+        with patch.object(Path, "read_text", fake_read_text):
+            addresses = nixvm.host_interface_addresses()
+        self.assertEqual(addresses, {"192.0.2.15", "2a02:2f04:9406:d900:605d:31a7:d692:f87"})
 
     def test_nixvm_firewall_test_gateway_is_covered_by_an_internal_deny_rule(self):
         config = json.loads(os.environ.get("NIXVM_FIREWALL_TEST_CONFIG", "{}"))

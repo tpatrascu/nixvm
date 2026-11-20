@@ -322,6 +322,50 @@ def add_network_access_rules(root, access):
                 )
 
 
+def host_interface_addresses():
+    """Return all addresses currently assigned to host interfaces on Linux."""
+    addresses = set()
+    try:
+        ipv4_routes = Path("/proc/net/fib_trie").read_text(encoding="ascii").splitlines()
+    except OSError as error:
+        raise RuntimeError(f"Could not inspect host IPv4 interface addresses: {error}") from error
+
+    for index, line in enumerate(ipv4_routes):
+        if line.strip() != "/32 host LOCAL":
+            continue
+        for candidate in reversed(ipv4_routes[max(0, index - 2):index]):
+            match = re.search(r"\|--\s+(\d+(?:\.\d+){3})\s*$", candidate)
+            if match:
+                addresses.add(ipaddress.IPv4Address(match.group(1)).compressed)
+                break
+
+    try:
+        ipv6_interfaces = Path("/proc/net/if_inet6").read_text(encoding="ascii")
+    except FileNotFoundError:
+        ipv6_interfaces = ""
+    except OSError as error:
+        raise RuntimeError(f"Could not inspect host IPv6 interface addresses: {error}") from error
+
+    for line in ipv6_interfaces.splitlines():
+        fields = line.split()
+        if fields and re.fullmatch(r"[0-9a-fA-F]{32}", fields[0]):
+            addresses.add(ipaddress.IPv6Address(bytes.fromhex(fields[0])).compressed)
+    if not addresses:
+        raise RuntimeError("Could not find any current host interface addresses for the VM firewall.")
+    return addresses
+
+
+def add_host_address_blocks(access):
+    """Block current host IPs except addresses explicitly opened by policy."""
+    host = access["host"]
+    explicitly_allowed = {ipaddress.ip_address(value).compressed for value in host["ips"]}
+    explicitly_allowed.update(
+        ipaddress.ip_address(rule["ip"]).compressed
+        for rule in access["internal"].get("allow", [])
+    )
+    host["blocked_ips"] = sorted(host_interface_addresses() - explicitly_allowed)
+
+
 def existing_network_filter_uuid(uri, name):
     result = subprocess.run(
         ["virsh", "--connect", uri, "nwfilter-dumpxml", name],
@@ -368,11 +412,41 @@ def build_network_filter(name, access, filter_uuid=None):
     ET.SubElement(root, "filterref", {"filter": "qemu-announce-self-rarp"})
     add_network_filter_rule(root, "accept", element="all", priority=50,
                             state="ESTABLISHED,RELATED")
-    # DHCP client requests use UDP 68 -> 67, including limited-broadcast
-    # destinations that are otherwise denied by the internal-range policy.
+    # DHCPv4 client requests may reach only the libvirt DHCP server or the
+    # limited broadcast on this isolated bridge. Other DHCP ports are blocked.
+    dhcp_match = {"srcportstart": 68, "srcportend": 68,
+                  "dstportstart": 67, "dstportend": 67}
+    dhcp_server = access["host"].get("dhcp_server")
+    if dhcp_server:
+        add_network_filter_rule(root, "accept", element="udp", priority=75,
+                                dstipaddr=ipaddress.ip_address(dhcp_server).compressed,
+                                **dhcp_match)
     add_network_filter_rule(root, "accept", element="udp", priority=75,
-                            srcportstart=68, srcportend=68,
-                            dstportstart=67, dstportend=67)
+                            dstipaddr="255.255.255.255", **dhcp_match)
+
+    # Protect live host addresses, including public IPv6 addresses. This runs
+    # before host_access allows so only explicit host_access IPs bypass it.
+    for address in sorted(access["host"].get("blocked_ips", []),
+                          key=lambda value: (ipaddress.ip_address(value).version,
+                                             ipaddress.ip_address(value))):
+        ip = ipaddress.ip_address(address)
+        add_network_filter_rule(
+            root, "drop", element="all" if ip.version == 4 else "ipv6", priority=80,
+            statematch=False if ip.version == 6 else None,
+            dstipaddr=ip.compressed, **({"state": "NEW"} if ip.version == 4 else {}),
+        )
+
+    # Do not let the guest use its DHCP client/server ports for other peers.
+    for port in (67, 68):
+        for field in ("src", "dst"):
+            add_network_filter_rule(root, "drop", element="udp", priority=80,
+                                    **{f"{field}portstart": port,
+                                       f"{field}portend": port})
+    for port in (546, 547):
+        for field in ("src", "dst"):
+            add_network_filter_rule(root, "drop", element="ipv6", priority=80,
+                                    protocol="udp", **{f"{field}portstart": port,
+                                                        f"{field}portend": port})
 
     # Host allow rules are explicit and are evaluated before internal-network
     # allow rules; remaining traffic to listed host IPs is denied.
@@ -451,6 +525,7 @@ def build_network_filter(name, access, filter_uuid=None):
 
 
 def define_network_filter_config(name, access, uri):
+    add_host_address_blocks(access)
     filter_uuid = existing_network_filter_uuid(uri, name)
     root = build_network_filter(name, access, filter_uuid)
 
@@ -496,7 +571,9 @@ def tofu_firewall_test_config(extra):
     result = run(["tofu", f"-chdir={ROOT / 'infrastructure'}", "console", *extra],
                  capture=True, input=expression + "\n").stdout.strip()
     try:
-        return json.loads(json.loads(result))
+        config = json.loads(json.loads(result))
+        add_host_address_blocks(config["filter_access"])
+        return config
     except (json.JSONDecodeError, TypeError) as error:
         raise RuntimeError(f"Could not read firewall test configuration from OpenTofu: {result}") from error
 
@@ -700,14 +777,14 @@ ContainerName={safe_name}
 Image={config['image']}
 AutoUpdate=registry
 Label=io.nixvm.service=nixvm-shared-mitmproxy
-Network=pasta
+# Share the host network namespace so route and DNS changes from NetworkManager
+# take effect immediately when the laptop switches between wired and Wi-Fi.
+Network=host
 Volume={systemd_unit_value(policy_dir)}:/etc/mitmproxy/nixvm:ro
 Volume={safe_name}-data:/home/mitmproxy/.mitmproxy
-PublishPort=0.0.0.0:8080:8080
-PublishPort=127.0.0.1:8081:8081
 Environment=NIXVM_MITMPROXY_POLICY=/etc/mitmproxy/nixvm/policy.json
 Entrypoint=mitmweb
-Exec=--mode regular@0.0.0.0:8080 --web-host 0.0.0.0 --web-port 8081 --set=web_open_browser=false --set=web_password={web_password} --set=confdir=/home/mitmproxy/.mitmproxy --set=show_ignored_hosts=true{upstream_ca_arg} --allow-hosts="{allow_hosts}" -s /etc/mitmproxy/nixvm/mitmproxy_policy.py
+Exec=--mode regular@0.0.0.0:8080 --web-host 127.0.0.1 --web-port 8081 --set=web_open_browser=false --set=web_password={web_password} --set=confdir=/home/mitmproxy/.mitmproxy --set=show_ignored_hosts=true{upstream_ca_arg} --allow-hosts="{allow_hosts}" -s /etc/mitmproxy/nixvm/mitmproxy_policy.py
 
 [Service]
 Restart=always
