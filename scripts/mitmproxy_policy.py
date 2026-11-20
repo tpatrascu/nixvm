@@ -73,10 +73,19 @@ class NixvmPolicy:
 
     def address_is_denied(self, address: str) -> bool:
         parsed = ipaddress.ip_address(address.split("%", 1)[0])
-        return any(
+        if any(
             parsed.version == network.version and parsed in network
             for network in self.denied_networks
-        )
+        ):
+            return True
+        if parsed.version != 6:
+            return False
+        networks, error = self.host_global_ipv6_networks()
+        if error:
+            # If the live interface policy cannot be read, fail closed for
+            # IPv6 rather than silently exposing a host LAN prefix.
+            return True
+        return any(parsed in network for network in networks)
 
     @staticmethod
     def host_interface_addresses():
@@ -108,6 +117,30 @@ class NixvmPolicy:
             if fields and re.fullmatch(r"[0-9a-fA-F]{32}", fields[0]):
                 addresses.add(ipaddress.IPv6Address(bytes.fromhex(fields[0])).compressed)
         return addresses, None
+
+    @staticmethod
+    def host_global_ipv6_networks():
+        """Read globally routable IPv6 interface prefixes from the host namespace."""
+        networks = set()
+        try:
+            ipv6_interfaces = Path("/proc/net/if_inet6").read_text(encoding="ascii")
+        except FileNotFoundError:
+            return networks, None
+        except OSError as error:
+            return None, f"could not inspect local IPv6 interface prefixes: {error}"
+
+        for line in ipv6_interfaces.splitlines():
+            fields = line.split()
+            if len(fields) < 3 or not re.fullmatch(r"[0-9a-fA-F]{32}", fields[0]):
+                continue
+            try:
+                address = ipaddress.IPv6Address(bytes.fromhex(fields[0]))
+                prefixlen = int(fields[2], 16)
+                if address.is_global and 0 <= prefixlen <= 128:
+                    networks.add(ipaddress.ip_network(f"{address}/{prefixlen}", strict=False))
+            except ValueError:
+                continue
+        return networks, None
 
     def internal_rule_allows(self, host: str, port: int, address: str) -> bool:
         rule = self.allowed_internal_hosts.get(self.normalize_domain(host))

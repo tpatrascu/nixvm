@@ -241,6 +241,43 @@ class NixvmFirewallTest(unittest.TestCase):
             if rule.get("action") == "accept" and rule.get("priority") == "100"
         ))
 
+    def test_live_global_ipv6_prefix_is_dropped_as_a_network(self):
+        access = json.loads(json.dumps(self.access))
+        access["internal"]["host_global_ipv6_networks"] = [
+            "2a02:2f04:9406:d900::/64"
+        ]
+        policy = nixvm.build_network_filter("nixvm-access", access)
+        prefix_drop = next(
+            rule for rule in policy.findall("rule")
+            if rule.get("action") == "drop" and rule.get("priority") == "900"
+            and rule.find("ipv6") is not None
+            and rule.find("ipv6").get("dstipaddr") == "2a02:2f04:9406:d900::"
+        )
+        self.assertEqual(prefix_drop.find("ipv6").get("dstipmask"), "64")
+
+    def test_host_prefix_discovery_uses_assigned_prefix_and_ignores_link_local(self):
+        ipv6_table = (
+            "2a022f049406d900605d31a7d6920f87 02 40 00 01 enx0\n"
+            "fe80000000000000025056fffe123456 02 40 20 01 enx0\n"
+        )
+        original_read_text = Path.read_text
+
+        def fake_read_text(path, encoding=None):
+            if path == Path("/proc/net/if_inet6"):
+                return ipv6_table
+            return original_read_text(path, encoding=encoding)
+
+        with patch.object(Path, "read_text", fake_read_text):
+            networks = nixvm.host_global_ipv6_networks()
+        self.assertEqual(networks, {ipaddress.ip_network("2a02:2f04:9406:d900::/64")})
+
+    def test_filter_refresh_timer_rechecks_host_addresses_regularly(self):
+        service, timer = nixvm.network_filter_refresh_units("nixvm", "/tmp/network-filter-policy.json")
+        self.assertIn("refresh-network-filter", service)
+        self.assertIn("OnBootSec=15s", timer)
+        self.assertIn("OnUnitActiveSec=30s", timer)
+        self.assertIn("Unit=nixvm-nwfilter-refresh.service", timer)
+
     def test_host_addresses_are_blocked_except_explicit_host_access_ips(self):
         access = json.loads(json.dumps(self.access))
         access["host"]["ips"].append("192.0.2.20")
@@ -250,9 +287,13 @@ class NixvmFirewallTest(unittest.TestCase):
         })
         with patch.object(nixvm, "host_interface_addresses",
                           return_value={"192.168.124.1", "192.0.2.20", "192.0.2.21",
-                                        "2001:db8::20"}):
+                                        "2001:db8::20"}), patch.object(
+                          nixvm, "host_global_ipv6_networks",
+                          return_value={ipaddress.ip_network("2a02:2f04::/64")}):
             nixvm.add_host_address_blocks(access)
         self.assertEqual(access["host"]["blocked_ips"], ["2001:db8::20"])
+        self.assertEqual(access["internal"]["host_global_ipv6_networks"],
+                         ["2a02:2f04::/64"])
 
     def test_host_interface_address_discovery_includes_live_global_ipv6(self):
         ipv4_table = """Main:

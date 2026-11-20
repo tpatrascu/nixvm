@@ -355,8 +355,32 @@ def host_interface_addresses():
     return addresses
 
 
+def host_global_ipv6_networks():
+    """Return globally routable IPv6 prefixes configured on host interfaces."""
+    try:
+        ipv6_interfaces = Path("/proc/net/if_inet6").read_text(encoding="ascii")
+    except FileNotFoundError:
+        return set()
+    except OSError as error:
+        raise RuntimeError(f"Could not inspect host IPv6 interface prefixes: {error}") from error
+
+    networks = set()
+    for line in ipv6_interfaces.splitlines():
+        fields = line.split()
+        if len(fields) < 3 or not re.fullmatch(r"[0-9a-fA-F]{32}", fields[0]):
+            continue
+        try:
+            address = ipaddress.IPv6Address(bytes.fromhex(fields[0]))
+            prefixlen = int(fields[2], 16)
+            if address.is_global and 0 <= prefixlen <= 128:
+                networks.add(ipaddress.ip_network(f"{address}/{prefixlen}", strict=False))
+        except ValueError:
+            continue
+    return networks
+
+
 def add_host_address_blocks(access):
-    """Block current host IPs except addresses explicitly opened by policy."""
+    """Block current host IPs and GUA prefixes, except explicit policy openings."""
     host = access["host"]
     explicitly_allowed = {ipaddress.ip_address(value).compressed for value in host["ips"]}
     explicitly_allowed.update(
@@ -364,6 +388,11 @@ def add_host_address_blocks(access):
         for rule in access["internal"].get("allow", [])
     )
     host["blocked_ips"] = sorted(host_interface_addresses() - explicitly_allowed)
+    access["internal"]["host_global_ipv6_networks"] = sorted(
+        (network.with_prefixlen for network in host_global_ipv6_networks()),
+        key=lambda value: (int(ipaddress.ip_network(value).network_address),
+                           ipaddress.ip_network(value).prefixlen),
+    )
 
 
 def existing_network_filter_uuid(uri, name):
@@ -504,6 +533,10 @@ def build_network_filter(name, access, filter_uuid=None):
         )
 
     internal_ranges = [ipaddress.ip_network(cidr) for cidr in access["internal"]["deny_cidrs"]]
+    internal_ranges.extend(
+        ipaddress.ip_network(cidr)
+        for cidr in access["internal"].get("host_global_ipv6_networks", [])
+    )
     for rule in internal_allow:
         if rule.get("managed_allow"):
             continue
@@ -537,6 +570,91 @@ def define_network_filter_config(name, access, uri):
     print(f"{action} host network filter: {name}")
 
 
+def network_filter_refresh_units(name, policy_file):
+    """Return user service and timer that refresh live host-address filter rules."""
+    script = Path(__file__).resolve()
+    python = sys.executable
+    policy_file = Path(policy_file).resolve()
+    service = f"""[Unit]
+Description=Refresh NixVM host network filter addresses
+
+[Service]
+Type=oneshot
+ExecStart={systemd_unit_value(python)} {systemd_unit_value(script)} refresh-network-filter --policy-file={systemd_unit_value(policy_file)}
+"""
+    timer = f"""[Unit]
+Description=Refresh NixVM host network filter addresses after network changes
+
+[Timer]
+OnBootSec=15s
+OnUnitActiveSec=30s
+AccuracySec=2s
+Unit={name}-nwfilter-refresh.service
+
+[Install]
+WantedBy=timers.target
+"""
+    return service, timer
+
+
+def install_network_filter_refresh(name, access, uri):
+    """Install a small user timer so address and prefix blocks follow roaming."""
+    state_dir = Path.home() / ".local" / "share" / "nixvm" / name
+    state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    state_dir.chmod(0o700)
+    policy_file = state_dir / "network-filter-policy.json"
+    saved_access = json.loads(json.dumps(access))
+    # These are regenerated from procfs each time the timer runs.
+    saved_access.get("host", {}).pop("blocked_ips", None)
+    saved_access.get("internal", {}).pop("host_global_ipv6_networks", None)
+    policy = {"filter_name": f"{name}-access", "filter_access": saved_access,
+              "connection": {"uri": uri}}
+    policy_file.write_text(json.dumps(policy, indent=2) + "\n", encoding="utf-8")
+    policy_file.chmod(0o600)
+
+    user_unit_dir = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "systemd" / "user"
+    user_unit_dir.mkdir(parents=True, exist_ok=True)
+    service_name = f"{name}-nwfilter-refresh"
+    service, timer = network_filter_refresh_units(name, policy_file)
+    service_file = user_unit_dir / f"{service_name}.service"
+    timer_file = user_unit_dir / f"{service_name}.timer"
+    for path, contents in ((service_file, service), (timer_file, timer)):
+        if not path.exists() or path.read_text(encoding="utf-8") != contents:
+            path.write_text(contents, encoding="utf-8")
+            path.chmod(0o600)
+    run(["systemctl", "--user", "daemon-reload"])
+    run(["systemctl", "--user", "enable", "--now", f"{service_name}.timer"])
+
+
+def refresh_network_filter(policy_file):
+    """Refresh live host address and prefix rules from a saved VM policy."""
+    try:
+        with Path(policy_file).open(encoding="utf-8") as source:
+            policy = json.load(source)
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"Could not load network filter policy {policy_file}: {error}") from error
+    define_network_filter_config(policy["filter_name"], policy["filter_access"],
+                                 policy["connection"]["uri"])
+
+
+def cleanup_network_filter_refresh(name):
+    """Remove the per-VM refresh timer and its saved firewall policy."""
+    if not re.fullmatch(r"[a-z][a-z0-9-]{0,30}", name):
+        raise ValueError(f"Invalid VM name for network filter cleanup: {name!r}")
+    unit_name = f"{name}-nwfilter-refresh"
+    subprocess.run(["systemctl", "--user", "disable", "--now", f"{unit_name}.timer"],
+                   check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["systemctl", "--user", "stop", f"{unit_name}.service"],
+                   check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    user_unit_dir = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "systemd" / "user"
+    (user_unit_dir / f"{unit_name}.timer").unlink(missing_ok=True)
+    (user_unit_dir / f"{unit_name}.service").unlink(missing_ok=True)
+    state_dir = Path.home() / ".local" / "share" / "nixvm" / name
+    (state_dir / "network-filter-policy.json").unlink(missing_ok=True)
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 def define_network_filter(extra=()):
     if "NIXVM_FILTER_NAME" in os.environ:
         name = os.environ["NIXVM_FILTER_NAME"]
@@ -548,6 +666,7 @@ def define_network_filter(extra=()):
         access = config["filter_access"]
         uri = config["connection"]["uri"]
     define_network_filter_config(name, access, uri)
+    install_network_filter_refresh(name.removesuffix("-access"), access, uri)
 
 
 def tofu_firewall_test_config(extra):
@@ -1988,11 +2107,12 @@ def usb(c, attach, selector=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["build-image", "remove-image", "define-network-filter", "firewall-test", "check-host-nfs", "setup-host-nfs", "setup-host-firewall", "setup-host-mitmproxy", "cleanup-host-mitmproxy", "setup-hostname", "cleanup-hostname", "bootstrap", "preflight", "ssh", "spice", "forward", "ensure-vm-nat",
+    parser.add_argument("command", choices=["build-image", "remove-image", "define-network-filter", "refresh-network-filter", "cleanup-network-filter-refresh", "firewall-test", "check-host-nfs", "setup-host-nfs", "setup-host-firewall", "setup-host-mitmproxy", "cleanup-host-mitmproxy", "setup-hostname", "cleanup-hostname", "bootstrap", "preflight", "ssh", "spice", "forward", "ensure-vm-nat",
                         "usb-attach", "usb-detach", "rebuild", "rollback", "password", "reboot", "start", "stop",
                         "reprovision", "import-public-keys", "gpu-check", "token-check", "update-config", "copy-host-cas", "ip"])
     parser.add_argument("--name", default=os.environ.get("NIXVM_PROFILE", "nixvm"),
                         help="VM name for remove-image (defaults to nixvm)")
+    parser.add_argument("--policy-file", help="Saved JSON policy for refresh-network-filter")
     parser.add_argument("--device", help="YubiKey USB port name or serial; mandatory if selection is ambiguous")
     parser.add_argument("--timeout", type=int, default=120, help="Seconds to wait for start/stop transitions (default: 120)")
     parser.add_argument("--force", action="store_true", help="Abruptly destroy the VM instead of graceful shutdown (stop only)")
@@ -2010,6 +2130,12 @@ def main():
         return remove_image_cache(args.name)
     if args.command == "define-network-filter":
         return define_network_filter(extra)
+    if args.command == "refresh-network-filter":
+        if not args.policy_file:
+            parser.error("refresh-network-filter requires --policy-file")
+        return refresh_network_filter(args.policy_file)
+    if args.command == "cleanup-network-filter-refresh":
+        return cleanup_network_filter_refresh(args.name)
     if args.command == "firewall-test":
         return run_firewall_tests(extra)
     if args.command == "setup-host-nfs":

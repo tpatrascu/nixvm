@@ -1,4 +1,5 @@
 import importlib.util
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -144,6 +145,14 @@ class HostTests(unittest.TestCase):
         self.assertFalse(policy.domain_is_blocked("api42.example.com"))
         self.assertTrue(policy.domain_is_blocked("telemetry9.example.net"))
         self.assertFalse(policy.domain_is_blocked("cdn.trusted.example.net"))
+        with patch.object(
+            policy, "host_global_ipv6_networks",
+            return_value=({ipaddress.ip_network("2a02:2f04:9406:d900::/64")}, None),
+        ):
+            self.assertTrue(policy.address_is_denied("2a02:2f04:9406:d900::1234"))
+            self.assertFalse(policy.address_is_denied("2606:4700:4700::1111"))
+        with patch.object(policy, "host_global_ipv6_networks", return_value=(None, "unavailable")):
+            self.assertTrue(policy.address_is_denied("2606:4700:4700::1111"))
         flow_data = types.SimpleNamespace(server=types.SimpleNamespace(
             id="git-server", address=("git.example.com", 443), tls=True, sni=None, error=None,
         ))

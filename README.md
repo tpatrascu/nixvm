@@ -154,6 +154,14 @@ IPv4/IPv6 ranges unless explicitly allowed by the host configuration. It also
 blocks new connections to the host's current interface addresses, including
 globally scoped IPv6 addresses; explicit entries in `host_access.ips` and
 `internal_network_allow` are the exceptions.
+For IPv6, it also blocks every globally routable prefix configured on a host
+interface (such as the advertised `/64` on Wi-Fi or Ethernet), covering other
+devices on that local IPv6 network. The host can only identify prefixes its
+router advertises on its interfaces; a delegated `/56` that the router does
+not expose as an interface prefix cannot be inferred from the host alone.
+When the VM filter is defined, a user systemd timer refreshes host addresses
+and IPv6 prefixes every 30 seconds, so the running VM follows network changes
+without needing another `nixvm up`. `nixvm destroy` removes this timer.
 DHCPv4 client traffic is limited to the VM's libvirt gateway and the isolated
 bridge's limited broadcast. Other DHCP client/server ports are blocked. With
 mitmproxy enabled, it also blocks guest egress to TCP and UDP destination ports
@@ -268,9 +276,11 @@ regex forms. The VM trusts the proxy's generated CA, which `nixvm up` copies
 into the guest configuration.
 The mitmproxy add-on also denies connections whose destination resolves into
 any CIDR in `internal_network_deny`, matching the guest-side filter, and denies
-addresses currently assigned to the host even when they are globally scoped.
+addresses currently assigned to the host and globally routable IPv6 prefixes
+configured on host interfaces.
 Only the named IP and port pairs in `allowed_internal_hosts` can override the
-CIDR deny; host-assigned addresses remain denied. This is proxy-request policy;
+CIDR or prefix deny; host-assigned addresses remain denied. This is
+proxy-request policy;
 the container shares the host network namespace. The host CA private key stays
 in the Podman volume; only its public certificate is copied to the guest. The
 mitmweb UI shows live flows and keeps them in memory.

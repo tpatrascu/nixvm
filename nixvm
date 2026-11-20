@@ -347,6 +347,7 @@ def main(arguments):
         if vm_name:
             # Keep .build/<profile> and its Nix closure for reuse if recreated.
             (ROOT / ".runtime" / vm_name / "known_hosts").unlink(missing_ok=True)
+            internal("cleanup-network-filter-refresh", ["--name", vm_name])
             internal("cleanup-hostname", ["--name", vm_name])
     elif command == "preflight":
         variables, operation = split_arguments(extra, profile)
