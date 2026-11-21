@@ -406,6 +406,7 @@ variable "apps" {
       chatgpt    = optional(bool, false)
       claudeCode = optional(bool, false)
       opencode   = optional(bool, false)
+      antigravity = optional(bool, false)
     }), {})
   })
   default = {}
@@ -451,8 +452,8 @@ variable "default_coding_agent" {
   type        = string
   default     = "none"
   validation {
-    condition     = contains(["none", "omp", "codex", "chatgpt", "claudeCode", "opencode"], var.default_coding_agent)
-    error_message = "default_coding_agent must be \"none\", \"omp\", \"codex\", \"chatgpt\", \"claudeCode\", or \"opencode\"."
+    condition     = contains(["none", "omp", "codex", "chatgpt", "claudeCode", "opencode", "antigravity"], var.default_coding_agent)
+    error_message = "default_coding_agent must be \"none\", \"omp\", \"codex\", \"chatgpt\", \"claudeCode\", \"opencode\", or \"antigravity\"."
   }
 }
 variable "additional_nix_pkgs" {

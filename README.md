@@ -493,10 +493,10 @@ Home Manager activates with `nixos-rebuild`; no separate activation is needed.
 
 The `apps` object groups software into `editors` (Zed and VS Code), `terminals`
 (Kitty and Ghostty), `browsers` (Firefox and Chromium), and `coding_agents` (Oh
-My Pi, Codex CLI, ChatGPT desktop, Claude Code, and OpenCode). Optional app
+My Pi, Codex CLI, ChatGPT desktop, Claude Code, OpenCode, and Google Antigravity). Optional app
 toggles default off, except Firefox, which defaults on for YubiKey-backed
-browsing. The selected defaults also enable Kitty. Chromium and Ghostty are
-disabled by default. Configure
+browsing. The selected defaults also enable Kitty. Chromium, Ghostty, and
+Antigravity are disabled by default. Configure
 `default_editor`, `default_terminal`, `default_shell`, `default_browser`, and
 `default_coding_agent` to choose the corresponding defaults; selecting an
 editor, terminal, browser, or coding agent enables it and pins its icon to the
@@ -511,6 +511,9 @@ Nixpkgs `pkgs.chatgpt` targets macOS. Its optional anonymous launch metric is di
 the upstream Linux x86_64 release binary at version 18.12.6 when
 `apps.coding_agents.omp` is enabled, pinned by SHA-256
 in `nix/packages/omp-binary.nix`, so rebuilding does not compile its source tree.
+Enable Google Antigravity with `apps.coding_agents.antigravity = true`; it is
+installed from the Nixpkgs 26.05 package set. Set `default_coding_agent` to
+`"antigravity"` to enable it and pin it to the GNOME dock.
 GNOME uses the packaged Adw-gtk3 dark theme and the packaged Vanilla-DMZ white
 cursor theme; 0xProto Nerd Font is configured for Zed buffers, Zed's integrated
 terminal, and Kitty. The dock favorites include Firefox and Files, plus Kitty

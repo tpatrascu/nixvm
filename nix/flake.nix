@@ -2,22 +2,27 @@
   description = "Reproducible libvirt development workstation";
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+    nixpkgs-antigravity.url = "github:NixOS/nixpkgs/nixos-26.05";
     home-manager = {
       url = "github:nix-community/home-manager/release-26.05";
       inputs.nixpkgs.follows = "nixpkgs";
     };
     chatgpt-linux.url = "github:bruglet/chatgpt-desktop-linux";
   };
-  outputs = { self, nixpkgs, home-manager, chatgpt-linux }:
+  outputs = { self, nixpkgs, nixpkgs-antigravity, home-manager, chatgpt-linux }:
     let
       system = "x86_64-linux";
+      antigravityPkgs = import nixpkgs-antigravity {
+        inherit system;
+        config.allowUnfree = true;
+      };
       machine = builtins.fromJSON (builtins.readFile (
         if builtins.pathExists ./machines/current.json
         then ./machines/current.json else ./machines/example.json
       ));
       mkSystem = bootstrap: settings: nixpkgs.lib.nixosSystem {
         inherit system;
-        specialArgs = { machine = settings; };
+        specialArgs = { machine = settings; antigravity = antigravityPkgs.antigravity; };
         modules = [
           ./modules/system/base.nix
         ] ++ (if bootstrap then [ ./modules/system/image.nix ] else [
@@ -34,7 +39,7 @@
           {
             home-manager.useGlobalPkgs = true;
             home-manager.useUserPackages = true;
-            home-manager.extraSpecialArgs = { machine = settings; };
+            home-manager.extraSpecialArgs = { machine = settings; antigravity = antigravityPkgs.antigravity; };
             home-manager.users.${settings.username} = import ./modules/home/default.nix;
           }
         ]);

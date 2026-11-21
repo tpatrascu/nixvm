@@ -114,10 +114,10 @@ guest = {
 #   editors      = { zed = true, vscode = true }
 #   terminals    = { kitty = true, ghostty = true }
 #   browsers     = { firefox = true, chromium = false }
-#   coding_agents = { omp = true, codex = true, chatgpt = true, claudeCode = true, opencode = true }
+#   coding_agents = { omp = true, codex = true, chatgpt = true, claudeCode = true, opencode = true, antigravity = true }
 # }
 # default_editor   = "nvim" # or "zed" / "vscode"; selected GUI editor is enabled and pinned
 # default_terminal = "kitty" # or "ghostty"; selecting it enables and pins it
 # default_shell    = "zsh" # or "bash"
 # default_browser  = "firefox" # or "chromium"; selecting it enables and pins it
-# default_coding_agent = "none" # or "omp", "codex", "chatgpt", "claudeCode", "opencode"; enables and pins the selected agent
+# default_coding_agent = "none" # or "omp", "codex", "chatgpt", "claudeCode", "opencode", "antigravity"; enables and pins the selected agent

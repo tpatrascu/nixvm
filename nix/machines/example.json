@@ -20,7 +20,7 @@
     "editors": {"zed": false, "vscode": false},
     "terminals": {"kitty": true, "ghostty": false},
     "browsers": {"firefox": true, "chromium": false},
-    "coding_agents": {"omp": false, "codex": false, "chatgpt": false, "claudeCode": false, "opencode": false}
+    "coding_agents": {"omp": false, "codex": false, "chatgpt": false, "claudeCode": false, "opencode": false, "antigravity": false}
   },
   "defaultEditor": "nvim",
   "defaultTerminal": "kitty",

@@ -25,6 +25,7 @@ locals {
       chatgpt    = var.apps.coding_agents.chatgpt || var.default_coding_agent == "chatgpt"
       claudeCode = var.apps.coding_agents.claudeCode || var.default_coding_agent == "claudeCode"
       opencode   = var.apps.coding_agents.opencode || var.default_coding_agent == "opencode"
+      antigravity = var.apps.coding_agents.antigravity || var.default_coding_agent == "antigravity"
     })
   }
   guest_config = merge(var.guest, {

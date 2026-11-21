@@ -29,6 +29,7 @@ let
   };
   codingAgentDesktop = if defaultCodingAgent == "none" then [ ]
     else if defaultCodingAgent == "chatgpt" then [ "codex-desktop.desktop" ]
+    else if defaultCodingAgent == "antigravity" then [ "antigravity.desktop" ]
     else [ "nixvm-coding-agent.desktop" ];
   mitmproxyEnabled =
     (machine.mitmproxy.enabled or false)

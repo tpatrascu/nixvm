@@ -1,4 +1,4 @@
-{ lib, pkgs, machine, ... }:
+{ lib, pkgs, machine, antigravity, ... }:
 let
   omp = pkgs.callPackage ../../packages/omp-binary.nix { };
   editors = machine.apps.editors or { };
@@ -29,6 +29,7 @@ in
     ++ lib.optionals (codingAgents.claudeCode or false) [ pkgs.claude-code ]
     ++ lib.optionals (codingAgents.opencode or false) [ pkgs.opencode ]
     ++ lib.optionals (editors.vscode or false) [ pkgs.vscode ]
+    ++ lib.optionals (codingAgents.antigravity or false) [ antigravity ]
     ++ lib.optionals (browsers.chromium or false) [ pkgs.chromium ]
     ++ additionalNixPkgs;
 
