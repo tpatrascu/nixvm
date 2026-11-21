@@ -508,10 +508,12 @@ Firefox and Chromium use DuckDuckGo as their default search engine.
 The default editor is Neovim; set `default_editor` to `"zed"` or `"vscode"`
 to select and enable that editor.
 ChatGPT uses a NixOS-compatible repackaging of OpenAI's signed Linux application because
-Nixpkgs `pkgs.chatgpt` targets macOS. Its optional anonymous launch metric is disabled. OMP uses
-the upstream Linux x86_64 release binary at version 18.12.6 when
-`apps.coding_agents.omp` is enabled, pinned by SHA-256
-in `nix/packages/omp-binary.nix`, so rebuilding does not compile its source tree.
+Nixpkgs `pkgs.chatgpt` targets macOS. Its optional anonymous launch metric is disabled. When
+`apps.coding_agents.omp` is enabled, Home Manager seeds the upstream Linux x86_64
+OMP binary at version 18.12.6 into `~/.local/bin/omp`, pinned by SHA-256 in
+`nix/packages/omp-binary.nix`. OMP stays at that user-writable path so
+`omp update` can replace it; later Home Manager activations preserve the
+self-updated binary. Nix-ld supplies the ELF runtime needed by upstream updates.
 Enable Google Antigravity with `apps.coding_agents.antigravity = true`; it is
 installed from the Nixpkgs 26.05 package set. Set `default_coding_agent` to
 `"antigravity"` to enable it and pin it to the GNOME dock.

@@ -23,7 +23,6 @@ in
   ]
     ++ lib.optionals (terminals.kitty or false) [ pkgs.kitty ]
     ++ lib.optionals (terminals.ghostty or false) [ pkgs.ghostty ]
-    ++ lib.optionals (codingAgents.omp or false) [ omp ]
     ++ lib.optionals (editors.zed or false) [ pkgs.zed-editor ]
     ++ lib.optionals (codingAgents.codex or false) [ pkgs.codex ]
     ++ lib.optionals (codingAgents.claudeCode or false) [ pkgs.claude-code ]
@@ -32,6 +31,25 @@ in
     ++ lib.optionals (codingAgents.antigravity or false) [ antigravity ]
     ++ lib.optionals (browsers.chromium or false) [ pkgs.chromium ]
     ++ additionalNixPkgs;
+
+  # Keep OMP at a user-writable path so its built-in `omp update` can replace
+  # the standalone binary. Nix seeds it once; later Home Manager activations
+  # preserve self-updates.
+  home.activation = lib.mkIf (codingAgents.omp or false) {
+    installOmp = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
+      omp_path="$HOME/.local/bin/omp"
+      if [ -L "$omp_path" ]; then
+        resolved_path="$(readlink -f "$omp_path" || true)"
+        case "$resolved_path" in
+          /nix/store/*) rm -f "$omp_path" ;;
+        esac
+      fi
+      if [ ! -e "$omp_path" ]; then
+        install -d -m 0755 "$HOME/.local/bin"
+        install -m 0755 ${lib.escapeShellArg (toString omp)} "$omp_path"
+      fi
+    '';
+  };
 
   xdg.desktopEntries = lib.optionalAttrs (terminals.kitty or false) {
     kitty = {

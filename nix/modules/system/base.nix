@@ -97,9 +97,19 @@ in {
     shell = if (machine.defaultShell or "zsh") == "zsh" then pkgs.zsh else pkgs.bashInteractive;
     openssh.authorizedKeys.keys = machine.sshPublicKeys;
   };
+  # OMP self-updates its standalone ELF binary in the user's writable bin dir.
+  # NixOS supplies its interpreter and runtime libraries through nix-ld.
+  programs.nix-ld = {
+    enable = true;
+    libraries = with pkgs; [ stdenv.cc.cc.lib zlib openssl ];
+  };
   # Home Manager's first activation needs a writable Nix profile directory.
   # A fresh image has not created one with nix profile install yet.
   systemd.tmpfiles.rules = [
+    # Keep the user's development workspace writable across provisioning and
+    # repair it if an earlier root-run command created it as root.
+    "d /home/${machine.username}/dev 0755 ${machine.username} ${machine.username} -"
+    "z /home/${machine.username}/dev 0755 ${machine.username} ${machine.username} -"
     "d /home/${machine.username}/.local 0755 ${machine.username} ${machine.username} -"
     "d /home/${machine.username}/.local/state 0755 ${machine.username} ${machine.username} -"
     "d /home/${machine.username}/.local/state/nix 0755 ${machine.username} ${machine.username} -"
