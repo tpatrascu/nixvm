@@ -7,9 +7,12 @@
   zlib,
   openssl,
 }:
+let
+  version = "18.12.6";
+in
 stdenv.mkDerivation {
   pname = "oh-my-pi";
-  version = "18.12.6";
+  inherit version;
 
   src = fetchurl {
     url = "https://github.com/can1357/oh-my-pi/releases/download/v18.12.6/omp-linux-x64";
@@ -17,6 +20,9 @@ stdenv.mkDerivation {
   };
 
   dontUnpack = true;
+  # Bun --compile stores its application payload in the executable. Preserve
+  # that payload by disabling strip; still patch the ELF interpreter for NixOS.
+  dontStrip = true;
   nativeBuildInputs = [ autoPatchelfHook makeWrapper ];
   buildInputs = [ stdenv.cc.cc.lib zlib openssl ];
 
@@ -33,7 +39,8 @@ stdenv.mkDerivation {
 
   doInstallCheck = true;
   installCheckPhase = ''
-    "$out/bin/omp" --version
+    version_output="$($out/bin/omp --version)"
+    test "$version_output" = "omp/${version}"
   '';
 
   meta = {
