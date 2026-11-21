@@ -183,7 +183,9 @@ class NixvmPolicy:
                 parsed = ipaddress.ip_address(address.split("%", 1)[0])
             except ValueError:
                 return None, "resolver returned an invalid destination address"
-            if parsed.compressed in local_addresses:
+            if parsed.compressed in local_addresses and not self.internal_rule_allows(
+                host, port, parsed.compressed
+            ):
                 return None, f"destination address {parsed} is assigned to this host"
             denied = self.address_is_denied(parsed.compressed)
             if internal_rule and parsed.compressed not in internal_rule["ips"]:

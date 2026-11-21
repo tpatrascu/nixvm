@@ -120,6 +120,10 @@ class HostTests(unittest.TestCase):
                     "hostname": "git.example.com",
                     "ips": ["192.168.50.10"],
                     "ports": [443],
+                }, {
+                    "hostname": "192.168.124.1",
+                    "ips": ["192.168.124.1"],
+                    "ports": [9999],
                 }],
             }), encoding="utf-8")
             mitmproxy_stub = types.ModuleType("mitmproxy")
@@ -145,6 +149,16 @@ class HostTests(unittest.TestCase):
         self.assertFalse(policy.domain_is_blocked("api42.example.com"))
         self.assertTrue(policy.domain_is_blocked("telemetry9.example.net"))
         self.assertFalse(policy.domain_is_blocked("cdn.trusted.example.net"))
+        with patch.object(
+            policy, "host_interface_addresses",
+            return_value=({"192.168.124.1"}, None),
+        ):
+            host_endpoint, error = policy.resolve_and_pin("192.168.124.1", 9999)
+            self.assertEqual(host_endpoint, "192.168.124.1")
+            self.assertIsNone(error)
+            blocked_host_port, error = policy.resolve_and_pin("192.168.124.1", 8080)
+            self.assertIsNone(blocked_host_port)
+            self.assertIn("not allowed", error)
         with patch.object(
             policy, "host_global_ipv6_networks",
             return_value=({ipaddress.ip_network("2a02:2f04:9406:d900::/64")}, None),

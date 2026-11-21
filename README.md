@@ -278,11 +278,12 @@ into the guest configuration.
 The mitmproxy add-on also denies connections whose destination resolves into
 any CIDR in `internal_network_deny`, matching the guest-side filter, and denies
 addresses currently assigned to the host and globally routable IPv6 prefixes
-configured on host interfaces.
-Only the named IP and port pairs in `allowed_internal_hosts` can override the
-CIDR or prefix deny; host-assigned addresses remain denied. This is
-proxy-request policy;
-the container shares the host network namespace. The host CA private key stays
+configured on host interfaces. An exact `allowed_internal_hosts` hostname, IP,
+and port entry can authorize that proxy destination, including an address
+assigned to the host; other host addresses and ports remain denied. This is
+proxy-request policy; direct guest access still follows the separate
+`host_access` and libvirt-filter rules. The container shares the host network
+namespace. The host CA private key stays
 in the Podman volume; only its public certificate is copied to the guest. The
 mitmweb UI shows live flows and keeps them in memory.
 
