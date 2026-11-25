@@ -1,6 +1,9 @@
 { config, lib, pkgs, machine, modulesPath, ... }:
 let
   apps = machine.apps or { };
+  codingAgents = apps.coding_agents or { };
+  antigravity = import ../../packages/antigravity-ide.nix { inherit pkgs; };
+  antigravityEnabled = codingAgents.antigravity or false;
   browsers = apps.browsers or { };
   chromiumEnabled = (browsers.chromium or false)
     || (machine.defaultBrowser or "firefox") == "chromium";
@@ -68,6 +71,15 @@ in {
   nix.settings."ssl-cert-file" = lib.mkIf caTrustEnabled caBundle;
   security.pki.certificateFiles = hostCaCertificates
     ++ lib.optionals mitmproxyEnabled [ ../../machines/mitmproxy-ca.pem ];
+  security.wrappers = lib.mkIf antigravityEnabled {
+    antigravity-chrome-sandbox = {
+      source = "${antigravity.app}/chrome-sandbox";
+      owner = "root";
+      group = "root";
+      setuid = true;
+      permissions = "u+rx,go+rx";
+    };
+  };
   networking.firewall.enable = true;
   time.timeZone = machine.timezone;
   i18n.defaultLocale = machine.locale;

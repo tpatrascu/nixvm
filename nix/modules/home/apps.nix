@@ -1,6 +1,7 @@
-{ lib, pkgs, machine, antigravity, ... }:
+{ lib, pkgs, machine, ... }:
 let
   omp = pkgs.callPackage ../../packages/omp-binary.nix { };
+  antigravity = import ../../packages/antigravity-ide.nix { inherit pkgs; };
   editors = machine.apps.editors or { };
   terminals = machine.apps.terminals or { };
   browsers = machine.apps.browsers or { };
@@ -28,14 +29,14 @@ in
     ++ lib.optionals (codingAgents.claudeCode or false) [ pkgs.claude-code ]
     ++ lib.optionals (codingAgents.opencode or false) [ pkgs.opencode ]
     ++ lib.optionals (editors.vscode or false) [ pkgs.vscode ]
-    ++ lib.optionals (codingAgents.antigravity or false) [ antigravity ]
+    ++ lib.optionals (codingAgents.antigravity or false) [ antigravity.launcher ]
     ++ lib.optionals (browsers.chromium or false) [ pkgs.chromium ]
     ++ additionalNixPkgs;
 
   # Keep OMP at a user-writable path so its built-in `omp update` can replace
   # the standalone binary. Nix seeds it once; later Home Manager activations
   # preserve self-updates.
-  home.activation = lib.mkIf (codingAgents.omp or false) {
+  home.activation = lib.optionalAttrs (codingAgents.omp or false) {
     installOmp = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
       omp_path="$HOME/.local/bin/omp"
       if [ -L "$omp_path" ]; then
@@ -47,6 +48,22 @@ in
       if [ ! -e "$omp_path" ]; then
         install -d -m 0755 "$HOME/.local/bin"
         install -m 0755 ${lib.escapeShellArg (toString omp)} "$omp_path"
+      fi
+    '';
+  } // lib.optionalAttrs (codingAgents.antigravity or false) {
+    installAntigravityIDE = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
+      antigravity_install_path="$HOME/.local/share/antigravity-ide"
+      if [ ! -x "$antigravity_install_path/bin/antigravity-ide" ]; then
+        install -d -m 0755 "$HOME/.local/share"
+        antigravity_stage="$(mktemp -d "$HOME/.local/share/.antigravity-ide.XXXXXX")"
+        trap 'rm -rf "$antigravity_stage"' EXIT
+        cp -R --no-preserve=ownership ${lib.escapeShellArg (toString antigravity.app)}/. "$antigravity_stage/"
+        chmod -R u+w "$antigravity_stage"
+        if [ -e "$antigravity_install_path" ]; then
+          mv "$antigravity_install_path" "$antigravity_install_path.broken-$(date +%s)"
+        fi
+        mv "$antigravity_stage" "$antigravity_install_path"
+        trap - EXIT
       fi
     '';
   };
@@ -69,6 +86,16 @@ in
       terminal = false;
       categories = [ "Utility" "TextEditor" "Development" "IDE" ];
       mimeType = [ "text/plain" "application/x-zerosize" "x-scheme-handler/zed" ];
+    };
+  } // lib.optionalAttrs (codingAgents.antigravity or false) {
+    antigravity = {
+      name = "Antigravity IDE";
+      genericName = "AI-powered development environment";
+      exec = "antigravity-ide %F";
+      icon = "${antigravity.app}/resources/app/resources/linux/code.png";
+      terminal = false;
+      categories = [ "Utility" "TextEditor" "Development" "IDE" ];
+      mimeType = [ "text/plain" "application/x-zerosize" ];
     };
   };
 

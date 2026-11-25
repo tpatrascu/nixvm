@@ -514,8 +514,17 @@ OMP binary at version 18.12.6 into `~/.local/bin/omp`, pinned by SHA-256 in
 `nix/packages/omp-binary.nix`. OMP stays at that user-writable path so
 `omp update` can replace it; later Home Manager activations preserve the
 self-updated binary. Nix-ld supplies the ELF runtime needed by upstream updates.
-Enable Google Antigravity with `apps.coding_agents.antigravity = true`; it is
-installed from the Nixpkgs 26.05 package set. Set `default_coding_agent` to
+Enable Google Antigravity with `apps.coding_agents.antigravity = true`; Nix
+packages Google's official Linux archive. Home Manager seeds it into the
+user-writable `~/.local/share/antigravity-ide` directory once, so the IDE's
+default auto-updater can replace its files; later activations preserve the
+self-updated copy. If that app directory is incomplete, activation renames the
+old program files to `.broken-*` before seeding a clean copy; it does not back
+up or restore settings. A fresh Antigravity profile uses its built-in defaults
+under `~/.config/Antigravity IDE`, and existing profile data is left untouched.
+The launcher uses a root-owned Chromium sandbox helper; the IDE and its child
+processes still run as the desktop user. Set
+`default_coding_agent` to
 `"antigravity"` to enable it and pin it to the GNOME dock.
 GNOME uses the packaged Adw-gtk3 dark theme and the packaged Vanilla-DMZ white
 cursor theme; 0xProto Nerd Font is configured for Zed buffers, Zed's integrated
