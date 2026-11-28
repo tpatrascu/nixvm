@@ -4,6 +4,7 @@
   services.xserver.enable = true;
   services.displayManager.gdm.enable = true;
   services.desktopManager.gnome.enable = true;
+  services.gnome.localsearch.enable = false;
   services.displayManager.autoLogin = {
     enable = machine.streaming.autologin;
     user = machine.username;

@@ -2,7 +2,7 @@
 let
   apps = machine.apps or { };
   codingAgents = apps.coding_agents or { };
-  antigravity = import ../../packages/antigravity-ide.nix { inherit pkgs; };
+  antigravity = import ../../packages/antigravity.nix { inherit pkgs; };
   antigravityEnabled = codingAgents.antigravity or false;
   browsers = apps.browsers or { };
   chromiumEnabled = (browsers.chromium or false)
@@ -105,7 +105,7 @@ in {
     uid = machine.uid;
     group = machine.username;
     home = "/home/${machine.username}";
-    extraGroups = [ "wheel" "networkmanager" "video" "render" ];
+    extraGroups = [ "wheel" "networkmanager" "video" "render" "docker" ];
     shell = if (machine.defaultShell or "zsh") == "zsh" then pkgs.zsh else pkgs.bashInteractive;
     openssh.authorizedKeys.keys = machine.sshPublicKeys;
   };
@@ -140,8 +140,9 @@ in {
   };
   services.qemuGuest.enable = true;
   environment.systemPackages = with pkgs; [
-    git rsync vim neovim curl
+    git rsync vim neovim curl patchelf
     htop atop btop sysstat iotop iptraf-ng nettools
-    podman
+    podman docker docker-compose
   ];
+  virtualisation.docker.enable = true;
 }

@@ -1,7 +1,7 @@
 { lib, pkgs, machine, ... }:
 let
   omp = pkgs.callPackage ../../packages/omp-binary.nix { };
-  antigravity = import ../../packages/antigravity-ide.nix { inherit pkgs; };
+  antigravity = import ../../packages/antigravity.nix { inherit pkgs; };
   editors = machine.apps.editors or { };
   terminals = machine.apps.terminals or { };
   browsers = machine.apps.browsers or { };
@@ -51,11 +51,11 @@ in
       fi
     '';
   } // lib.optionalAttrs (codingAgents.antigravity or false) {
-    installAntigravityIDE = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
-      antigravity_install_path="$HOME/.local/share/antigravity-ide"
-      if [ ! -x "$antigravity_install_path/bin/antigravity-ide" ]; then
+    installAntigravity = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
+      antigravity_install_path="$HOME/.local/share/antigravity"
+      if [ ! -x "$antigravity_install_path/antigravity" ]; then
         install -d -m 0755 "$HOME/.local/share"
-        antigravity_stage="$(mktemp -d "$HOME/.local/share/.antigravity-ide.XXXXXX")"
+        antigravity_stage="$(mktemp -d "$HOME/.local/share/.antigravity.XXXXXX")"
         trap 'rm -rf "$antigravity_stage"' EXIT
         cp -R --no-preserve=ownership ${lib.escapeShellArg (toString antigravity.app)}/. "$antigravity_stage/"
         chmod -R u+w "$antigravity_stage"
@@ -89,10 +89,10 @@ in
     };
   } // lib.optionalAttrs (codingAgents.antigravity or false) {
     antigravity = {
-      name = "Antigravity IDE";
+      name = "Antigravity";
       genericName = "AI-powered development environment";
-      exec = "antigravity-ide %F";
-      icon = "${antigravity.app}/resources/app/resources/linux/code.png";
+      exec = "antigravity %F";
+      icon = "antigravity";
       terminal = false;
       categories = [ "Utility" "TextEditor" "Development" "IDE" ];
       mimeType = [ "text/plain" "application/x-zerosize" ];

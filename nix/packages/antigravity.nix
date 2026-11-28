@@ -1,6 +1,6 @@
 { pkgs }:
 let
-  version = "2.8.0";
+  version = "2.36.0";
   runtimeLibraries = with pkgs; [
     stdenv.cc.cc.lib
     curl
@@ -41,14 +41,14 @@ let
     wayland
   ];
   app = pkgs.stdenvNoCC.mkDerivation {
-    pname = "antigravity-ide-unpacked";
+    pname = "antigravity-unpacked";
     inherit version;
     src = pkgs.fetchurl {
-      name = "antigravity-ide-${version}.tar.gz";
-      url = "https://edgedl.me.gvt1.com/edgedl/release2/j0qc3/antigravity/stable/2.8.0-6733682917113856/linux-x64/Antigravity%20IDE.tar.gz";
-      hash = "sha256-e6o2uqsoXLRhAa+Vi4975jBUWNuaRNiz0JONYfOFl9c=";
+      name = "antigravity-${version}.tar.gz";
+      url = "https://storage.googleapis.com/antigravity-public/antigravity-hub/2.36.0-5596661662220288/linux-x64/Antigravity.tar.gz";
+      hash = "sha256-b+QY8I52DAt/KXXfna7262y8R8ZRYSUTSeDOJVxgj7Y=";
     };
-    sourceRoot = "Antigravity IDE";
+    sourceRoot = "Antigravity-x64";
     dontBuild = true;
     dontFixup = true;
     installPhase = ''
@@ -56,13 +56,13 @@ let
       cp -a . "$out/"
     '';
     meta = {
-      description = "Google Antigravity IDE official Linux release";
+      description = "Google Antigravity official Linux release";
       homepage = "https://antigravity.google/download/";
       license = pkgs.lib.licenses.unfree;
       platforms = [ "x86_64-linux" ];
     };
   };
-  launcher = pkgs.writeShellScriptBin "antigravity-ide" ''
+  launcher = pkgs.writeShellScriptBin "antigravity" ''
       # Keep Chromium's renderer sandbox enabled using NixOS's root-owned
       # helper. The IDE and its renderer processes still run as the desktop user.
       export CHROME_DEVEL_SANDBOX=/run/wrappers/bin/antigravity-chrome-sandbox
@@ -76,7 +76,7 @@ let
           --wayland-text-input-version=3
         )
       fi
-      exec "$HOME/.local/share/antigravity-ide/bin/antigravity-ide" "''${antigravity_args[@]}" "$@"
+      exec "$HOME/.local/share/antigravity/antigravity" "''${antigravity_args[@]}" "$@"
   '';
 in
 {
